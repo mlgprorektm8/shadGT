@@ -5,6 +5,7 @@
 
 #include "common/types.h"
 #include "core/libraries/kernel/orbis_error.h"
+#include "core/libraries/kernel/uuid.h"
 #include "core/linker.h"
 
 namespace Core::Loader {

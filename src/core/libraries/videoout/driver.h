@@ -7,6 +7,7 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -50,9 +51,13 @@ struct VideoOutPort {
         return address >= start && address <= end;
     }
 
-    void WaitVoLabel(auto&& pred) {
+    void WaitVoLabel(auto&& pred, auto&& on_timeout) {
         std::unique_lock lk{vo_mutex};
-        vo_cv.wait(lk, pred);
+        while (!pred()) {
+            if (vo_cv.wait_for(lk, std::chrono::seconds(5)) == std::cv_status::timeout && !pred()) {
+                on_timeout();
+            }
+        }
     }
 
     void SignalVoLabel() {

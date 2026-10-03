@@ -36,6 +36,24 @@ bld/
 [Ll]ogs/
 [Bb]uild/
 
+# Alternate CMake build/install directories and generated files
+/[Bb]uild-*/
+/[Bb]uild_*/
+/[Ii]nstall/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Local emulator profiles and diagnostics (including saves, caches, and dumps)
+/user/
+*.dmp
+*.core
+
 # Visual Studio 2015/2017 cache/options directory
 .vs/
 # Uncomment if you have tasks that create the project's static files in wwwroot

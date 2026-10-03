@@ -353,6 +353,9 @@ set(KERNEL_LIB src/core/libraries/kernel/coredump/coredump.cpp
                src/core/libraries/kernel/file_system.cpp
                src/core/libraries/kernel/file_system.h
                src/core/libraries/kernel/kernel.cpp
+               src/core/libraries/kernel/openpsid.cpp
+               src/core/libraries/kernel/openpsid.h
+               src/core/libraries/kernel/uuid.h
                src/core/libraries/kernel/kernel.h
                src/core/libraries/kernel/memory.cpp
                src/core/libraries/kernel/memory.h
@@ -568,6 +571,8 @@ set(IME_LIB src/core/libraries/ime/error_dialog.cpp
 )
 
 set(PAD_LIB src/core/libraries/pad/pad.cpp
+            src/core/libraries/device_service/device_service.cpp
+            src/core/libraries/device_service/device_service.h
             src/core/libraries/pad/pad.h
             src/core/libraries/pad/pad_errors.h
 )

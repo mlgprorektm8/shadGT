@@ -19,6 +19,7 @@
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/memory.h"
+#include "core/libraries/kernel/openpsid.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/process.h"
@@ -156,16 +157,6 @@ void SetPosixErrno(s32 e) {
     g_posix_errno = NativeToPosixErrno(e);
 }
 
-struct OrbisKernelUuid {
-    u32 timeLow;
-    u16 timeMid;
-    u16 timeHiAndVersion;
-    u8 clockSeqHiAndReserved;
-    u8 clockSeqLow;
-    u8 node[6];
-};
-static_assert(sizeof(OrbisKernelUuid) == 0x10);
-
 s32 PS4_SYSV_ABI sceKernelUuidCreate(OrbisKernelUuid* orbisUuid) {
     if (!orbisUuid) {
         return ORBIS_KERNEL_ERROR_EINVAL;
@@ -181,6 +172,11 @@ s32 PS4_SYSV_ABI sceKernelUuidCreate(OrbisKernelUuid* orbisUuid) {
 #endif
     std::memcpy(orbisUuid, &uuid, sizeof(OrbisKernelUuid));
     return ORBIS_OK;
+}
+
+void* PS4_SYSV_ABI sceKernelGetSanitizerNewReplaceExternal() {
+    // No address-sanitizer runtime is loaded into the guest process.
+    return nullptr;
 }
 
 s32 PS4_SYSV_ABI kernel_ioctl(s32 fd, u64 cmd, VA_ARGS) {
@@ -477,6 +473,9 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceKernelGetFsSandboxRandomWord);
     LIB_FUNCTION("6xVpy0Fdq+I", "libkernel", 1, "libkernel", _sigprocmask);
     LIB_FUNCTION("Xjoosiw+XPI", "libkernel", 1, "libkernel", sceKernelUuidCreate);
+    LIB_FUNCTION("DLORcroUqbc", "libSceOpenPsId", 1, "libkernel", sceKernelGetOpenPsId);
+    LIB_FUNCTION("bnZxYgAFeA0", "libkernel", 1, "libkernel",
+                 sceKernelGetSanitizerNewReplaceExternal);
     LIB_FUNCTION("Ou3iL1abvng", "libkernel", 1, "libkernel", stack_chk_fail);
     LIB_FUNCTION("9BcDykPmo1I", "libkernel", 1, "libkernel", __Error);
     LIB_FUNCTION("k+AXqu2-eBc", "libkernel", 1, "libkernel", posix_getpagesize);

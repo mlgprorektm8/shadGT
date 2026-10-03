@@ -15,6 +15,7 @@
 #include "core/libraries/companion/companion_httpd.h"
 #include "core/libraries/companion/companion_util.h"
 #include "core/libraries/content_export/content_export.h"
+#include "core/libraries/device_service/device_service.h"
 #include "core/libraries/disc_map/disc_map.h"
 #include "core/libraries/fiber/fiber.h"
 #include "core/libraries/game_live_streaming/gamelivestreaming.h"
@@ -109,6 +110,7 @@ static void RegisterAudio3d(Core::Loader::SymbolsResolver* sym) {
 
 void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_Kernel, "Initializing HLE libraries");
+    Libraries::DeviceService::RegisterLib(sym);
 
     auto* game_info = Common::Singleton<Common::ElfInfo>::Instance();
     const auto& sys_module_path = EmulatorSettings.GetSysModulesDir();

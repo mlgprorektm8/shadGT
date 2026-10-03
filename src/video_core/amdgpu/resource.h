@@ -83,12 +83,12 @@ struct Buffer {
         return stride;
     }
 
-    u32 NumDwords() const noexcept {
+    u64 NumDwords() const noexcept {
         return Common::AlignUp(GetSize(), sizeof(u32)) >> 2;
     }
 
-    u32 GetSize() const noexcept {
-        return stride == 0 ? num_records : (stride * num_records);
+    u64 GetSize() const noexcept {
+        return stride == 0 ? num_records : (u64(stride) * num_records);
     }
 
     u32 GetIndexStride() const noexcept {

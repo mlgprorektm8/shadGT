@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
@@ -142,6 +143,40 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        if (code == EXCEPTION_ACCESS_VIOLATION && pExp->ExceptionRecord->NumberParameters >= 2) {
+            const auto operation = pExp->ExceptionRecord->ExceptionInformation[0];
+            LOG_CRITICAL(Debug, "Guest memory fault: {} at {:#x}",
+                         operation == 0   ? "read"
+                         : operation == 1 ? "write"
+                                          : "execute",
+                         pExp->ExceptionRecord->ExceptionInformation[1]);
+        }
+        const auto& ctx = *pExp->ContextRecord;
+        LOG_CRITICAL(Debug,
+                     "Guest registers: RIP={:#x} RSP={:#x} RBP={:#x} RAX={:#x} RBX={:#x} "
+                     "RCX={:#x} RDX={:#x} RSI={:#x} RDI={:#x}",
+                     ctx.Rip, ctx.Rsp, ctx.Rbp, ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi,
+                     ctx.Rdi);
+        LOG_CRITICAL(Debug,
+                     "Guest registers: R8={:#x} R9={:#x} R10={:#x} R11={:#x} R12={:#x} "
+                     "R13={:#x} R14={:#x} R15={:#x} EFLAGS={:#x}",
+                     ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
+                     ctx.EFlags);
+        // ReadProcessMemory avoids another exception if RIP is unmapped or crosses a page boundary.
+        std::array<u8, 15> bytes{};
+        SIZE_T bytes_read = 0;
+        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(ctx.Rip), bytes.data(),
+                          bytes.size(), &bytes_read);
+        if (bytes_read != 0) {
+            ZydisDecodedInstruction instruction{};
+            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]{};
+            auto* decoder = Common::Decoder::Instance();
+            if (ZYAN_SUCCESS(
+                    decoder->decodeInstruction(instruction, operands, bytes.data(), bytes_read))) {
+                LOG_CRITICAL(Debug, "Guest instruction: {}",
+                             decoder->disassembleInst(instruction, operands, ctx.Rip));
+            }
+        }
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 

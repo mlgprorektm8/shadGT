@@ -131,6 +131,13 @@ struct ImageResource {
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
 
+    constexpr bool HasSameBinding(const ImageResource& other) const noexcept {
+        // Vulkan uses different image types and formats for ordinary and comparison sampling.
+        return sharp_fetch == other.sharp_fetch && is_depth == other.is_depth &&
+               is_array == other.is_array && mip_fallback_mode == other.mip_fallback_mode &&
+               constant_mip_index == other.constant_mip_index && post_op == other.post_op;
+    }
+
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         AmdGpu::Image image{};
         if (!Fetch(info.flattened_ud_buf.data(), &image)) {

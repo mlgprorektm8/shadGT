@@ -10,6 +10,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/stencil_reference.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -469,7 +470,10 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     VertexInputs<BufferRange> ranges{};
     for (const auto& buffer : guest_buffers) {
         if (buffer.base_address != 0 && buffer.GetSize() > 0) {
-            ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
+            // Bound each descriptor before merging, so open-ended ranges cannot bridge unmapped
+            // guest memory and make another vertex buffer appear resident in the first buffer.
+            const u64 size = memory->ClampRangeSize(buffer.base_address, buffer.GetSize());
+            ranges.emplace_back(buffer.base_address, buffer.base_address + size);
         }
     }
 
@@ -504,6 +508,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     VertexInputs<vk::DeviceSize> host_sizes;
     VertexInputs<vk::DeviceSize> host_strides;
     for (const auto& buffer : guest_buffers) {
+        u64 host_size{};
         if (buffer.base_address != 0 && buffer.GetSize() > 0) {
             const auto host_buffer_info =
                 std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
@@ -512,13 +517,16 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
                 });
             ASSERT(host_buffer_info != ranges_merged.cend());
             host_buffers.emplace_back(host_buffer_info->buffer->Handle());
-            host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
-                                   host_buffer_info->base_address);
+            const u64 offset =
+                host_buffer_info->offset + buffer.base_address - host_buffer_info->base_address;
+            host_offsets.push_back(offset);
+            const u64 mapped_size = memory->ClampRangeSize(buffer.base_address, buffer.GetSize());
+            host_size = std::min(mapped_size, host_buffer_info->buffer->SizeBytes() - offset);
         } else {
             host_buffers.emplace_back(VK_NULL_HANDLE);
             host_offsets.push_back(0);
         }
-        host_sizes.push_back(buffer.GetSize());
+        host_sizes.push_back(host_size);
         host_strides.push_back(buffer.GetStride());
     }
 
@@ -775,9 +783,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-                if (size != vsharp.GetSize()) {
-                    LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
-                              vsharp.GetSize(), size, stage.pgm_hash);
+                // Max-record descriptors intentionally expose an open-ended guest range.
+                // Clamp it to mapped memory before creating a finite Vulkan binding.
+                if (size != vsharp.GetSize() && vsharp.num_records != UINT32_MAX) {
+                    LOG_ERROR(Render,
+                              "Clamped size from {} to {} for stage {:#x}: base={:#x}, stride={}, "
+                              "records={:#x}",
+                              vsharp.GetSize(), size, stage.pgm_hash, u64(vsharp.base_address),
+                              vsharp.GetStride(), vsharp.num_records);
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
@@ -819,9 +832,18 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto tsharp = image_desc.GetSharp(stage);
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
-        if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            image_bindings[num_images++].image_id = {};
+        const auto bind_null_image = [&] {
+            auto& [image_id, desc] = image_bindings[num_images++];
+            image_id = {};
+            desc = {};
+            // This scratch entry may previously have held a storage image from another stage.
+            // Null descriptors must still match the current shader's descriptor type.
+            desc.type = image_desc.is_written ? VideoCore::TextureCache::BindingType::Storage
+                                              : VideoCore::TextureCache::BindingType::Texture;
             image_descriptor_array_sizes.push_back(1);
+        };
+        if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+            bind_null_image();
             continue;
         }
 
@@ -832,8 +854,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
-            image_bindings[num_images++].image_id = {};
-            image_descriptor_array_sizes.push_back(1);
+            bind_null_image();
             continue;
         }
 
@@ -1457,33 +1478,28 @@ void Rasterizer::UpdateDepthStencilState() const {
         const auto front = regs.stencil_ref_front;
         const auto back =
             regs.depth_control.backface_enable ? regs.stencil_ref_back : regs.stencil_ref_front;
-        // GCN REPLACE_OP writes DB_STENCILREFMASK.STENCILOPVAL, so a face whose stencil ops
-        // include ReplaceOp takes its Vulkan reference from op_val.
         const auto& sc = regs.stencil_control;
-        const auto uses_op_val = [](AmdGpu::StencilFunc fail, AmdGpu::StencilFunc zpass,
-                                    AmdGpu::StencilFunc zfail) {
-            return fail == AmdGpu::StencilFunc::ReplaceOp ||
-                   zpass == AmdGpu::StencilFunc::ReplaceOp ||
-                   zfail == AmdGpu::StencilFunc::ReplaceOp;
-        };
-        const bool front_op =
-            uses_op_val(sc.stencil_fail_front, sc.stencil_zpass_front, sc.stencil_zfail_front);
-        const bool back_op =
+        const auto depth_compare = !depth_test_enabled ? AmdGpu::CompareFunc::Always
+                                   : regs.depth_control.depth_bounds_enable
+                                       ? AmdGpu::CompareFunc::Less
+                                       : regs.depth_control.depth_func;
+        const auto front_ref = ResolveStencilReference(
+            sc.stencil_fail_front, sc.stencil_zpass_front, sc.stencil_zfail_front,
+            regs.depth_control.stencil_ref_func, front, depth_compare);
+        const auto back_ref =
             regs.depth_control.backface_enable
-                ? uses_op_val(sc.stencil_fail_back, sc.stencil_zpass_back, sc.stencil_zfail_back)
-                : front_op;
-        const auto ref_conflict = [](AmdGpu::CompareFunc func, const AmdGpu::StencilRefMask& ref) {
-            return func != AmdGpu::CompareFunc::Always && func != AmdGpu::CompareFunc::Never &&
-                   ref.stencil_test_val != ref.stencil_op_val;
-        };
-        if ((front_op && ref_conflict(regs.depth_control.stencil_ref_func, front)) ||
-            (back_op && regs.depth_control.backface_enable &&
-             ref_conflict(regs.depth_control.stencil_bf_func, back))) {
-            LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp requires "
-                                       "op_val; the stencil test will use op_val");
+                ? ResolveStencilReference(sc.stencil_fail_back, sc.stencil_zpass_back,
+                                          sc.stencil_zfail_back, regs.depth_control.stencil_bf_func,
+                                          back, depth_compare)
+                : front_ref;
+        if (!front_ref.exact || !back_ref.exact) {
+            LOG_WARNING(Render_Vulkan,
+                        "Stencil operations require conflicting references: front test={} op={} "
+                        "selected={}, back test={} op={} selected={}",
+                        front.stencil_test_val, front.stencil_op_val, front_ref.value,
+                        back.stencil_test_val, back.stencil_op_val, back_ref.value);
         }
-        dynamic_state.SetStencilReferences(front_op ? front.stencil_op_val : front.stencil_test_val,
-                                           back_op ? back.stencil_op_val : back.stencil_test_val);
+        dynamic_state.SetStencilReferences(front_ref.value, back_ref.value);
         dynamic_state.SetStencilWriteMasks(!stencil_clear ? front.stencil_write_mask : 0U,
                                            !stencil_clear ? back.stencil_write_mask : 0U);
         dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);

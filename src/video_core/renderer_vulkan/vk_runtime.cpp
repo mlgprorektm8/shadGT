@@ -162,9 +162,21 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
 bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
-    const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
-    image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
-    return image_barriers.size() != prev_num_barriers;
+    VideoCore::Image::Barriers next_barriers;
+    image->GetBarriers(next_barriers, dst_layout, dst_access, dst_stage, subres_range);
+    if (next_barriers.empty()) {
+        return false;
+    }
+
+    // Barriers in a single dependency are concurrent, not a sequence of transitions.
+    // Commit any earlier transition of this image before using its resulting state.
+    if (std::ranges::any_of(image_barriers, [&](const auto& barrier) {
+            return barrier.image == image->GetImage();
+        })) {
+        FlushBarriers();
+    }
+    image_barriers.insert(image_barriers.end(), next_barriers.begin(), next_barriers.end());
+    return true;
 }
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,

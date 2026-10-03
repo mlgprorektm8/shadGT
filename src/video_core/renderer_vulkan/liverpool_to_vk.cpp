@@ -36,8 +36,7 @@ vk::StencilOp StencilOp(AmdGpu::StencilFunc op) {
     case AmdGpu::StencilFunc::ReplaceOp:
         return vk::StencilOp::eReplace;
     case AmdGpu::StencilFunc::Ones:
-        LOG_WARNING(Render_Vulkan, "Unsupported stencil op {}, using Replace.",
-                    static_cast<u32>(op));
+        // ResolveStencilReference selects 0xff for this operation.
         return vk::StencilOp::eReplace;
     case AmdGpu::StencilFunc::And:
     case AmdGpu::StencilFunc::Or:

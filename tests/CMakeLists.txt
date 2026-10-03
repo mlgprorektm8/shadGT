@@ -9,6 +9,49 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
+add_executable(shadps4_stencil_test test_stencil_reference.cpp)
+target_include_directories(shadps4_stencil_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_stencil_test PRIVATE GTest::gtest_main fmt::fmt)
+include(GoogleTest)
+gtest_discover_tests(shadps4_stencil_test)
+
+add_executable(shadps4_device_service_test test_device_service.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/device_service/device_service.cpp)
+target_include_directories(shadps4_device_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_device_service_test PRIVATE GTest::gtest_main fmt::fmt)
+gtest_discover_tests(shadps4_device_service_test)
+
+add_executable(shadps4_pm4_type0_test test_pm4_type0.cpp)
+target_include_directories(shadps4_pm4_type0_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_pm4_type0_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_pm4_type0_test)
+
+add_executable(shadps4_openpsid_test test_openpsid.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/kernel/openpsid.cpp)
+target_include_directories(shadps4_openpsid_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_openpsid_test PRIVATE GTest::gtest_main fmt::fmt)
+gtest_discover_tests(shadps4_openpsid_test)
+
+add_executable(shadps4_buffer_resource_test test_buffer_resource.cpp)
+target_include_directories(shadps4_buffer_resource_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_buffer_resource_test PRIVATE GTest::gtest_main fmt::fmt)
+gtest_discover_tests(shadps4_buffer_resource_test)
+
+add_executable(shadps4_image_resource_test test_image_resource.cpp)
+target_include_directories(shadps4_image_resource_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_image_resource_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers)
+gtest_discover_tests(shadps4_image_resource_test)
+
+add_executable(shadps4_ce_de_counter_test test_ce_de_counter.cpp)
+target_include_directories(shadps4_ce_de_counter_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_ce_de_counter_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_ce_de_counter_test)
+
+add_executable(shadps4_pm4_rewind_test test_pm4_rewind.cpp)
+target_include_directories(shadps4_pm4_rewind_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_pm4_rewind_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_pm4_rewind_test)
+
 set(TEST_TARGETS
     shadps4_settings_test
     shadps4_ngs2_test
