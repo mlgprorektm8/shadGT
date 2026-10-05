@@ -291,11 +291,15 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         case IR::Opcode::ImageSampleRaw: {
             IR::F32 fmaskx = ir.BitCast<IR::F32>(ir.Imm32(0x76543210));
             IR::F32 fmasky = ir.BitCast<IR::F32>(ir.Imm32(0xfedcba98));
-            inst.ReplaceUsesWith(ir.CompositeConstruct(fmaskx, fmasky));
+            // Image reads and samples return four components even when the FMask data only
+            // occupies two. Keep the result width for consumers of the unused components.
+            inst.ReplaceUsesWith(
+                ir.CompositeConstruct(fmaskx, fmasky, ir.Imm32(0.0f), ir.Imm32(0.0f)));
             return;
         }
         case IR::Opcode::ImageQueryLod:
-            inst.ReplaceUsesWith(ir.Imm32(1));
+            // FMask has no mip chain; IMAGE_GET_LOD returns both clamped and unclamped LOD.
+            inst.ReplaceUsesWith(ir.CompositeConstruct(ir.Imm32(0.0f), ir.Imm32(0.0f)));
             return;
         case IR::Opcode::ImageQueryDimensions: {
             IR::Value dims = ir.CompositeConstruct(ir.Imm32(static_cast<u32>(image.width)),  // x

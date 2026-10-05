@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <utility>
 #include "common/assert.h"
 #include "common/number_utils.h"
 #include "video_core/amdgpu/pixel_format.h"
@@ -241,6 +242,37 @@ bool IsDualSourceBlendFactor(AmdGpu::BlendControl::BlendFactor factor) {
     default:
         return false;
     }
+}
+
+bool NeedsSwizzledAlphaBlend(AmdGpu::CompMapping swizzle, const AmdGpu::BlendControl& control) {
+    using Factor = AmdGpu::BlendControl::BlendFactor;
+    using Func = AmdGpu::BlendControl::BlendFunc;
+    std::array<bool, 4> channels{};
+    for (const auto channel : swizzle.array) {
+        if (channel < AmdGpu::CompSwizzle::Red || channel > AmdGpu::CompSwizzle::Alpha) {
+            return false;
+        }
+        const auto index = u32(channel) - u32(AmdGpu::CompSwizzle::Red);
+        if (std::exchange(channels[index], true)) {
+            return false;
+        }
+    }
+    return swizzle.a != AmdGpu::CompSwizzle::Alpha && control.enable &&
+           control.separate_alpha_blend && control.color_func == Func::Add &&
+           control.color_src_factor == Factor::SrcAlpha &&
+           control.color_dst_factor == Factor::OneMinusSrcAlpha &&
+           control.alpha_func == Func::Add && control.alpha_src_factor == Factor::Zero &&
+           control.alpha_dst_factor == Factor::OneMinusSrcAlpha;
+}
+
+void SetSwizzledAlphaBlend(vk::PipelineColorBlendAttachmentState& attachment) {
+    // Source 1 contains zero in the stored alpha lane and logical source alpha elsewhere.
+    attachment.srcColorBlendFactor = vk::BlendFactor::eSrc1Color;
+    attachment.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrc1Alpha;
+    attachment.colorBlendOp = vk::BlendOp::eAdd;
+    attachment.srcAlphaBlendFactor = vk::BlendFactor::eSrc1Alpha;
+    attachment.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrc1Alpha;
+    attachment.alphaBlendOp = vk::BlendOp::eAdd;
 }
 
 vk::BlendOp BlendOp(AmdGpu::BlendControl::BlendFunc func) {
@@ -807,7 +839,6 @@ vk::Format DepthFormat(DepthBuffer::ZFormat z_format, DepthBuffer::StencilFormat
 }
 
 vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {
-    const auto comp_swizzle = color_buffer.Swizzle();
     const auto format = AmdGpu::DataFormat(color_buffer.info.format);
     const auto number_type = color_buffer.GetFixedNumberFormat();
 
@@ -1133,7 +1164,8 @@ vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {
         break;
     }
 
-    color.float32 = comp_swizzle.Apply(color.float32);
+    // CLEAR_WORDs are already packed in surface-memory order. Component swap applies
+    // to shader exports, not these physical components.
     return {.color = color};
 }
 

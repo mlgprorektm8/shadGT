@@ -193,6 +193,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         } else {
             info.hw.fs.dual_source_blending = false;
         }
+        info.hw.fs.dual_source_blending |= graphics_key.color_buffers[0].blend_swizzled_alpha;
         const auto& ps_inputs = regs.ps_inputs;
         for (u32 i = 0; i < regs.num_interp; i++) {
             info.hw.fs.inputs[i] = {
@@ -339,6 +340,23 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
+    if (graphics_key.num_color_attachments > AmdGpu::NUM_COLOR_BUFFERS) {
+        LOG_WARNING(Render_Vulkan, "Skipping draw with {} color attachments (MRT mask={:#x})",
+                    graphics_key.num_color_attachments, graphics_key.mrt_mask);
+        return nullptr;
+    }
+    for (u32 cb = 0; cb < graphics_key.num_color_attachments; ++cb) {
+        const auto& color_buffer = graphics_key.color_buffers[cb];
+        if (color_buffer.data_format != AmdGpu::DataFormat::FormatInvalid &&
+            Vulkan::LiverpoolToVK::TrySurfaceFormat(
+                color_buffer.data_format, color_buffer.num_format) == vk::Format::eUndefined) {
+            LOG_WARNING(Render_Vulkan,
+                        "Skipping draw with unsupported color target {} format: data={}, number={}",
+                        cb, static_cast<u32>(color_buffer.data_format),
+                        static_cast<u32>(color_buffer.num_format));
+            return nullptr;
+        }
+    }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
@@ -424,10 +442,20 @@ bool PipelineCache::RefreshGraphicsKey() {
             continue;
         }
 
+        const auto data_format = col_buf.GetDataFmt();
+        const auto number_format = col_buf.GetNumberFmt();
+        if (Vulkan::LiverpoolToVK::TrySurfaceFormat(data_format, number_format) ==
+            vk::Format::eUndefined) {
+            LOG_WARNING(Render_Vulkan,
+                        "Skipping draw with unsupported color target {} format: data={}, number={}",
+                        cb, static_cast<u32>(data_format), static_cast<u32>(number_format));
+            return false;
+        }
+
         // Fill color target information
         auto& color_buffer = key.color_buffers[cb];
-        color_buffer.data_format = col_buf.GetDataFmt();
-        color_buffer.num_format = col_buf.GetNumberFmt();
+        color_buffer.data_format = data_format;
+        color_buffer.num_format = number_format;
         color_buffer.num_conversion = col_buf.GetNumberConversion();
         color_buffer.export_format = regs.color_export_format.GetFormat(cb);
         color_buffer.swizzle = col_buf.Swizzle();
@@ -439,6 +467,12 @@ bool PipelineCache::RefreshGraphicsKey() {
              bc.color_func == AmdGpu::BlendControl::BlendFunc::Max) &&
             bc.color_src_factor == AmdGpu::BlendControl::BlendFactor::SrcColor &&
             bc.color_dst_factor == AmdGpu::BlendControl::BlendFactor::DstColor;
+        color_buffer.blend_swizzled_alpha =
+            cb == 0 && !col_buf.info.blend_bypass && instance.IsDualSourceBlendSupported() &&
+            regs.color_export_format.GetFormat(1) == AmdGpu::ShaderExportFormat::Zero &&
+            (regs.color_target_mask.raw & ~0xfu) == 0 &&
+            (regs.color_shader_mask.GetMask(cb) & AmdGpu::ColorBufferMask::ComponentA) != 0 &&
+            LiverpoolToVK::NeedsSwizzledAlphaBlend(color_buffer.swizzle, bc);
     }
 
     // Compile and bind shader stages
@@ -525,6 +559,10 @@ bool PipelineCache::RefreshGraphicsStages() {
     const auto* fs_info = infos[static_cast<u32>(SwStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
     key.num_color_attachments = std::bit_width(key.mrt_mask);
+    if (key.num_color_attachments > AmdGpu::NUM_COLOR_BUFFERS) {
+        LOG_WARNING(Render_Vulkan, "Skipping draw with invalid MRT mask {:#x}", key.mrt_mask);
+        return false;
+    }
 
     switch (regs.stage_enable.raw) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
@@ -600,8 +638,18 @@ bool PipelineCache::RefreshGraphicsStages() {
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
                        MaxVertexBufferCount);
-            key.vertex_buffer_formats[vertex_binding++] =
-                Vulkan::LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+            const auto data_format = buffer.GetDataFmt();
+            const auto number_format = buffer.GetNumberFmt();
+            const auto format = Vulkan::LiverpoolToVK::TrySurfaceFormat(data_format, number_format);
+            if (format == vk::Format::eUndefined) {
+                LOG_WARNING(Render_Vulkan,
+                            "Skipping draw with unsupported vertex attribute {} format: data={}, "
+                            "number={}",
+                            vertex_binding, static_cast<u32>(data_format),
+                            static_cast<u32>(number_format));
+                return false;
+            }
+            key.vertex_buffer_formats[vertex_binding++] = format;
         }
     }
 
@@ -656,50 +704,45 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     auto runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
-        it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
-        auto& program = it_pgm.value();
-        auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
-
-        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        program->AddPermut(module, std::move(spec));
-        if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
-            fetch_shader = &fetch;
-        }
-        return std::make_tuple(&program->info, module, perm_hash);
+        it_pgm.value() = std::make_unique<Program>();
     }
 
     auto& program = it_pgm.value();
-    auto& info = program->info;
-    info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
-    info.user_data = params.user_data;
-    info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
-
-    size_t perm_idx = program->modules.size();
-    u64 perm_hash = HashCombine(params.hash, perm_idx);
-
-    vk::ShaderModule module{};
-
-    const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
-    if (it == program->modules.end()) {
-        auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
-
-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        program->AddPermut(module, std::move(spec));
-    } else {
+    for (size_t perm_idx = 0; perm_idx < program->modules.size(); ++perm_idx) {
+        auto& permutation = program->modules[perm_idx];
+        if (!permutation.info) {
+            continue;
+        }
+        auto& info = *permutation.info;
+        info.pgm_base = params.Base();
+        info.user_data = params.user_data;
+        info.RefreshFlatBuf();
+        const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+        // Newly active resources must match the compiled specialization; inactive ones can reuse
+        // it.
+        if (permutation.spec != spec) {
+            continue;
+        }
         info.AddBindings(binding);
-        module = it->module;
-        perm_idx = std::distance(program->modules.begin(), it);
-        perm_hash = HashCombine(params.hash, perm_idx);
+        if (auto& fetch = permutation.spec.fetch_shader_data; !fetch.Empty()) {
+            fetch_shader = &fetch;
+        }
+        return std::make_tuple(&info, permutation.module, HashCombine(params.hash, perm_idx));
     }
+
+    const size_t perm_idx = program->modules.size();
+    const u64 perm_hash = HashCombine(params.hash, perm_idx);
+    const auto start = binding;
+    auto info = std::make_unique<Shader::Info>(hw_stage, sw_stage, params);
+    const auto module = CompileModule(*info, runtime_info, params.code, perm_idx, binding);
+    auto spec = Shader::StageSpecialization(*info, runtime_info, profile, start);
+    RegisterShaderMeta(*info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+    const auto* info_ptr = info.get();
+    program->AddPermut(module, std::move(spec), std::move(info));
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
     }
-    return std::make_tuple(&program->info, module, perm_hash);
+    return std::make_tuple(info_ptr, module, perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,

@@ -72,7 +72,7 @@ struct RangeSet {
 
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
-        if (m_ranges_set.empty()) {
+        if (size == 0 || m_ranges_set.empty()) {
             return;
         }
         const VAddr start_address = base_addr;
@@ -92,7 +92,9 @@ struct RangeSet {
             if (inter_addr < start_address) {
                 inter_addr = start_address;
             }
-            func(inter_addr, inter_addr_end);
+            if (inter_addr < inter_addr_end) {
+                func(inter_addr, inter_addr_end);
+            }
         }
     }
 

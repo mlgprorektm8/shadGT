@@ -8,9 +8,13 @@
 
 namespace Shader {
 struct HwFragmentRuntimeInfo;
-}
+struct Info;
+} // namespace Shader
 
 namespace Shader::Backend::SPIRV {
+
+// Reserve the first varying for layer transport and shift auxiliary stage parameters.
+inline constexpr u32 AuxLayerLocation = 0;
 
 enum class AuxShaderType : u32 {
     RectListTCS,
@@ -19,6 +23,8 @@ enum class AuxShaderType : u32 {
 };
 
 [[nodiscard]] std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type,
-                                                      const HwFragmentRuntimeInfo& fs_info);
+                                                      const HwFragmentRuntimeInfo& fs_info,
+                                                      const Info& vertex_info,
+                                                      const Info* fragment_info);
 
 } // namespace Shader::Backend::SPIRV

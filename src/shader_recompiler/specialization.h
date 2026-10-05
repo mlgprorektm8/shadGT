@@ -190,7 +190,14 @@ struct StageSpecialization {
     }
 
     bool operator==(const StageSpecialization& other) const {
-        if (!Valid()) {
+        if (!Valid() || !other.Valid()) {
+            return false;
+        }
+
+        // Resource discovery can differ between permutations of the same program. Check
+        // lengths before comparing individual resources or treating an empty layout as reusable.
+        if (buffers.size() != other.buffers.size() || images.size() != other.images.size() ||
+            samplers.size() != other.samplers.size()) {
             return false;
         }
 

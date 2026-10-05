@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <fmt/ranges.h>
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -9,7 +10,9 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/renderer_vulkan/depth_attachment.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/resource_binding.h"
 #include "video_core/renderer_vulkan/stencil_reference.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -17,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/texture_cache/image_descriptor.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -196,15 +200,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     PrepareRenderState(pipeline);
-    if (!BindResources(pipeline)) {
-        return;
-    }
-    const auto state = BeginRendering(pipeline);
-
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
     }
+    if (!BindResources(pipeline)) {
+        return;
+    }
+    auto state = BeginRendering(pipeline);
+    FinalizeTextureLayouts(&state);
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -230,6 +234,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 
+    scheduler.EndRendering();
     ResetBindings(false);
 }
 
@@ -254,11 +259,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     PrepareRenderState(pipeline);
-    if (!BindResources(pipeline)) {
-        return;
-    }
-    const auto state = BeginRendering(pipeline);
-
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer();
@@ -274,6 +274,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
     }
+
+    if (!BindResources(pipeline)) {
+        return;
+    }
+    auto state = BeginRendering(pipeline);
+    FinalizeTextureLayouts(&state);
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -357,12 +363,12 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
 
+    const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
+    needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+
     if (!BindResources(pipeline)) {
         return;
     }
-
-    const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -411,25 +417,48 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     set_writes.clear();
     buffer_infos.clear();
     image_infos.clear();
+    bound_textures.clear();
 
     bool uses_dma = false;
 
-    // Bind resource buffers and textures.
+    // Preserve the compiled stage binding numbers while resolving every buffer alias before
+    // texture descriptors and attachment layouts are finalized.
     Shader::Backend::Bindings binding{};
+    std::array<StageResourceBindings, Shader::MaxStageTypes> stage_bindings{};
+    const auto stages = pipeline->GetStages();
     push_data = MakeUserData(liverpool->regs);
-    for (const auto* stage : pipeline->GetStages()) {
+    for (u32 i = 0; i < stages.size(); ++i) {
+        const auto* stage = stages[i];
         if (!stage) {
             continue;
         }
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
-        BindBuffers(*stage, binding, push_data);
-        BindTextures(*stage, binding);
+        stage_bindings[i] = PlanStageResourceBindings(*stage, binding);
+        auto buffer_binding = stage_bindings[i].buffers;
+        BindBuffers(*stage, buffer_binding, push_data);
+        binding = stage_bindings[i].next;
         uses_dma |= stage->uses_dma;
     }
 
     if (uses_dma) {
         buffer_cache.SynchronizeDmaBuffers();
+    }
+
+    for (u32 i = 0; i < stages.size(); ++i) {
+        if (const auto* stage = stages[i]) {
+            auto texture_binding = stage_bindings[i].textures;
+            BindTextures(*stage, texture_binding);
+        }
+    }
+    const u32 num_color_targets =
+        pipeline->IsCompute()
+            ? 0u
+            : std::bit_width(
+                  static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().mrt_mask);
+    RebindTextures(pipeline->IsCompute(), num_color_targets);
+    if (pipeline->IsCompute()) {
+        FinalizeTextureLayouts();
     }
 
     return true;
@@ -563,13 +592,18 @@ void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
-    for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+    for (const auto [buffer, offset, size, is_written, guest_address] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
         const auto write_flag =
             is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone;
         runtime.AccessBuffer(buffer, offset, size, dst_stage,
                              vk::AccessFlagBits2::eShaderRead | write_flag);
+        if (is_written && guest_address != 0) {
+            // A texture or attachment refresh during binding may have consumed the earlier
+            // invalidation. The scheduled shader write makes these aliases stale again.
+            texture_cache.InvalidateMemoryFromGPU(guest_address, size);
+        }
     }
     bound_images.clear();
     bound_buffers.clear();
@@ -802,7 +836,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
-                bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
+                bound_buffers.emplace_back(buffer, offset, size, desc.is_written,
+                                           vsharp.base_address);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
@@ -822,6 +857,47 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
+void Rasterizer::LogInvalidTextureContext(const Shader::Info& stage, u32 sharp_offset) {
+    // This compute shader supplies several live UI textures. Capture its bad descriptor
+    // inputs in normal-speed runs too; the Khronos layer makes GT Sport too slow to inspect.
+    const bool trace_gt_sport_ui = stage.pgm_hash == 0xaa3822a3;
+    if ((!EmulatorSettings.IsVkValidationEnabled() && !trace_gt_sport_ui) ||
+        invalid_texture_context_count >= (trace_gt_sport_ui ? 4 : 16)) {
+        return;
+    }
+    ++invalid_texture_context_count;
+    const auto words =
+        std::span{stage.flattened_ud_buf.data(),
+                  std::min<size_t>(stage.flattened_ud_buf.size(), trace_gt_sport_ui ? 96 : 256)};
+    LOG_WARNING(Render_Vulkan, "Invalid T# context shader={}_{:#x} flatbuf[0:{}]={:08x}",
+                stage.hw_stage, stage.pgm_hash, words.size(), fmt::join(words, " "));
+    const auto sharp_begin = sharp_offset > 16 ? sharp_offset - 16 : 0;
+    const auto sharp_end = std::min<size_t>(stage.flattened_ud_buf.size(), sharp_offset + 8);
+    if (sharp_begin < sharp_end) {
+        const auto sharp_words =
+            std::span{stage.flattened_ud_buf.data() + sharp_begin, sharp_end - sharp_begin};
+        LOG_WARNING(Render_Vulkan, "Invalid T# table flatbuf[{}:{}]={:08x}", sharp_begin, sharp_end,
+                    fmt::join(sharp_words, " "));
+    }
+    for (u32 index = 0; index < stage.buffers.size(); ++index) {
+        const auto& resource = stage.buffers[index];
+        if (resource.IsSpecial()) {
+            continue;
+        }
+        const auto buffer = resource.GetSharp(stage);
+        const u64 size = buffer.GetSize();
+        const u64 checked_size = std::min<u64>(size, 4_KB);
+        const bool gpu_modified =
+            buffer.base_address != 0 && checked_size != 0 &&
+            buffer_cache.IsRegionGpuModified(buffer.base_address, checked_size);
+        LOG_WARNING(Render_Vulkan,
+                    "Invalid T# buffer context shader={}_{:#x} buffer={} address={:#x} "
+                    "size={:#x} checked_size={:#x} gpu_modified={} written={}",
+                    stage.hw_stage, stage.pgm_hash, index, u64(buffer.base_address), size,
+                    checked_size, gpu_modified, resource.is_written);
+    }
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -833,14 +909,17 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         const auto bind_null_image = [&] {
-            auto& [image_id, desc] = image_bindings[num_images++];
-            image_id = {};
-            desc = {};
-            // This scratch entry may previously have held a storage image from another stage.
-            // Null descriptors must still match the current shader's descriptor type.
-            desc.type = image_desc.is_written ? VideoCore::TextureCache::BindingType::Storage
-                                              : VideoCore::TextureCache::BindingType::Texture;
-            image_descriptor_array_sizes.push_back(1);
+            const u32 array_size =
+                ForEachImageDescriptorBinding(stage, image_desc, [&](bool is_written) {
+                    auto& [image_id, desc] = image_bindings[num_images++];
+                    image_id = {};
+                    desc = {};
+                    // Preserve every compiled mip slot and its sampled/storage type when
+                    // rejecting the guest descriptor, including reused scratch entries.
+                    desc.type = is_written ? VideoCore::TextureCache::BindingType::Storage
+                                           : VideoCore::TextureCache::BindingType::Texture;
+                });
+            image_descriptor_array_sizes.push_back(array_size);
         };
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
             bind_null_image();
@@ -851,9 +930,39 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
-                        "data_format={}, num_format={}",
+                        "data_format={}, num_format={}, shader={}_{:#x}, sharp_offset={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
-                        static_cast<u32>(num_fmt));
+                        static_cast<u32>(num_fmt), stage.hw_stage, stage.pgm_hash,
+                        image_desc.sharp_fetch.offsets[0]);
+            LogInvalidTextureContext(stage, image_desc.sharp_fetch.offsets[0]);
+            bind_null_image();
+            continue;
+        }
+
+        if (LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt) == vk::Format::eUndefined) {
+            LOG_WARNING(Render_Vulkan,
+                        "Binding null image for unsupported T# format data={} number={} "
+                        "address={:#x} shader={}_{:#x}",
+                        static_cast<u32>(data_fmt), static_cast<u32>(num_fmt), tsharp.Address(),
+                        stage.hw_stage, stage.pgm_hash);
+            bind_null_image();
+            continue;
+        }
+
+        const auto geometry_error =
+            VideoCore::CheckImageDescriptorGeometry(tsharp, instance.GetImageLimits());
+        if (geometry_error != VideoCore::ImageDescriptorGeometryError::None) {
+            LOG_WARNING(Render_Vulkan,
+                        "Rejecting invalid T# geometry={} address={:#x} type={} "
+                        "extent={}x{}x{} pitch={} layers={} levels={} base_level={} samples={} "
+                        "data_format={} num_format={} shader={}_{:#x} sharp_offset={}",
+                        magic_enum::enum_name(geometry_error), tsharp.Address(),
+                        AmdGpu::NameOf(tsharp.GetType()), tsharp.width + 1, tsharp.height + 1,
+                        tsharp.depth + 1, tsharp.Pitch(), tsharp.NumLayers(), tsharp.NumLevels(),
+                        tsharp.base_level, tsharp.NumSamples(), static_cast<u32>(data_fmt),
+                        static_cast<u32>(num_fmt), stage.hw_stage, stage.pgm_hash,
+                        image_desc.sharp_fetch.offsets[0]);
+            LogInvalidTextureContext(stage, image_desc.sharp_fetch.offsets[0]);
             bind_null_image();
             continue;
         }
@@ -902,7 +1011,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
-                old_image.binding = {};
                 image_id = texture_cache.FindImage(desc);
             }
 
@@ -912,10 +1020,18 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             auto& image_view = texture_cache.FindTexture(image_id, desc);
             const auto binding = image.binding;
 
-            // The image is either bound as storage in a separate descriptor or bound as render
-            // target in feedback loop. Depth images are excluded because they can't be bound as
-            // storage and feedback loop doesn't make sense for them
-            if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
+            if (binding.is_target && image.info.props.is_depth) {
+                const bool depth_write = db_desc.second.view_info.is_storage;
+                const bool stencil_write = image.info.props.has_stencil &&
+                                           liverpool->regs.depth_control.stencil_enable &&
+                                           !depth_write;
+                const auto layout =
+                    DepthAttachmentLayout(image.info.props.has_stencil, depth_write, stencil_write,
+                                          true, instance.IsAttachmentFeedbackLoopLayoutSupported());
+                needs_barrier |=
+                    runtime.Transit(&image, layout, vk::PipelineStageFlagBits2::eAllGraphics,
+                                    vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+            } else if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
                 if (instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target) {
                     needs_barrier |= runtime.Transit(
                         &image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
@@ -946,6 +1062,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
+            bound_textures.emplace_back(image_infos.size() - 1, image_id, desc, image.GetImage());
         }
     }
 
@@ -974,12 +1091,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                 liverpool->regs.ta_bc_base.Address() == 0)) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
-                        "border_color_type={}, border_color_base={:#x}",
+                        "border_color_type={}, border_color_base={:#x}, shader={}_{:#x}, "
+                        "sharp_offset={}, min_lod={}, max_lod={}",
                         static_cast<u32>(ssharp.max_aniso.Value()),
                         static_cast<u32>(ssharp.filter_mode.Value()),
                         static_cast<u32>(ssharp.mip_filter.Value()),
                         static_cast<u32>(ssharp.border_color_type.Value()),
-                        liverpool->regs.ta_bc_base.Address());
+                        liverpool->regs.ta_bc_base.Address(), stage.hw_stage, stage.pgm_hash,
+                        sampler.sharp_fetch.offsets[0], ssharp.MinLod(), ssharp.MaxLod());
             ssharp = AmdGpu::Sampler{};
         }
         const auto vk_sampler =
@@ -995,8 +1114,147 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 }
 
+void Rasterizer::RebindTextures(bool is_compute, u32 num_color_targets) {
+    const auto refresh_targets = [&](bool gpu_dirty_only) {
+        if (is_compute) {
+            return;
+        }
+        for (u32 cb = 0; cb < num_color_targets; ++cb) {
+            auto& [image_id, desc] = cb_descs[cb];
+            if (!image_id) {
+                continue;
+            }
+            if (texture_cache.GetImage(image_id).binding.needs_rebind) {
+                image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+            }
+            auto& image = texture_cache.GetImage(image_id);
+            image.binding.is_target = 1u;
+            if (!gpu_dirty_only || True(image.flags & VideoCore::ImageFlagBits::GpuDirty)) {
+                texture_cache.UpdateImage(image_id);
+            }
+        }
+        auto& [image_id, desc] = db_desc;
+        if (image_id) {
+            if (texture_cache.GetImage(image_id).binding.needs_rebind) {
+                image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+            }
+            auto& image = texture_cache.GetImage(image_id);
+            image.binding.is_target = 1u;
+            if (!gpu_dirty_only || True(image.flags & VideoCore::ImageFlagBits::GpuDirty)) {
+                texture_cache.UpdateImage(image_id);
+            }
+        }
+    };
+    // Target refreshes can export sampled/storage aliases too. Finish them before the final
+    // texture refresh sweep, rather than allowing BeginRendering to invalidate a bound image.
+    refresh_targets(false);
+    // A later stage may expand an image that an earlier stage already bound. Preserve each
+    // descriptor's image and range until all image discovery and refresh operations finish.
+    for (auto& bound : bound_textures) {
+        const auto old_binding = texture_cache.GetImage(bound.image_id).binding;
+        if (old_binding.needs_rebind) {
+            bound.image_id = texture_cache.FindImage(bound.desc);
+            auto* image = &texture_cache.GetImage(bound.image_id);
+            if (const auto depth_id = texture_cache.GetAssociatedDepth(*image)) {
+                bound.image_id = depth_id;
+                image = &texture_cache.GetImage(depth_id);
+            }
+            image->binding.is_target |= old_binding.is_target;
+            image->binding.force_general |= old_binding.force_general;
+            bound_images.emplace_back(bound.image_id);
+        }
+        auto& image = texture_cache.GetImage(bound.image_id);
+        image.binding.is_bound = 1u;
+        const auto& view = texture_cache.FindTexture(bound.image_id, bound.desc);
+        image_infos[bound.descriptor_index].imageView = *view.image_view;
+        bound.backing_image = image.GetImage();
+    }
+    // A CPU-dirty alias refreshed later in the sweep can export an earlier bound image and
+    // leave it GpuDirty. Consume that arena authority before a pending storage-image write.
+    // GpuDirty aliases themselves block competing exports, so this cleanup cannot export
+    // another overlapping authoritative image and restart the cycle.
+    refresh_targets(true);
+    for (auto& bound : bound_textures) {
+        auto& image = texture_cache.GetImage(bound.image_id);
+        if (False(image.flags & VideoCore::ImageFlagBits::GpuDirty)) {
+            continue;
+        }
+        const auto& view = texture_cache.FindTexture(bound.image_id, bound.desc);
+        image_infos[bound.descriptor_index].imageView = *view.image_view;
+        bound.backing_image = image.GetImage();
+    }
+}
+
+void Rasterizer::FinalizeTextureLayouts(RenderState* render_state) {
+    const auto& regs = liverpool->regs;
+    for (u32 i = 0; i < bound_textures.size(); ++i) {
+        const auto& bound = bound_textures[i];
+        if (std::ranges::any_of(std::span{bound_textures.data(), i}, [&](const auto& previous) {
+                return previous.image_id == bound.image_id &&
+                       previous.backing_image == bound.backing_image;
+            })) {
+            continue;
+        }
+        auto& image = texture_cache.GetImage(bound.image_id);
+        const auto backing = std::ranges::find_if(image.backing_images, [&](const auto& backing) {
+            return backing.image.image == bound.backing_image;
+        });
+        ASSERT(backing != image.backing_images.end());
+
+        ImageBindingRequirements requirements{
+            .is_depth = image.info.props.is_depth,
+            .has_stencil = image.info.props.has_stencil,
+            .feedback_layout_supported = instance.IsAttachmentFeedbackLoopLayoutSupported(),
+            .is_compute = render_state == nullptr,
+        };
+        for (const auto& other : bound_textures) {
+            if (other.image_id == bound.image_id && other.backing_image == bound.backing_image) {
+                requirements.is_storage |=
+                    other.desc.type == VideoCore::TextureCache::BindingType::Storage;
+            }
+        }
+        // The image may have separate single- and multi-sample backings. Attachment layout
+        // requirements apply only to the physical backing used by the attachment.
+        if (render_state && image.GetImage() == bound.backing_image) {
+            for (u32 cb = 0; cb < render_state->num_color_attachments; ++cb) {
+                requirements.color_attachment |= cb_descs[cb].image_id == bound.image_id;
+            }
+            requirements.depth_attachment = db_desc.first == bound.image_id;
+            requirements.depth_write = db_desc.second.view_info.is_storage ||
+                                       render_state->depth_stencil_attachment.depth_clear;
+            requirements.stencil_write =
+                requirements.has_stencil &&
+                (render_state->depth_stencil_attachment.stencil_clear ||
+                 (regs.depth_control.stencil_enable && !requirements.depth_write));
+        }
+        const auto state = FinalImageBindingState(requirements);
+        auto* active_backing = image.backing;
+        image.backing = &*backing;
+        // Every descriptor of this backing must agree over its entire view. A final full-image
+        // transition also repairs partial sampled/storage overlaps and attachment promotions.
+        needs_barrier |= runtime.Transit(&image, state.layout, state.stages, state.access);
+        image.backing = active_backing;
+
+        for (const auto& other : bound_textures) {
+            if (other.image_id == bound.image_id && other.backing_image == bound.backing_image) {
+                image_infos[other.descriptor_index].imageLayout = state.layout;
+            }
+        }
+        if (requirements.color_attachment) {
+            for (u32 cb = 0; cb < render_state->num_color_attachments; ++cb) {
+                if (cb_descs[cb].image_id == bound.image_id) {
+                    render_state->color_attachments[cb].image_layout = state.layout;
+                }
+            }
+        }
+        if (requirements.depth_attachment) {
+            render_state->depth_stencil_attachment.image_layout = state.layout;
+        }
+    }
+}
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
-    attachment_feedback_loop = false;
+    attachment_feedback_loop = {};
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state;
@@ -1037,7 +1295,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                 vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                                 vk::AccessFlagBits2::eColorAttachmentWrite |
                                     vk::AccessFlagBits2::eColorAttachmentRead);
-            attachment_feedback_loop = true;
+            attachment_feedback_loop |= vk::ImageAspectFlagBits::eColor;
         } else {
             needs_barrier |= runtime.Transit(image, vk::ImageLayout::eColorAttachmentOptimal,
                                              vk::PipelineStageFlagBits2::eColorAttachmentOutput,
@@ -1071,31 +1329,37 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         auto& image = texture_cache.GetImage(image_id);
 
         const auto slice = image_view.info.range.base.layer;
-        const bool is_depth_clear =
-            (regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
-             regs.depth_control.depth_write_enable) ||
-            texture_cache.IsMetaCleared(htile_address, slice);
-        const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
+        const auto clear_aspects = DepthStencilClearAspects(
+            regs.depth_buffer, regs.depth_control, regs.depth_render_control,
+            texture_cache.IsMetaCleared(htile_address, slice));
+        const bool is_depth_clear = bool(clear_aspects & vk::ImageAspectFlagBits::eDepth);
+        const bool is_stencil_clear = bool(clear_aspects & vk::ImageAspectFlagBits::eStencil);
         texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
         const bool has_stencil = image.info.props.has_stencil;
         // Stencil writes can be enabled while depth writes are off.
         const bool stencil_write =
-            has_stencil && regs.depth_control.stencil_enable && !desc.view_info.is_storage;
-        const auto new_layout = desc.view_info.is_storage
-                                    ? has_stencil ? vk::ImageLayout::eDepthStencilAttachmentOptimal
-                                                  : vk::ImageLayout::eDepthAttachmentOptimal
-                                : stencil_write
-                                    ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
-                                : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                              : vk::ImageLayout::eDepthReadOnlyOptimal;
-        needs_barrier |= runtime.Transit(&image, new_layout,
-                                         vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                             vk::PipelineStageFlagBits2::eLateFragmentTests,
-                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                                         desc.view_info.range);
+            has_stencil &&
+            (is_stencil_clear || (regs.depth_control.stencil_enable && !desc.view_info.is_storage));
+        const auto new_layout = DepthAttachmentLayout(
+            has_stencil, desc.view_info.is_storage || is_depth_clear, stencil_write,
+            image.binding.is_bound, instance.IsAttachmentFeedbackLoopLayoutSupported());
+        if (image.binding.is_bound &&
+            (desc.view_info.is_storage || is_depth_clear || stencil_write)) {
+            attachment_feedback_loop |= image.aspect_mask;
+        }
+        needs_barrier |=
+            runtime.Transit(&image, new_layout,
+                            vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                vk::PipelineStageFlagBits2::eLateFragmentTests |
+                                (image.binding.is_bound ? vk::PipelineStageFlagBits2::eAllGraphics
+                                                        : vk::PipelineStageFlagBits2::eNone),
+                            vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                                vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                (image.binding.is_bound ? vk::AccessFlagBits2::eShaderRead
+                                                        : vk::AccessFlagBits2::eNone),
+                            desc.view_info.range);
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);
@@ -1174,11 +1438,15 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    if (num_bytes == 0) {
+        return;
+    }
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
-        if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
+        if (!buffer_cache.IsRegionGpuModified(address, num_bytes) &&
+            !buffer_cache.HasGpuImageAlias(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             return;
@@ -1190,19 +1458,25 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         }
         return buffer_cache.ObtainBuffer(address, num_bytes, true);
     }();
+    if (!is_gds) {
+        texture_cache.InvalidateMemoryFromGPU(address, num_bytes);
+    }
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
-    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
+    if (num_bytes == 0) {
+        return;
+    }
+    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
+        !buffer_cache.HasGpuImageAlias(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
-            !texture_cache.FindImageFromRange(src, num_bytes)) {
+            !buffer_cache.HasGpuImageAlias(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             return;
         }
     }
-    texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (src_gds) {
@@ -1216,6 +1490,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         }
         return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
     }();
+    if (!dst_gds) {
+        texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+    }
     const vk::BufferCopy copy = {
         .srcOffset = src_offset,
         .dstOffset = dst_offset,
@@ -1363,6 +1640,26 @@ void Rasterizer::UpdateViewportScissorState() const {
             // Unrestricted depth range not supported by device. Restrict to valid range.
             viewport.minDepth = std::max(viewport.minDepth, 0.f);
             viewport.maxDepth = std::min(viewport.maxDepth, 1.f);
+        }
+
+        if (regs.primitive_type == AmdGpu::PrimitiveType::QuadList &&
+            regs.depth_buffer.DepthValid() &&
+            regs.depth_buffer.z_info.format == AmdGpu::DepthBuffer::ZFormat::Z32Float &&
+            !regs.depth_shader_control.z_export_enable && !regs.polygon_control.NeedsBias()) {
+            const auto far_depth =
+                ReadOnlyFarDepthMax(viewport.minDepth, viewport.maxDepth, regs.depth_control);
+            if (far_depth != viewport.maxDepth) {
+                static const bool logged = [&] {
+                    LOG_INFO(
+                        Render_Vulkan,
+                        "Applying read-only far-depth precision workaround: viewport=[{}, {}], "
+                        "guest clamp=[{}, {}], scale={}, offset={}",
+                        viewport.minDepth, viewport.maxDepth, vp_d.zmin, vp_d.zmax, zscale,
+                        zoffset);
+                    return true;
+                }();
+                viewport.maxDepth = far_depth;
+            }
         }
 
         if (regs.IsClipDisabled()) {

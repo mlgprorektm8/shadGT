@@ -37,6 +37,13 @@ public:
         });
     }
 
+    /// Mark a fully synchronized region as authoritative in the buffer cache.
+    void MarkRegionAsGpuModified(VAddr cpu_addr, u64 size) {
+        IteratePages<true>(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->template ChangeRegionState<StateOp::None, StateOp::Set>(offset, size);
+        });
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr cpu_addr, u64 size, bool is_write) noexcept {
         IteratePages(cpu_addr, size, [is_write](RegionManager* manager, u64 offset, u64 size) {

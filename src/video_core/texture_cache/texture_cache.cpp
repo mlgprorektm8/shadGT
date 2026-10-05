@@ -126,7 +126,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
         const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
         image.hash = XXH3_64bits(addr, image.info.guest_size);
     }
-    image.flags |= ImageFlagBits::MaybeCpuDirty;
+    image.flags = ImageFlagsAfterCpuWrite(image.flags, true);
     UntrackImage(image_id);
 }
 
@@ -147,7 +147,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
         if (image.Overlaps(addr, size)) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
-            image.flags |= ImageFlagBits::CpuDirty;
+            image.flags = ImageFlagsAfterCpuWrite(image.flags);
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -170,9 +170,9 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
-        // Only consider images that match base address.
-        // TODO: Maybe also consider subresources
-        if (image.info.guest_address != address) {
+        // Only full-image preservation proves an interior buffer write can invalidate a
+        // clean rendered alias, including after a texture refresh cleared its dirty flag.
+        if (!CanInvalidateImageFromGPU(image.flags, image.info.guest_address == address)) {
             return;
         }
         // Ensure image is reuploaded when accessed again.
@@ -270,6 +270,21 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
+        // Cropped descriptors need their own image because views cannot change dimensions.
+        if (image_info.IsSubrectOf(cache_image.info)) {
+            ImageId result_id = merged_image_id;
+            if (!result_id) {
+                result_id = slot_images.Insert(instance, runtime, slot_image_views, image_info);
+                RegisterImage(result_id);
+            }
+            auto& source = slot_images[cache_image_id];
+            auto& destination = slot_images[result_id];
+            if (source.contents_version > destination.contents_version && source.SafeToDownload()) {
+                runtime.CopySubrect(&source, &destination);
+            }
+            return {result_id, -1, -1};
+        }
+
         const u32 lhs_block_size = image_info.num_bits * image_info.num_samples;
         const u32 rhs_block_size = cache_image.info.num_bits * cache_image.info.num_samples;
         if (image_info.BlockDim() != cache_image.info.BlockDim() ||
@@ -531,6 +546,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (cache_image.info.size != info.size) {
             continue;
         }
+        // Depth attachment formats must agree with the pipeline, even when their sampled
+        // aspects are compatible. Let overlap resolution preserve and convert their contents.
+        if (desc.type == BindingType::DepthTarget &&
+            (cache_image.info.pixel_format != info.pixel_format ||
+             cache_image.info.props.has_stencil != info.props.has_stencil)) {
+            continue;
+        }
         if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
             (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
             continue;
@@ -556,6 +578,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                 image_id = overlap_image_id;
                 view_mip = overlap_view_mip;
                 view_slice = overlap_view_slice;
+            }
+        }
+    } else {
+        for (const auto& cache_id : image_ids) {
+            if (cache_id != image_id &&
+                slot_images[image_id].info.IsSubrectOf(slot_images[cache_id].info)) {
+                ResolveOverlap(slot_images[image_id].info, desc.type, cache_id, image_id);
             }
         }
     }
@@ -626,7 +655,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
-        image.flags |= ImageFlagBits::GpuModified;
+        image.MarkGpuModified();
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
@@ -639,7 +668,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
-    image.flags |= ImageFlagBits::GpuModified;
+    image.MarkGpuModified();
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
@@ -665,7 +694,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
-    image.flags |= ImageFlagBits::GpuModified;
+    image.MarkGpuModified();
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
 
@@ -764,7 +793,7 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     if (image_copies.empty()) {
-        image.flags &= ~ImageFlagBits::Dirty;
+        image.flags = ImageFlagsAfterBufferUpload(image.flags, false);
         return;
     }
 
@@ -777,7 +806,8 @@ void TextureCache::RefreshImage(Image& image) {
         copy.bufferOffset += offset;
     }
 
-    runtime.UploadImage(&image, buffer, image_copies);
+    // Refresh covers every mip and layer from the canonical guest buffer footprint.
+    runtime.UploadImage(&image, buffer, image_copies, true);
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,

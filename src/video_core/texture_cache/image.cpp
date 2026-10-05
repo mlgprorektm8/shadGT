@@ -17,6 +17,7 @@ namespace VideoCore {
 using namespace Vulkan;
 
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
+Common::IncrementalIdProvider<u64> Image::global_contents_version{};
 
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
                                            const ImageInfo& info) {
@@ -24,13 +25,13 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
                                 vk::ImageUsageFlagBits::eTransferDst |
                                 vk::ImageUsageFlagBits::eSampled;
     if (!info.props.is_block) {
+        if (instance.IsAttachmentFeedbackLoopLayoutSupported()) {
+            usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+        }
         if (info.props.is_depth) {
             usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
         } else {
             usage |= vk::ImageUsageFlagBits::eColorAttachment;
-            if (instance.IsAttachmentFeedbackLoopLayoutSupported()) {
-                usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
-            }
             // Always create images with storage flag to avoid needing re-creation in case of e.g
             // compute clears This sacrifices a bit of performance but is less work. ExtendedUsage
             // flag is also used. The exception here is for multisample images when storage is not
@@ -117,8 +118,14 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
-    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
-               vk::to_string(vk::Result{result}));
+    ASSERT_MSG(result == VK_SUCCESS,
+               "Failed allocating image: error={} format={} type={} extent={}x{}x{} "
+               "mips={} layers={} samples={} flags={} usage={} tiling={}",
+               vk::to_string(vk::Result{result}), vk::to_string(image_ci.format),
+               vk::to_string(image_ci.imageType), image_ci.extent.width, image_ci.extent.height,
+               image_ci.extent.depth, image_ci.mipLevels, image_ci.arrayLayers,
+               vk::to_string(image_ci.samples), vk::to_string(image_ci.flags),
+               vk::to_string(image_ci.usage), vk::to_string(image_ci.tiling));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
 }

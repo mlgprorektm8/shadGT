@@ -121,6 +121,9 @@ private:
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    void LogInvalidTextureContext(const Shader::Info& stage, u32 sharp_offset);
+    void RebindTextures(bool is_compute, u32 num_color_targets);
+    void FinalizeTextureLayouts(RenderState* render_state = nullptr);
     bool BindResources(const Pipeline* pipeline);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
@@ -160,11 +163,20 @@ private:
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
 
+    struct BoundTexture {
+        u32 descriptor_index;
+        VideoCore::ImageId image_id;
+        VideoCore::TextureCache::ImageDesc desc;
+        vk::Image backing_image;
+    };
+    boost::container::static_vector<BoundTexture, Shader::NUM_IMAGES> bound_textures;
+
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
         u64 offset;
         u32 size;
         bool is_written;
+        VAddr guest_address{};
     };
     boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
@@ -173,8 +185,9 @@ private:
     Pipeline::DescriptorWrites set_writes;
     Shader::PushData push_data;
 
-    bool attachment_feedback_loop{};
+    vk::ImageAspectFlags attachment_feedback_loop{};
     bool needs_barrier{};
+    u32 invalid_texture_context_count{};
 };
 
 } // namespace Vulkan

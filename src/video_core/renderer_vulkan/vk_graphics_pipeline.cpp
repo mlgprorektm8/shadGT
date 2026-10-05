@@ -198,7 +198,9 @@ GraphicsPipeline::GraphicsPipeline(
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
-            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
+            sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
+                type, fs_info, *infos[u32(Shader::SwStage::Vertex)],
+                infos[u32(Shader::SwStage::Fragment)]);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
@@ -217,7 +219,8 @@ GraphicsPipeline::GraphicsPipeline(
         if (!preloading) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
             sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
-                AuxShaderType::PassthroughTES, fs_info);
+                AuxShaderType::PassthroughTES, fs_info, *infos[u32(Shader::SwStage::Vertex)],
+                infos[u32(Shader::SwStage::Fragment)]);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
@@ -390,6 +393,14 @@ GraphicsPipeline::GraphicsPipeline(
             attachments[i].dstColorBlendFactor = dst_color == vk::BlendFactor::eSrcAlpha
                                                      ? vk::BlendFactor::eOne
                                                      : vk::BlendFactor::eZero; // 1-A
+        }
+
+        if (key.color_buffers[i].blend_swizzled_alpha) {
+            LiverpoolToVK::SetSwizzledAlphaBlend(attachments[i]);
+            static const bool logged = [] {
+                LOG_INFO(Render_Vulkan, "Using dual-source swizzled source-alpha blend emulation");
+                return true;
+            }();
         }
     }
 

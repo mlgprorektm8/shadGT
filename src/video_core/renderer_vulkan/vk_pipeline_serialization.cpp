@@ -12,10 +12,11 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-// Image bindings now distinguish ordinary sampling from depth comparison sampling.
-static constexpr u32 ShaderBinaryVersion = 7u;
-static constexpr u32 ShaderMetaVersion = 6u;
-static constexpr u32 PipelineKeyVersion = 3u;
+// Synthetic dual-source exports change the fragment shader interface.
+static constexpr u32 ShaderBinaryVersion = 12u;
+// Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
+static constexpr u32 ShaderMetaVersion = 11u;
+static constexpr u32 PipelineKeyVersion = 7u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -247,18 +248,17 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 }
 
 bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) {
-    auto program = std::make_unique<Program>();
+    auto info = std::make_unique<Shader::Info>();
     Shader::StageSpecialization spec{};
-    spec.info = &program->info;
+    spec.info = info.get();
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, *info, spec, perm_idx)) {
         return false;
     }
 
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
-                                       spv);
+                                       fmt::format("{:#018x}_{}", info->pgm_hash, perm_idx), spv);
     if (spv.empty()) {
         return false;
     }
@@ -268,10 +268,10 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
     vk::ShaderModule module{};
 
-    auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
+    auto [it_pgm, new_program] = program_cache.try_emplace(info->pgm_hash);
     if (new_program) {
         module = CompileSPV(spv, instance.GetDevice());
-        it_pgm.value() = std::move(program);
+        it_pgm.value() = std::make_unique<Program>();
     } else {
         const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
         if (it != it_pgm.value()->modules.end()) {
@@ -283,17 +283,31 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                 LOG_WARNING(Render_Vulkan,
                             "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
                             "preload",
-                            perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
+                            perm_idx, info->hw_stage, info->pgm_hash, idx);
                 return false;
             }
             module = it->module;
+            infos[stage] = it->info.get();
+            modules[stage] = module;
+            if (auto& fetch = it->spec.fetch_shader_data; !fetch.Empty()) {
+                fetch_shader = &fetch;
+            }
+            return true;
         } else {
+            if (perm_idx < it_pgm.value()->modules.size() &&
+                it_pgm.value()->modules[perm_idx].info) {
+                LOG_WARNING(Render_Vulkan,
+                            "Conflicting metadata for cached permutation {} of {}_{:x}, "
+                            "skipping preload",
+                            perm_idx, info->hw_stage, info->pgm_hash);
+                return false;
+            }
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
-    it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
+    it_pgm.value()->InsertPermut(module, std::move(spec), std::move(info), perm_idx);
 
-    infos[stage] = &it_pgm.value()->info;
+    infos[stage] = it_pgm.value()->modules[perm_idx].info.get();
     modules[stage] = module;
     if (auto& fetch = it_pgm.value()->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;

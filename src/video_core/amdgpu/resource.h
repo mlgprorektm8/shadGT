@@ -223,13 +223,22 @@ struct Image {
     }
 
     [[nodiscard]] u32 NumLayers() const noexcept {
-        // Depth is the number of layers for Array images.
-        u32 slices = depth + 1;
         const auto image_type = GetType();
-        if (image_type == ImageType::Color3D) {
-            // Depth is the actual texture depth for 3D images.
-            slices = 1;
-        } else if (image_type == ImageType::Cube) {
+        switch (image_type) {
+        case ImageType::Color1D:
+        case ImageType::Color2D:
+        case ImageType::Color2DMsaa:
+        case ImageType::Color3D:
+            // Non-array images have one layer. Depth is only a volume extent for 3D images;
+            // simple 1D/2D descriptors may omit the extended descriptor words entirely.
+            return 1;
+        default:
+            break;
+        }
+
+        // Depth is the number of layers minus one for array images.
+        u32 slices = depth + 1;
+        if (image_type == ImageType::Cube) {
             // Depth is the number of full cubes for Cube images.
             slices *= 6;
         }

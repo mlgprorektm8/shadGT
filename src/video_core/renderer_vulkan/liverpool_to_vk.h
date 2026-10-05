@@ -33,6 +33,10 @@ vk::BlendFactor BlendFactor(AmdGpu::BlendControl::BlendFactor factor);
 
 bool IsDualSourceBlendFactor(AmdGpu::BlendControl::BlendFactor factor);
 
+bool NeedsSwizzledAlphaBlend(AmdGpu::CompMapping swizzle, const AmdGpu::BlendControl& control);
+
+void SetSwizzledAlphaBlend(vk::PipelineColorBlendAttachmentState& attachment);
+
 vk::BlendOp BlendOp(AmdGpu::BlendControl::BlendFunc func);
 
 vk::LogicOp LogicOp(AmdGpu::ColorControl::LogicOp logic_op);
@@ -93,9 +97,18 @@ constexpr size_t GetSurfaceFormatTableIndex(AmdGpu::DataFormat data_format,
     return result;
 }
 
+constexpr vk::Format TrySurfaceFormat(AmdGpu::DataFormat data_format,
+                                      AmdGpu::NumberFormat num_format) noexcept {
+    if (u32(data_format) >= (1u << amd_gpu_data_format_bit_size) ||
+        u32(num_format) >= (1u << amd_gpu_number_format_bit_size)) {
+        return vk::Format::eUndefined;
+    }
+    return surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
+}
+
 constexpr vk::Format SurfaceFormat(AmdGpu::DataFormat data_format,
                                    AmdGpu::NumberFormat num_format) noexcept {
-    vk::Format result = surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
+    vk::Format result = TrySurfaceFormat(data_format, num_format);
     bool found =
         result != vk::Format::eUndefined || data_format == AmdGpu::DataFormat::FormatInvalid;
     ASSERT_MSG(found, "Unknown data_format={} and num_format={}", static_cast<u32>(data_format),

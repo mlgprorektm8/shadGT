@@ -31,6 +31,7 @@ class StagingBufferPool;
 namespace VideoCore {
 
 class TextureCache;
+struct Image;
 class MemoryTracker;
 class PageManager;
 
@@ -95,6 +96,9 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// Returns true when host-memory shortcuts would bypass rendered image contents.
+    [[nodiscard]] bool HasGpuImageAlias(VAddr addr, size_t size);
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
@@ -124,7 +128,9 @@ private:
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
 
-    bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
+    bool SynchronizeMetadata(const Buffer* arena, VAddr device_addr, u32 size);
+
+    void SynchronizeMemoryFromImage(VAddr device_addr, u32 size);
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -138,11 +144,11 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    u32 image_alias_exports_logged{};
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
     bool fault_process_pending{};
-
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;

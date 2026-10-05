@@ -3,6 +3,7 @@
 
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/program.h"
+#include "shader_recompiler/ir/passes/shared_memory_to_storage.h"
 #include "shader_recompiler/profile.h"
 
 namespace Shader::Optimization {
@@ -134,7 +135,9 @@ void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_
             const IR::U32 handle = ir.Imm32(binding);
             const IR::U32 offset = ir.IMul(ir.GetAttributeU32(IR::Attribute::WorkgroupIndex),
                                            ir.Imm32(shared_memory_size));
-            const IR::U32 address = ir.IAdd(IR::U32{inst.Arg(0)}, offset);
+            const IR::U32 byte_address = ir.IAdd(IR::U32{inst.Arg(0)}, offset);
+            const IR::U32 address = ir.ShiftRightLogical(
+                byte_address, ir.Imm32(SharedMemoryAccessIndexShift(inst.GetOpcode())));
             switch (inst.GetOpcode()) {
             case IR::Opcode::SharedAtomicIAdd32:
             case IR::Opcode::SharedAtomicIAdd64:

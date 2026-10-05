@@ -278,7 +278,8 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
 }
 
 void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
-                            const VideoCore::Buffer* out_buffer, u64 out_offset) {
+                            const VideoCore::Buffer* out_buffer, u64 out_offset,
+                            bool preserve_padding) {
     const auto& info = in_image.info;
     if (!info.props.is_tiled) {
         for (auto& copy : buffer_copies) {
@@ -307,13 +308,21 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .range = sizeof(params),
     };
 
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal,
-                                                          256, false, true);
+    // Image downloads only write actual texels. Seed the linear padding from the old guest
+    // buffer before retiling, so exporting an image cannot destroy adjacent alias bytes.
+    const auto [linear_buffer, linear_offset] = [&]() -> std::pair<const Buffer*, u64> {
+        if (preserve_padding) {
+            return DetileImage(out_buffer, out_offset, info);
+        }
+        const auto staging = runtime.GetStagingPool().Request(
+            info.guest_size, MemoryType::DeviceLocal, 256, false, true);
+        return std::pair{staging.buffer, staging.offset};
+    }();
     for (auto& copy : buffer_copies) {
-        copy.bufferOffset += staging.offset;
+        copy.bufferOffset += linear_offset;
     }
 
-    runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
+    runtime.DownloadImage(&in_image, linear_buffer, buffer_copies);
     runtime.FlushBarriers();
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -326,8 +335,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     };
 
     const vk::DescriptorBufferInfo linear_buffer_info{
-        .buffer = staging.buffer->Handle(),
-        .offset = staging.offset,
+        .buffer = linear_buffer->Handle(),
+        .offset = linear_offset,
         .range = info.guest_size,
     };
 

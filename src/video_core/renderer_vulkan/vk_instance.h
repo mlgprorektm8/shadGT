@@ -351,6 +351,11 @@ public:
         return properties.limits.maxSamplerAnisotropy;
     }
 
+    /// Returns the cached physical device limits for image descriptor validation.
+    const vk::PhysicalDeviceLimits& GetImageLimits() const {
+        return properties.limits;
+    }
+
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
         return push_descriptor_props.maxPushDescriptors;
@@ -421,6 +426,10 @@ public:
     /// Returns true if logic ops are supported by the device.
     bool IsLogicOpSupported() const {
         return features.logicOp;
+    }
+
+    bool IsDualSourceBlendSupported() const {
+        return features.dualSrcBlend;
     }
 
     /// Returns whether VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT is supported on compressed

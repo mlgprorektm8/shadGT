@@ -47,7 +47,8 @@ public:
     ~TileManager();
 
     void TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
-                   const VideoCore::Buffer* out_buffer, u64 out_offset);
+                   const VideoCore::Buffer* out_buffer, u64 out_offset,
+                   bool preserve_padding = false);
 
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
                                               const ImageInfo& info);

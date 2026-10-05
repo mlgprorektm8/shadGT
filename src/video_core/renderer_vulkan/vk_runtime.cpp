@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/buffer_copy.h"
+#include "video_core/renderer_vulkan/depth_attachment.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -82,7 +84,14 @@ static u32 BufferImageCopySize(const vk::BufferImageCopy& copy, const vk::Format
     const u32 height = copy.bufferImageHeight ? copy.bufferImageHeight : copy.imageExtent.height;
 
     const auto block = vk::blockExtent(pixel_format);
-    const u32 block_size = vk::blockSize(pixel_format);
+    const u32 block_size =
+        copy.imageSubresource.aspectMask == vk::ImageAspectFlagBits::eDepth
+            ? pixel_format == vk::Format::eD16Unorm || pixel_format == vk::Format::eD16UnormS8Uint
+                  ? 2u
+                  : 4u
+        : copy.imageSubresource.aspectMask == vk::ImageAspectFlagBits::eStencil
+            ? 1u
+            : vk::blockSize(pixel_format);
     const u32 row_pitch = (row_length / block[0]) * block_size;
     const u32 slice_pitch = (height / block[1]) * row_pitch;
 
@@ -109,6 +118,11 @@ void Runtime::TickFrame() {
 
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
+    SmallVector<vk::BufferCopy, 8> non_empty_copies;
+    copies = NonEmptyBufferCopies(copies, non_empty_copies);
+    if (copies.empty()) {
+        return;
+    }
     scheduler.EndRendering();
 
     bool needs_flush{};
@@ -132,6 +146,9 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
 }
 
 void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value) {
+    if (size == 0) {
+        return;
+    }
     scheduler.EndRendering();
 
     if (IsBufferAccessed(dst, offset, size, true)) {
@@ -180,7 +197,9 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
 }
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
-                          std::span<const vk::BufferImageCopy> upload_copies) {
+                          std::span<const vk::BufferImageCopy> upload_copies,
+                          bool preserve_buffer_coherence) {
+    dst->MarkModified();
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
 
@@ -205,7 +224,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                      vk::AccessFlagBits2::eTransferRead);
     }
 
-    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    dst->flags = VideoCore::ImageFlagsAfterBufferUpload(dst->flags, preserve_buffer_coherence);
 }
 
 void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
@@ -329,15 +348,56 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, regions);
 
-    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+    dst->MarkGpuModified(src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+void Runtime::CopySubrect(VideoCore::Image* src, VideoCore::Image* dst) {
+    ASSERT(dst->info.IsSubrectOf(src->info));
+    SetBackingSamples(dst, dst->info.num_samples, false);
+    SetBackingSamples(src, src->info.num_samples);
+    scheduler.EndRendering();
+
+    const auto src_state = src->backing->state;
+    bool needs_flush =
+        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
+                vk::AccessFlagBits2::eTransferRead);
+    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
+                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+    if (needs_flush) {
+        FlushBarriers();
+    }
+
+    const vk::ImageCopy copy{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .srcOffset = {0, 0, 0},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstOffset = {0, 0, 0},
+        .extent = {dst->info.size.width, dst->info.size.height, 1},
+    };
+    scheduler.CommandBuffer().copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+                                        dst->GetImage(), vk::ImageLayout::eTransferDstOptimal,
+                                        copy);
+
+    // The source may already have a descriptor bound in this draw.
+    if (Transit(src, src_state.layout, src_state.pl_stage, src_state.access_mask)) {
+        FlushBarriers();
+    }
+    dst->MarkGpuModified();
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    dst->contents_version = src->contents_version;
+}
+
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
-                                  const VideoCore::Buffer* buffer, u64 offset) {
+                                  const VideoCore::Buffer* buffer, u64 offset,
+                                  std::optional<VideoCore::SubresourceRange> sub_range) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
+    ASSERT(num_mips == 1);
+    const u32 base_layer = sub_range ? sub_range->base.layer : 0;
+    ASSERT(base_layer < num_layers);
+    const u32 copy_layers =
+        sub_range ? std::min<u32>(sub_range->extent.layers, num_layers - base_layer) : num_layers;
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
@@ -349,11 +409,13 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         .imageSubresource{
             .aspectMask = src->aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
             .mipLevel = 0u,
-            .baseArrayLayer = 0,
-            .layerCount = num_layers,
+            .baseArrayLayer = base_layer,
+            .layerCount = copy_layers,
         },
         .imageOffset = {0, 0, 0},
-        .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+        .imageExtent = {std::min(src->info.size.width, dst->info.size.width),
+                        std::min(src->info.size.height, dst->info.size.height),
+                        std::min(src->info.size.depth, dst->info.size.depth)},
     };
     const auto copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
 
@@ -389,7 +451,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     cmdbuf.copyBufferToImage(buffer->Handle(), dst->GetImage(),
                              vk::ImageLayout::eTransferDstOptimal, buffer_copy);
 
-    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+    dst->MarkGpuModified(src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -441,17 +503,18 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, image_copy);
 
-    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+    dst->MarkGpuModified(src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
-        if (instance.IsMaintenance8Supported() ||
-            src->info.props.is_depth == dst->info.props.is_depth) {
+        if (!DepthCopyNeedsBuffer(src->info.pixel_format, dst->info.pixel_format,
+                                  src->info.props.is_depth, dst->info.props.is_depth,
+                                  instance.IsMaintenance8Supported())) {
             CopyImage(src, dst);
         } else {
-            // Perform depth from/to color copy using the intermediate copy buffer.
+            // Preserve the depth plane across format changes through an intermediate buffer.
             static constexpr size_t COPY_BUFFER_SIZE = 128_MB;
             const auto copy_ref =
                 staging_pool.Request(COPY_BUFFER_SIZE, VideoCore::MemoryType::DeviceLocal);
@@ -474,6 +537,8 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
         blit_helper->ReinterpretColorAsMsDepth(
             dst->info.size.width, dst->info.size.height, dst->info.num_samples,
             src->info.pixel_format, dst->info.pixel_format, src->GetImage(), dst->GetImage());
+        dst->MarkGpuModified();
+        dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
     } else {
         LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
     }
@@ -481,6 +546,11 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
 
 void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
                                const VideoCore::SubresourceRange& sub_range) {
+    if (src->info.pixel_format != dst->info.pixel_format) {
+        const auto copy_ref = staging_pool.Request(128_MB, VideoCore::MemoryType::DeviceLocal);
+        CopyImageWithBuffer(src, dst, copy_ref.buffer, copy_ref.offset, sub_range);
+        return;
+    }
     scheduler.EndRendering();
 
     bool needs_flush =
@@ -516,7 +586,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, region);
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->MarkGpuModified();
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -582,7 +652,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                             vk::ImageLayout::eTransferDstOptimal, region);
     }
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->MarkGpuModified();
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -608,7 +678,7 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
     cmdbuf.clearColorImage(dst->GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
                            vk_range);
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->MarkGpuModified();
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -619,6 +689,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     if (!backing || backing->num_samples == num_samples) {
         return;
     }
+    image->flags &= ~VideoCore::ImageFlagBits::BufferCoherent;
     ASSERT_MSG(!image->info.props.is_depth, "Swapping samples is only valid for color images");
     VideoCore::Image::BackingImage* new_backing;
     auto it = std::ranges::find(backing_images, num_samples,

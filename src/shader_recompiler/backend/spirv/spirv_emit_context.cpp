@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -279,7 +280,8 @@ void EmitContext::DefineAmdPerVertexAttribs() {
     }
     for (s32 i = 0; i < runtime_info.hw.fs.num_inputs; i++) {
         const auto& input = runtime_info.hw.fs.inputs[i];
-        if (input.IsDefault() || info.fs_interpolation[i].primary != Qualifier::PerVertex) {
+        if (input.IsDefault() || !info.loads.GetAny(IR::Attribute::Param0 + i) ||
+            info.fs_interpolation[i].primary != Qualifier::PerVertex) {
             continue;
         }
         auto& param = input_params[i];
@@ -449,10 +451,10 @@ void EmitContext::DefineInputs() {
 
         for (s32 i = 0; i < num_inputs; i++) {
             const auto& input = runtime_info.hw.fs.inputs[i];
-            if (input.IsDefault()) {
+            const IR::Attribute param = IR::Attribute::Param0 + i;
+            if (input.IsDefault() || !info.loads.GetAny(param)) {
                 continue;
             }
-            const IR::Attribute param = IR::Attribute::Param0 + i;
             const u32 num_components = info.loads.NumComponents(param);
             const auto [primary, auxiliary] = info.fs_interpolation[i];
             const Id type = F32[num_components];
@@ -611,7 +613,13 @@ void EmitContext::DefineVertexBlock() {
             DefineVariable(F32[1], spv::BuiltIn::PointSize, spv::StorageClass::Output);
     }
     if (info.stores.GetAny(IR::Attribute::RenderTargetIndex)) {
-        output_layer = DefineVariable(U32[1], spv::BuiltIn::Layer, spv::StorageClass::Output);
+        if (sw_stage == SwStage::Vertex && runtime_info.sw.vs.tess_emulated_primitive) {
+            // Layer cannot be a tessellation-control input builtin. Carry it as a user
+            // varying until the auxiliary evaluation shader writes the final builtin.
+            output_layer = DefineOutput(U32[1], AuxLayerLocation);
+        } else {
+            output_layer = DefineVariable(U32[1], spv::BuiltIn::Layer, spv::StorageClass::Output);
+        }
     }
     if (info.stores.GetAny(IR::Attribute::ViewportIndex)) {
         output_viewport_index =
@@ -634,6 +642,9 @@ void EmitContext::DefineOutputs() {
             const bool needs_clip_distance_emulation =
                 hw_stage == HwStage::Vertex && profile.needs_clip_distance_emulation &&
                 info.stores.GetAny(IR::Attribute::ClipDistance);
+            const bool exports_layer = runtime_info.sw.vs.tess_emulated_primitive &&
+                                       info.stores.GetAny(IR::Attribute::RenderTargetIndex);
+            const u32 layer_offset = exports_layer ? 1 : 0;
             u32 num_attrs = 0u;
             for (u32 i = 0; i < IR::NumParams; i++) {
                 const IR::Attribute param{IR::Attribute::Param0 + i};
@@ -642,7 +653,8 @@ void EmitContext::DefineOutputs() {
                 }
                 const u32 num_components = info.stores.NumComponents(param);
                 const Id id{
-                    DefineOutput(F32[num_components], i + (needs_clip_distance_emulation ? 1 : 0))};
+                    DefineOutput(F32[num_components],
+                                 i + (needs_clip_distance_emulation ? 1 : 0) + layer_offset)};
                 Name(id, fmt::format("out_attr{}", i));
                 output_params[i] =
                     GetAttributeInfo(AmdGpu::NumberFormat::Float, id, num_components, true);
@@ -650,7 +662,7 @@ void EmitContext::DefineOutputs() {
             }
 
             if (needs_clip_distance_emulation) {
-                clip_distances = Id{DefineOutput(F32[MaxEmulatedClipDistances], 0)};
+                clip_distances = Id{DefineOutput(F32[MaxEmulatedClipDistances], layer_offset)};
                 output_params[num_attrs] = GetAttributeInfo(
                     AmdGpu::NumberFormat::Float, clip_distances, MaxEmulatedClipDistances, true);
                 Name(clip_distances, fmt::format("cldist_attr{}", 0));

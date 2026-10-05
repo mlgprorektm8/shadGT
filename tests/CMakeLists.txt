@@ -15,6 +15,27 @@ target_link_libraries(shadps4_stencil_test PRIVATE GTest::gtest_main fmt::fmt)
 include(GoogleTest)
 gtest_discover_tests(shadps4_stencil_test)
 
+add_executable(shadps4_depth_attachment_test test_depth_attachment.cpp)
+target_include_directories(shadps4_depth_attachment_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_depth_attachment_test PRIVATE GTest::gtest_main fmt::fmt Vulkan::Headers)
+gtest_discover_tests(shadps4_depth_attachment_test)
+
+add_executable(shadps4_color_clear_test test_color_clear.cpp test_color_blend.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/liverpool_to_vk.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/number_utils.cpp)
+target_include_directories(shadps4_color_clear_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_color_clear_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_color_clear_test PRIVATE
+    GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers magic_enum::magic_enum half::half)
+gtest_discover_tests(shadps4_color_clear_test)
+
+add_executable(shadps4_buffer_copy_test test_buffer_copy.cpp)
+target_include_directories(shadps4_buffer_copy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_buffer_copy_test PRIVATE
+    GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
+gtest_discover_tests(shadps4_buffer_copy_test)
+
 add_executable(shadps4_device_service_test test_device_service.cpp
     ${CMAKE_SOURCE_DIR}/src/core/libraries/device_service/device_service.cpp)
 target_include_directories(shadps4_device_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -41,6 +62,44 @@ add_executable(shadps4_image_resource_test test_image_resource.cpp)
 target_include_directories(shadps4_image_resource_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_image_resource_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers)
 gtest_discover_tests(shadps4_image_resource_test)
+
+add_executable(shadps4_shader_program_test test_shader_program.cpp)
+target_include_directories(shadps4_shader_program_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_shader_program_test PRIVATE
+    GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers tsl::robin_map xxHash::xxhash
+    magic_enum::magic_enum)
+gtest_discover_tests(shadps4_shader_program_test)
+
+add_executable(shadps4_image_aliasing_test test_image_aliasing.cpp)
+target_include_directories(shadps4_image_aliasing_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_image_aliasing_test PRIVATE
+    GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
+gtest_discover_tests(shadps4_image_aliasing_test)
+
+add_executable(shadps4_image_descriptor_test test_image_descriptor.cpp)
+target_include_directories(shadps4_image_descriptor_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_image_descriptor_test PRIVATE
+    GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
+gtest_discover_tests(shadps4_image_descriptor_test)
+
+add_executable(shadps4_aux_tessellation_test test_aux_tessellation.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/backend/spirv/emit_spirv_quad_rect.cpp)
+target_include_directories(shadps4_aux_tessellation_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_aux_tessellation_test PRIVATE
+    GTest::gtest_main fmt::fmt sirit Boost::headers magic_enum::magic_enum)
+gtest_discover_tests(shadps4_aux_tessellation_test)
+
+add_executable(shadps4_resource_binding_test test_resource_binding.cpp)
+target_include_directories(shadps4_resource_binding_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_resource_binding_test PRIVATE
+    GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
+gtest_discover_tests(shadps4_resource_binding_test)
+
+add_executable(shadps4_shared_memory_storage_test test_shared_memory_storage.cpp)
+target_include_directories(shadps4_shared_memory_storage_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_shared_memory_storage_test PRIVATE
+    GTest::gtest_main fmt::fmt Boost::headers magic_enum::magic_enum)
+gtest_discover_tests(shadps4_shared_memory_storage_test)
 
 add_executable(shadps4_ce_de_counter_test test_ce_de_counter.cpp)
 target_include_directories(shadps4_ce_de_counter_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -167,6 +226,9 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/constant_propagation_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/dead_code_elimination_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/shader_info_collection_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/resource_discover_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/resource_patching_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/ssa_rewrite_pass.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/post_order.cpp
     ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/post_order.h
@@ -187,6 +249,8 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/common/logging/classes.cpp
     ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
     ${CMAKE_SOURCE_DIR}/src/common/ntapi.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/decoder.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/signal_context.cpp
 
     # Stubs that replace dependencies
     stubs/common_stub.cpp
@@ -204,6 +268,9 @@ set(GCN_TEST_SOURCES
 
     # Tests
     gcn/test_gcn_instructions.cpp
+    test_dynamic_readconst.cpp
+    test_resource_patching.cpp
+    test_color_export.cpp
 )
 
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
@@ -247,6 +314,8 @@ target_link_libraries(shadps4_gcn_test PRIVATE
     SDL3::SDL3
     spdlog::spdlog
     half::half
+    xbyak::xbyak
+    Zydis::Zydis
 )
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR

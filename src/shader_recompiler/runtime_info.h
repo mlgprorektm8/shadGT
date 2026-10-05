@@ -177,6 +177,8 @@ struct PsColorBuffer {
     // pattern min/max(src*src, dst*dst) the shader squares its color output instead, keeping
     // the attachment in the squared domain end to end.
     u32 blend_self_scale : 1;
+    // The secondary blend source carries logical alpha independently of physical channel order.
+    u32 blend_swizzled_alpha : 1;
     AmdGpu::CompMapping swizzle;
 
     bool operator==(const PsColorBuffer& other) const = default;

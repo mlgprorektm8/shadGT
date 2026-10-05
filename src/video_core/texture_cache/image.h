@@ -31,10 +31,33 @@ enum ImageFlagBits : u32 {
     CpuDirty = 1 << 1,      ///< Contents have been modified from the CPU
     GpuDirty = 1 << 2, ///< Contents have been modified from the GPU (valid data in buffer cache)
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
-    GpuModified = 1 << 3, ///< Contents have been modified from the GPU
-    Registered = 1 << 6,  ///< True when the image is registered
+    GpuModified = 1 << 3,    ///< Contents have been modified from the GPU
+    BufferCoherent = 1 << 4, ///< Full guest footprint has been preserved in the buffer cache
+    Registered = 1 << 6,     ///< True when the image is registered
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
+
+constexpr ImageFlagBits ImageFlagsAfterGpuWrite(
+    ImageFlagBits flags, ImageFlagBits modified = ImageFlagBits::GpuModified) {
+    return (flags | modified) & ~ImageFlagBits::BufferCoherent;
+}
+
+constexpr ImageFlagBits ImageFlagsAfterCpuWrite(ImageFlagBits flags, bool maybe = false) {
+    return (flags | (maybe ? ImageFlagBits::MaybeCpuDirty : ImageFlagBits::CpuDirty)) &
+           ~ImageFlagBits::BufferCoherent;
+}
+
+constexpr ImageFlagBits ImageFlagsAfterBufferUpload(ImageFlagBits flags,
+                                                    bool preserve_buffer_coherence) {
+    flags &= ~ImageFlagBits::Dirty;
+    return preserve_buffer_coherence ? flags : flags & ~ImageFlagBits::BufferCoherent;
+}
+
+constexpr bool CanInvalidateImageFromGPU(ImageFlagBits flags, bool base_matches) {
+    const bool safe_to_download =
+        True(flags & ImageFlagBits::GpuModified) && False(flags & ImageFlagBits::Dirty);
+    return base_matches || !safe_to_download || True(flags & ImageFlagBits::BufferCoherent);
+}
 
 struct UniqueImage {
     explicit UniqueImage() = default;
@@ -105,6 +128,15 @@ struct Image : public Common::LRUNode<> {
         return True(flags & ImageFlagBits::GpuModified) && False(flags & ImageFlagBits::Dirty);
     }
 
+    void MarkModified() {
+        contents_version = global_contents_version.Next();
+    }
+
+    void MarkGpuModified(ImageFlagBits modified = ImageFlagBits::GpuModified) {
+        MarkModified();
+        flags = ImageFlagsAfterGpuWrite(flags, modified);
+    }
+
     void AssociateDepth(ImageId depth_image_id, u64 depth_image_uid) {
         depth_id = depth_image_id;
         depth_uid = depth_image_uid;
@@ -153,6 +185,7 @@ public:
     SmallVector<BackingImage, 2> backing_images;
     BackingImage* backing{};
     u64 image_uid{};
+    u64 contents_version{};
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
@@ -174,6 +207,7 @@ public:
 
 private:
     static Common::IncrementalIdProvider<u64> global_image_uid;
+    static Common::IncrementalIdProvider<u64> global_contents_version;
 };
 
 } // namespace VideoCore

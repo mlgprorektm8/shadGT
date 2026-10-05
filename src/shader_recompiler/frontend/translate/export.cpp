@@ -103,6 +103,14 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
                                     color_buffer.data_format == AmdGpu::DataFormat::Format8_8 ||
                                     color_buffer.data_format == AmdGpu::DataFormat::Format8_8_8_8);
 
+    if (color_buffer.blend_swizzled_alpha && mrt == IR::Attribute::RenderTarget0) {
+        const auto alpha = components[3].IsEmpty() ? ir.Imm32(1.f) : components[3];
+        for (u32 i = 0; i < 4; ++i) {
+            const auto factor = color_buffer.swizzle.Map(i) == 3 ? ir.Imm32(0.f) : alpha;
+            ir.SetAttribute(IR::Attribute::RenderTarget1, factor, i);
+        }
+    }
+
     // Swizzle components and export
     for (u32 i = 0; i < 4; ++i) {
         const auto swizzled_comp = components[color_buffer.swizzle.Map(i)];

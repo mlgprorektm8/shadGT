@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <vector>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -16,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/texture_cache/image_aliasing.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 #include <vk_mem_alloc.h>
@@ -169,8 +171,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    SynchronizeMemoryFromImage(device_addr, size);
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
+        !HasGpuImageAlias(device_addr, size)) {
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
@@ -181,9 +185,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
-    if (is_texel_buffer && !is_written) {
-        SynchronizeMemoryFromImage(arena, device_addr, size);
-    }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
     }
@@ -207,6 +208,18 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
+}
+
+bool BufferCache::HasGpuImageAlias(VAddr addr, size_t size) {
+    if (size == 0) {
+        return false;
+    }
+    bool found = false;
+    texture_cache.ForEachImageInRegion(addr, size, [&](ImageId, Image& image) {
+        found |= image.SafeToDownload();
+        return found;
+    });
+    return found;
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
@@ -348,12 +361,12 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         runtime.CopyBuffer(staging.buffer, arena, copies);
     }
     if (is_texel_buffer && !is_written) {
-        return SynchronizeMemoryFromImage(arena, device_addr, size);
+        return SynchronizeMetadata(arena, device_addr, size);
     }
     return false;
 }
 
-bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
+bool BufferCache::SynchronizeMetadata(const Buffer* arena, VAddr device_addr, u32 size) {
     if (auto type = texture_cache.IsMeta(device_addr)) {
         if (*type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;
@@ -363,44 +376,84 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
             LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
         }
     }
-    const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
-    if (!image_id) {
-        return false;
+    return false;
+}
+
+void BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
+    if (size == 0) {
+        return;
     }
-    Image& image = texture_cache.GetImage(image_id);
-    ASSERT_MSG(device_addr == image.info.guest_address,
-               "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
-               image.info.guest_address);
-    const u64 arena_offset = arena->Offset(device_addr);
-    boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
-    for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
-        const auto& mip_info = image.info.mips_layout[mip];
-        const u32 width = std::max(image.info.size.width >> mip, 1u);
-        const u32 height = std::max(image.info.size.height >> mip, 1u);
-        const u32 depth = std::max(image.info.size.depth >> mip, 1u);
-        if (arena_offset + mip_info.offset + mip_info.size > arena->size_bytes) {
-            break;
+    std::vector<ImageId> image_ids;
+    const auto collect = [&](ImageId id, Image&) {
+        if (std::ranges::find(image_ids, id) == image_ids.end()) {
+            image_ids.push_back(id);
         }
-        buffer_copies.push_back(vk::BufferImageCopy{
-            .bufferOffset = mip_info.offset,
-            .bufferRowLength = mip_info.pitch,
-            .bufferImageHeight = mip_info.height,
-            .imageSubresource{
-                .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
-                .mipLevel = mip,
-                .baseArrayLayer = 0,
-                .layerCount = image.info.resources.layers,
-            },
-            .imageOffset = {0, 0, 0},
-            .imageExtent = {width, height, depth},
-        });
+    };
+    texture_cache.ForEachImageInRegion(device_addr, size, collect);
+    const size_t requested_images = image_ids.size();
+    // Full exports must also consider aliases outside the requested buffer slice.
+    for (size_t i = 0; i < requested_images; ++i) {
+        const auto& image = texture_cache.GetImage(image_ids[i]);
+        if (image.SafeToDownload() && False(image.flags & ImageFlagBits::BufferCoherent)) {
+            texture_cache.ForEachImageInRegion(image.info.guest_address, image.info.guest_size,
+                                               collect);
+        }
     }
-    if (buffer_copies.empty()) {
-        return false;
+    std::vector<ImageAliasFootprint> footprints;
+    footprints.reserve(image_ids.size());
+    for (const auto id : image_ids) {
+        const auto& image = texture_cache.GetImage(id);
+        const auto& info = image.info;
+        const bool exportable = info.num_samples == 1 && image.backing->num_samples == 1 &&
+                                !info.props.has_stencil && info.guest_size <= UINT32_MAX &&
+                                info.pixel_format == image.backing->image.image_ci.format;
+        footprints.push_back(DescribeImageAlias(
+            info.guest_address, info.guest_size, image.flags,
+            gpu_modified_ranges.Intersects(info.guest_address, info.guest_size), exportable));
     }
-    auto& tile_manager = texture_cache.GetTileManager();
-    tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
-    return true;
+    for (const auto& export_image : PlanImageAliasExports(footprints, device_addr, size)) {
+        Image& image = texture_cache.GetImage(image_ids[export_image.index]);
+        const u64 first_block = export_image.address >> block_shift;
+        const u64 last_block = (export_image.address + export_image.size - 1) >> block_shift;
+        const auto* arena = GetArena(first_block, last_block);
+        EnsureResident(arena, first_block, last_block);
+        const auto arena_offset =
+            ImageAliasExportOffset(export_image, arena->cpu_addr, arena->size_bytes);
+        ASSERT(arena_offset.has_value());
+        SynchronizeMemory(arena, export_image.address, export_image.size, false, false);
+
+        boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
+        for (u32 mip = 0; mip < image.info.resources.levels; ++mip) {
+            const auto& mip_info = image.info.mips_layout[mip];
+            buffer_copies.push_back(vk::BufferImageCopy{
+                .bufferOffset = mip_info.offset,
+                .bufferRowLength = mip_info.pitch,
+                .bufferImageHeight = mip_info.height,
+                .imageSubresource{
+                    .aspectMask = image.aspect_mask,
+                    .mipLevel = mip,
+                    .baseArrayLayer = 0,
+                    .layerCount = image.info.resources.layers,
+                },
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {std::max(image.info.size.width >> mip, 1u),
+                                std::max(image.info.size.height >> mip, 1u),
+                                std::max(image.info.size.depth >> mip, 1u)},
+            });
+        }
+        texture_cache.GetTileManager().TileImage(image, buffer_copies, arena, *arena_offset, true);
+        memory_tracker->MarkRegionAsGpuModified(export_image.address, export_image.size);
+        gpu_modified_ranges.Add(export_image.address, export_image.size);
+        image.flags |= ImageFlagBits::BufferCoherent;
+        if (image_alias_exports_logged < 16) {
+            ++image_alias_exports_logged;
+            LOG_INFO(
+                Render,
+                "Preserved image alias base={:#x}, size={:#x}, extent={}x{}, request={:#x}+{:#x}",
+                export_image.address, export_image.size, image.info.size.width,
+                image.info.size.height, device_addr, size);
+        }
+    }
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {

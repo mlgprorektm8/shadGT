@@ -71,6 +71,8 @@ enum class SharpFetchPostOp : u8 {
     ForceRepeatXyzClamp,
     ForceLastTexelXyClamp,
     ClearAnisoRatioAndThreshold,
+    // A scalar-memory base pointer, rather than a guest V# descriptor.
+    ReadConstPointer,
 };
 
 enum class BufferType : u8 {
@@ -101,7 +103,21 @@ struct BufferResource {
         if (!sharp_fetch.Fetch(info.flattened_ud_buf.data(), &buffer)) {
             return AmdGpu::Buffer::Null();
         }
-        if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
+        if (post_op == SharpFetchPostOp::ReadConstPointer) {
+            u64 address;
+            std::memcpy(&address, &buffer, sizeof(address));
+            address &= 0xFFFFFFFFFFFFULL;
+            // Ordinary guest buffer bindings encode 40-bit addresses. Do not let
+            // a wider scalar-memory pointer become stride or swizzle bits.
+            if (address >= (1ULL << 40)) {
+                return AmdGpu::Buffer::Null();
+            }
+            buffer = {};
+            buffer.base_address = address;
+            // Scalar loads have no V# bounds. Binding clamps this open-ended
+            // range to the mapped guest allocation before accessing the cache.
+            buffer.num_records = UINT32_MAX;
+        } else if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
             reinterpret_cast<u32*>(&buffer)[1] |= post_op_dw1_mask;
         } else if (post_op == SharpFetchPostOp::OffsetByProgramBase) {
             buffer.base_address += info.pgm_base;
@@ -174,9 +190,11 @@ struct ImageResource {
 
     u32 NumBindings(const auto& info) const {
         const AmdGpu::Image tsharp = GetSharp(info);
-        return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex)
-                   ? (tsharp.last_level - tsharp.base_level + 1)
-                   : 1;
+        if (mip_fallback_mode != MipStorageFallbackMode::DynamicIndex ||
+            tsharp.last_level < tsharp.base_level) {
+            return 1;
+        }
+        return tsharp.last_level - tsharp.base_level + 1;
     }
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;

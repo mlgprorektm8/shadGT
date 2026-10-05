@@ -134,6 +134,9 @@ struct PassInfo {
             } else if (!a.IsImmediate() && !b.IsImmediate()) {
                 auto a_inst = a.Inst();
                 auto b_inst = b.Inst();
+                if (a_inst == b_inst) {
+                    return false;
+                }
                 auto a_block = a_inst->GetParent();
                 auto b_block = b_inst->GetParent();
                 if (a_block != b_block) {
@@ -585,6 +588,29 @@ static inline void PopPtr(Xbyak::CodeGenerator& c) {
     c.pop(rdi);
 }
 
+static bool CanComputeOffset(PassInfo& pass_info, const IR::Value& value) {
+    if (value.IsImmediate()) {
+        return true;
+    }
+    auto* inst = value.Inst();
+    if (inst->GetOpcode() == IR::Opcode::GetUserData) {
+        return true;
+    }
+    if (inst->GetOpcode() == IR::Opcode::ReadConst ||
+        inst->GetOpcode() == IR::Opcode::ReadConstBuffer) {
+        return GetFlatbufOffset(pass_info.DeduplicateInstruction(inst)) != 0;
+    }
+    if (!IsAllowedOffsetInstruction(inst)) {
+        return false;
+    }
+    for (size_t i = 0; i < inst->NumArgs(); ++i) {
+        if (!CanComputeOffset(pass_info, inst->Arg(i))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& pass_info,
                          Xbyak::CodeGenerator& c) {
     if (subtree->GetOpcode() == IR::Opcode::ReadConst && subtree->Flags<u16>() == 0 ||
@@ -593,10 +619,12 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         return;
     }
 
-    if (!PushPtr(c, pass_info, off_dw)) {
-        LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+    // A sibling table may produce this pointer offset later in the traversal. Defer it before
+    // emitting any code, so an incomplete offset expression cannot leave a partial stack push.
+    if (!CanComputeOffset(pass_info, off_dw)) {
         return;
     }
+    ASSERT(PushPtr(c, pass_info, off_dw));
     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
     ASSERT(use_list);
 
@@ -606,13 +634,13 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     // TODO src and dst are contiguous. Optimize with wider loads/stores
     // TODO if this subtree is dynamically indexed, don't compact it (keep it sparse)
     for (auto [src_off_dw, use] : *use_list) {
+        if (GetFlatbufOffset(use) != 0 || !CanComputeOffset(pass_info, src_off_dw)) {
+            continue;
+        }
         if (src_off_dw.IsImmediate()) {
             c.mov(r10d, ptr[rdi + (src_off_dw.U32() << 2)]);
         } else {
-            if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
-                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
-                continue;
-            }
+            ASSERT(ComputeOffset(c, r10d, pass_info, src_off_dw));
             c.shl(r10d, 2);
             c.mov(r10d, r10d);
             c.mov(r10d, dword[rdi + r10]);
@@ -653,8 +681,50 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
-    for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
-        VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c);
+    const auto has_unresolved_loads = [&] {
+        for (const auto& [pointer, uses] : pass_info.pointer_uses) {
+            for (const auto& [offset, use] : uses) {
+                if (GetFlatbufOffset(use) == 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    u16 previous_size;
+    do {
+        previous_size = pass_info.dst_off_dw;
+        for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
+            // Root pointers are fetched from the host-owned user-data array; nested pointers
+            // reference guest SRT memory and are followed by the generated walker.
+            VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c);
+        }
+        // Only pending reads are emitted on a subsequent traversal. Their index producers have
+        // now been copied into the flat buffer, even when they came from a later sibling/root.
+    } while (pass_info.dst_off_dw != previous_size && has_unresolved_loads());
+
+    for (const auto& [pointer, uses] : pass_info.pointer_uses) {
+        size_t unresolved{};
+        IR::Value first_offset;
+        for (const auto& [offset, use] : uses) {
+            if (GetFlatbufOffset(use) == 0) {
+                if (unresolved++ == 0) {
+                    first_offset = offset;
+                }
+            }
+        }
+        if (unresolved != 0) {
+            const auto* offset_source = first_offset.TryInst();
+            LOG_ERROR(Render_Recompiler,
+                      "Failed to compute offset for SRT walker: shader {:#x}, {} unresolved loads "
+                      "from {} pointer {}, first offset source {} {}",
+                      info.pgm_hash, unresolved, magic_enum::enum_name(pointer->GetOpcode()),
+                      fmt::ptr(pointer),
+                      offset_source ? magic_enum::enum_name(offset_source->GetOpcode())
+                                    : "Immediate",
+                      offset_source ? fmt::format("{}", fmt::ptr(offset_source))
+                                    : fmt::format("{:#x}", first_offset.U32()));
+        }
     }
 
     c.ret();

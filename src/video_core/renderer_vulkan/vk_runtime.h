@@ -46,13 +46,16 @@ public:
                  std::optional<VideoCore::SubresourceRange> subres_range = {});
 
     void UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
-                     std::span<const vk::BufferImageCopy> upload_copies);
+                     std::span<const vk::BufferImageCopy> upload_copies,
+                     bool preserve_buffer_coherence = false);
     void DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                        std::span<const vk::BufferImageCopy> download_copies);
 
     void CopyImage(VideoCore::Image* src, VideoCore::Image* dst);
+    void CopySubrect(VideoCore::Image* src, VideoCore::Image* dst);
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
-                             const VideoCore::Buffer* buffer, u64 offset);
+                             const VideoCore::Buffer* buffer, u64 offset,
+                             std::optional<VideoCore::SubresourceRange> sub_range = {});
     void CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice);
 
     void CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst);

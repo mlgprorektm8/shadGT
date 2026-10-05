@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_set>
 #include "common/assert.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
@@ -365,6 +366,84 @@ ResourceDiscoveryList ResourceDiscoverPass(IR::Program& program, const Profile& 
         }
     }
     return sharp_usages;
+}
+
+void LowerDynamicReadConstPass(IR::Program& program, ResourceDiscoveryList& resources) {
+    std::unordered_set<const IR::Inst*> host_sources;
+    boost::container::small_vector<const IR::Inst*, 16> pending;
+    const auto protect_host_source = [&](IR::Value value) {
+        if (const auto* source = value.TryInst()) {
+            pending.push_back(source);
+        }
+    };
+    for (const auto& resource : resources) {
+        for (const auto& sharp : resource.sharps) {
+            for (u32 i = 0; i < sharp.num_dwords; ++i) {
+                protect_host_source(sharp.dwords[i]);
+            }
+            if (sharp.post_op == SharpFetchPostOp::DisableAnisoIfSingleLod) {
+                protect_host_source(sharp.post_op_data.lod_prod);
+            }
+        }
+    }
+    // Reads that form another scalar-memory base must also remain available to
+    // the host walker, including indirect dependencies in resource-table offsets.
+    for (IR::Block* block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::ReadConst) {
+                protect_host_source(inst.Arg(0));
+            }
+        }
+    }
+    while (!pending.empty()) {
+        const auto* source = pending.back();
+        pending.pop_back();
+        if (!host_sources.insert(source).second) {
+            continue;
+        }
+        for (u32 i = 0; i < source->NumArgs(); ++i) {
+            protect_host_source(source->Arg(i));
+        }
+    }
+
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::ReadConst || inst.Arg(1).IsImmediate() ||
+                host_sources.contains(&inst)) {
+                continue;
+            }
+            auto* base = inst.Arg(0).TryInst();
+            if (!base || base->GetOpcode() != IR::Opcode::CompositeConstructU32x2) {
+                continue;
+            }
+            const auto is_host_pointer_dword = [](IR::Value value) {
+                if (value.IsImmediate()) {
+                    return true;
+                }
+                const auto* source = value.TryInst();
+                return source && source->GetOpcode() == IR::Opcode::GetUserData;
+            };
+            if (!is_host_pointer_dword(base->Arg(0)) ||
+                !is_host_pointer_dword(base->Arg(1))) {
+                continue;
+            }
+
+            // Workgroup IDs and loop phis cannot be evaluated by the CPU SRT
+            // walker. Bind the known base pointer as a raw buffer and keep the
+            // index in the shader. Descriptor-producing loads still use the
+            // existing sharp discovery and flattening path.
+            auto& resource = resources.emplace_back(&inst);
+            auto& sharp = resource.sharps[0];
+            sharp.num_dwords = 4;
+            sharp.dwords[0] = base->Arg(0);
+            sharp.dwords[1] = base->Arg(1);
+            sharp.dwords[2] = IR::Value{UINT32_MAX};
+            sharp.dwords[3] = IR::Value{0U};
+            sharp.post_op = SharpFetchPostOp::ReadConstPointer;
+            inst.ReplaceOpcode(IR::Opcode::ReadConstBuffer);
+            inst.SetFlags(IR::BufferInstInfo{});
+        }
+    }
 }
 
 } // namespace Shader::Optimization

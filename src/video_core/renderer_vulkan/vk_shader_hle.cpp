@@ -16,6 +16,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
                                  Rasterizer& rasterizer) {
     auto& runtime = rasterizer.GetRuntime();
     auto& buffer_cache = rasterizer.GetBufferCache();
+    auto& texture_cache = rasterizer.GetTextureCache();
 
     // Copy shader defines three formatted buffers as inputs: control, source, and destination.
     const auto ctl_buf_sharp = info.buffers[0].GetSharp(info);
@@ -42,6 +43,9 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         const u32 local_dst_offset = dst_idx * buf_stride;
         const u32 local_src_offset = src_idx * buf_stride;
         const u32 local_size = (end + 1) * buf_stride;
+        if (local_size == 0) {
+            continue;
+        }
         copies.emplace_back(local_src_offset, local_dst_offset, local_size);
     }
 
@@ -96,6 +100,10 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         LOG_TRACE(Render_Vulkan, "HLE buffer copy: src_size = {}, dst_size = {}",
                   src_offset_max - src_offset_min, dst_offset_max - dst_offset_min);
         runtime.CopyBuffer(src_buf, dst_buf, vk_copies);
+        // HLE bypasses shader buffer binding, so publish the destination write to image aliases.
+        // Buffer preparation must finish before invalidation to preserve untouched image bytes.
+        texture_cache.InvalidateMemoryFromGPU(dst_buf_sharp.base_address + dst_offset_min,
+                                             dst_offset_max - dst_offset_min);
         batch_start = batch_end;
     }
 
