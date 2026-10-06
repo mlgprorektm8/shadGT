@@ -439,3 +439,22 @@ cmake-build-*
 
 # Nix Result symlink
 result
+
+# Build/ is shared on purpose so a friend can grab the same workflow and help too.
+# Only the builder workflow (run/capture/profile scripts, helper tools' source, and
+# the docs) is tracked. Everything else in here is build output, logs, captures or
+# installed tools. See Build/TOOLS_SETUP.md for installing the tools yourself.
+!/[Bb]uild/
+/[Bb]uild/*
+!/[Bb]uild/*.ps1
+!/[Bb]uild/*.py
+!/[Bb]uild/*.md
+!/[Bb]uild/gt-sport-accuracy-approved-20261005/
+/[Bb]uild/gt-sport-accuracy-approved-20261005/*
+!/[Bb]uild/gt-sport-accuracy-approved-20261005/*.ps1
+!/[Bb]uild/tools/
+/[Bb]uild/tools/*
+!/[Bb]uild/tools/capture-inspect/
+/[Bb]uild/tools/capture-inspect/*
+!/[Bb]uild/tools/capture-inspect/main.cpp
+!/[Bb]uild/tools/capture-inspect/renderdoc.def
