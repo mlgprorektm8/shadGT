@@ -589,8 +589,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
             window_title = fmt::format("shadPS4 v{} {} {} | {}", Common::g_version,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         } else {
-            window_title = fmt::format("shadPS4 v{} {}/{} {} | {}", Common::g_version, remote_host,
-                                       Common::g_scm_branch, Common::g_scm_desc, game_title);
+            // Fork builds show only the game and that this is the current build; the full
+            // revision is still in the log ("Revision", "Branch", "Description").
+            window_title = fmt::format("{} - Current Build", title);
         }
     }
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),

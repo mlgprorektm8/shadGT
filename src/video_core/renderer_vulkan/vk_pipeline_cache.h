@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <chrono>
+#include <filesystem>
+#include <thread>
 #include <unordered_set>
 #include <variant>
 #include <tsl/robin_map.h>
@@ -117,6 +120,19 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+
+    // The driver's VkPipelineCache, kept on disk so cached pipelines are not recompiled by the
+    // driver on every launch.
+    void CreateDriverCache();
+    void SaveDriverCache(bool wait);
+    void MaybeSaveDriverCache();
+    std::filesystem::path driver_cache_path;
+    u32 pipelines_at_driver_save{};
+    std::chrono::steady_clock::time_point driver_cache_saved_at{};
+    std::jthread driver_cache_writer;
+
+    struct PreloadQueue;
+    PreloadQueue* preload_queue{};
     std::unordered_set<u64> logged_swizzled_blends;
 
     // Only if Config::collectShadersForDebug()

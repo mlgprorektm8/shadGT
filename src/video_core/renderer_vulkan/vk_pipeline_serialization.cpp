@@ -1,6 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_stdinc.h>
+#include <SDL3/SDL_video.h>
+
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -210,6 +223,80 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     return true;
 }
 
+// Worker threads that build preloaded graphics pipelines (see WarmUp).
+struct PipelineCache::PreloadQueue {
+    using Task = std::function<std::unique_ptr<GraphicsPipeline>()>;
+    using Result = std::pair<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>>;
+
+    explicit PreloadQueue(u32 num_workers) {
+        for (u32 i = 0; i < num_workers; ++i) {
+            workers.emplace_back([this] { Work(); });
+        }
+    }
+
+    ~PreloadQueue() {
+        Finish();
+    }
+
+    void Push(const GraphicsPipelineKey& key, Task&& task) {
+        {
+            std::scoped_lock lk{mutex};
+            tasks.emplace_back(key, std::move(task));
+        }
+        ++num_queued;
+        cv.notify_one();
+    }
+
+    std::vector<Result> Finish() {
+        {
+            std::scoped_lock lk{mutex};
+            closing = true;
+        }
+        cv.notify_all();
+        workers.clear();
+        return std::move(results);
+    }
+
+    u32 NumQueued() const {
+        return num_queued.load();
+    }
+
+    u32 NumDone() const {
+        return num_done.load();
+    }
+
+private:
+    void Work() {
+        while (true) {
+            std::pair<GraphicsPipelineKey, Task> item;
+            {
+                std::unique_lock lk{mutex};
+                cv.wait(lk, [&] { return closing || !tasks.empty(); });
+                if (tasks.empty()) {
+                    return;
+                }
+                item = std::move(tasks.front());
+                tasks.pop_front();
+            }
+            auto pipeline = item.second();
+            {
+                std::scoped_lock lk{mutex};
+                results.emplace_back(item.first, std::move(pipeline));
+            }
+            ++num_done;
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::pair<GraphicsPipelineKey, Task>> tasks;
+    std::vector<Result> results;
+    bool closing{};
+    std::atomic<u32> num_queued{};
+    std::atomic<u32> num_done{};
+    std::vector<std::jthread> workers;
+};
+
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     graphics_key.Deserialize(ar);
 
@@ -239,9 +326,23 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
-    it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, fetch_shader, modules, sdata, true);
+    if (preload_queue) {
+        // Driver compilation is the slow part of the precompile, so it runs on worker threads.
+        // Copy everything this load filled in; the members are reused by the next load.
+        preload_queue->Push(
+            graphics_key,
+            [this, key = graphics_key, stage_infos = infos, stage_runtime = runtime_infos,
+             fetch = fetch_shader ? std::optional{*fetch_shader} : std::nullopt,
+             stage_modules = modules, sdata]() mutable {
+                return std::make_unique<GraphicsPipeline>(
+                    instance, scheduler, desc_heap, profile, key, *pipeline_cache, stage_infos,
+                    stage_runtime, fetch ? &*fetch : nullptr, stage_modules, sdata, true);
+            });
+    } else {
+        it.value() = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+            runtime_infos, fetch_shader, modules, sdata, true);
+    }
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -358,9 +459,46 @@ void PipelineCache::WarmUp() {
     u32 num_pipelines{};
     u32 num_total_pipelines{};
 
+    // Precompile every cached pipeline before the game starts. This runs on the thread that
+    // owns the window, so show progress in the title and keep pumping window events; otherwise
+    // the OS reports the window as not responding until the precompile ends.
+    u32 num_cached{};
+    Storage::DataBase::Instance().ForEachBlob(Storage::BlobType::PipelineKey,
+                                              [&](std::vector<u8>&&) { ++num_cached; });
+    int num_windows{};
+    SDL_Window** windows = SDL_GetWindows(&num_windows);
+    SDL_Window* window = windows && num_windows > 0 ? windows[0] : nullptr;
+    SDL_free(windows);
+    const std::string window_title = window ? SDL_GetWindowTitle(window) : "";
+    auto last_progress = std::chrono::steady_clock::now();
+    const auto report_progress = [&](u32 done, bool force) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!window || (!force && now - last_progress < std::chrono::milliseconds(100))) {
+            return;
+        }
+        last_progress = now;
+        const auto title =
+            fmt::format("{} - Compiling shaders {} / {} ({}%)", window_title, done, num_cached,
+                        num_cached ? u64(done) * 100 / num_cached : 100);
+        SDL_SetWindowTitle(window, title.c_str());
+        SDL_PumpEvents();
+    };
+
+    const u32 num_workers = std::clamp(std::thread::hardware_concurrency(), 2u, 14u) - 1;
+    std::optional<PreloadQueue> queue;
+    if (num_cached > 0) {
+        LOG_INFO(Render, "Precompiling {} cached pipelines on {} threads", num_cached,
+                 num_workers);
+        queue.emplace(num_workers);
+        preload_queue = &*queue;
+        report_progress(0, true);
+    }
+    u32 num_direct{}; // compute pipelines and rejected entries finish on this thread
+
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
+            report_progress(num_direct + queue->NumDone(), false);
 
             Serialization::Archive ar{std::move(data)};
             Serialization::Reader pldata{ar};
@@ -368,6 +506,7 @@ void PipelineCache::WarmUp() {
             u32 version{};
             pldata.Read(version);
             if (version != Serialization::PipelineKeyVersion) {
+                ++num_direct;
                 return;
             }
 
@@ -375,10 +514,14 @@ void PipelineCache::WarmUp() {
             pldata.Read(is_compute);
 
             bool result{};
+            const u32 queued_before = queue->NumQueued();
             if (is_compute) {
                 result = LoadComputePipeline(ar);
             } else {
                 result = LoadGraphicsPipeline(ar);
+            }
+            if (queue->NumQueued() == queued_before) {
+                ++num_direct;
             }
 
             if (result) {
@@ -386,7 +529,28 @@ void PipelineCache::WarmUp() {
             }
         });
 
-    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    if (queue) {
+        // Wait for the workers, keeping the window responsive, and save the driver cache now
+        // and then so an interrupted precompile is not lost.
+        u32 saved_at{};
+        while (queue->NumDone() < queue->NumQueued()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const u32 done = queue->NumDone();
+            report_progress(num_direct + done, false);
+            if (done - saved_at >= 1000) {
+                saved_at = done;
+                SaveDriverCache(false);
+            }
+        }
+        for (auto& [key, pipeline] : queue->Finish()) {
+            graphics_pipelines[key] = std::move(pipeline);
+        }
+        preload_queue = nullptr;
+    }
+
+    if (window) {
+        SDL_SetWindowTitle(window, window_title.c_str());
+    }    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);

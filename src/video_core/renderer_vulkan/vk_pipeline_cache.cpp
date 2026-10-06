@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <ranges>
 
+#include "common/elf_info.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -326,15 +329,110 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
+    // The driver cache must exist before WarmUp so preloaded pipelines can use it.
+    CreateDriverCache();
     WarmUp();
+    SaveDriverCache(false);
+}
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+PipelineCache::~PipelineCache() {
+    SaveDriverCache(true);
+}
+
+void PipelineCache::CreateDriverCache() {
+    std::vector<u8> data;
+    if (EmulatorSettings.IsPipelineCacheEnabled()) {
+        const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+        driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                            fmt::format("{}.vkpipelinecache", serial);
+        const Common::FS::IOFile file{driver_cache_path, Common::FS::FileAccessMode::Read};
+        if (file.IsOpen()) {
+            data.resize(file.GetSize());
+            if (file.Read(data) != data.size()) {
+                data.clear();
+            }
+        }
+        // Header (Vulkan spec, VkPipelineCacheHeaderVersionOne): size, version, vendor,
+        // device, UUID. Data from another GPU or driver starts an empty cache.
+        const auto props = instance.GetPhysicalDevice().getProperties();
+        struct Header {
+            u32 size;
+            u32 version;
+            u32 vendor_id;
+            u32 device_id;
+            std::array<u8, VK_UUID_SIZE> uuid;
+        } header{};
+        if (data.size() < sizeof(Header)) {
+            data.clear();
+        } else {
+            std::memcpy(&header, data.data(), sizeof(Header));
+            if (header.version != static_cast<u32>(vk::PipelineCacheHeaderVersion::eOne) ||
+                header.vendor_id != props.vendorID || header.device_id != props.deviceID ||
+                std::memcmp(header.uuid.data(), props.pipelineCacheUUID.data(), VK_UUID_SIZE)) {
+                LOG_INFO(Render_Vulkan, "Driver pipeline cache is from another GPU or driver");
+                data.clear();
+            }
+        }
+    }
+    auto [cache_result, cache] =
+        instance.GetDevice().createPipelineCacheUnique(vk::PipelineCacheCreateInfo{
+            .initialDataSize = data.size(),
+            .pInitialData = data.data(),
+        });
+    if (cache_result != vk::Result::eSuccess && !data.empty()) {
+        LOG_WARNING(Render_Vulkan, "Driver pipeline cache rejected ({}), starting empty",
+                    vk::to_string(cache_result));
+        auto [empty_result, empty_cache] = instance.GetDevice().createPipelineCacheUnique({});
+        cache_result = empty_result;
+        cache = std::move(empty_cache);
+    }
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+    pipelines_at_driver_save = num_new_pipelines;
+    driver_cache_saved_at = std::chrono::steady_clock::now();
+    LOG_INFO(Render_Vulkan, "Driver pipeline cache: loaded {} bytes", data.size());
 }
 
-PipelineCache::~PipelineCache() = default;
+void PipelineCache::SaveDriverCache(bool wait) {
+    if (driver_cache_path.empty() || !pipeline_cache) {
+        return;
+    }
+    auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    if (result != vk::Result::eSuccess || data.empty()) {
+        return;
+    }
+    pipelines_at_driver_save = num_new_pipelines;
+    driver_cache_saved_at = std::chrono::steady_clock::now();
+    if (driver_cache_writer.joinable()) {
+        driver_cache_writer.join();
+    }
+    // Write beside the file and rename, so an interrupted write never leaves a broken cache.
+    driver_cache_writer = std::jthread([path = driver_cache_path, data = std::move(data)] {
+        auto temp = path;
+        temp += ".tmp";
+        {
+            const Common::FS::IOFile file{temp, Common::FS::FileAccessMode::Create};
+            if (!file.IsOpen() || file.Write(data) != data.size()) {
+                return;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(temp, path, ec);
+    });
+    if (wait) {
+        driver_cache_writer.join();
+    }
+}
+
+void PipelineCache::MaybeSaveDriverCache() {
+    // New pipelines are compiled during play; save them in batches without blocking the frame.
+    using namespace std::chrono_literals;
+    if (num_new_pipelines - pipelines_at_driver_save >= 64 &&
+        std::chrono::steady_clock::now() - driver_cache_saved_at >= 30s) {
+        SaveDriverCache(false);
+    }
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
@@ -370,6 +468,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
+        MaybeSaveDriverCache();
 
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
@@ -398,6 +497,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                                                        modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
+        MaybeSaveDriverCache();
 
         if (EmulatorSettings.IsShaderCollect()) {
             auto& m = modules[0];

@@ -1019,3 +1019,13 @@ Findings from the October 5, 11:47 Release run (`Build/gt-sport-fixed/user/log/s
 
 - Captures 1-5: the car renders into 26082 and its 1200x1080 crop 57860 (copy 3742) correctly. The TAA pass (fs_0x184b619c, viewport x 720-1920) outputs one constant value over the whole car area in both ping-pong parities (captures 1/3/5 write 0x10083b0000, capture 4 writes 0x10073c0000), while the same shader works for the cockpit view.
 - Lead (unconfirmed): the TAA shader's output channel order differs from the morning build (z and w swapped: old `(s.w, s.z, s.x, s.y)`, new `(s.w, s.z, s.y, s.x)` in the copy-through path). GCN code: `v_cvt_pkrtz v0, v0, v1; v_cvt_pkrtz_e64 v1, v2, 1.0; exp mrt1 v0 v1; v_cvt_pkrtz v2, v2, v3; exp mrt0 v0 v2`. Not resolved which order is correct.
+
+### FIX-011: startup precompile with progress, persistent driver pipeline cache
+
+- Player request (Oct 6): cleaner window title and no long startup delay; precompile shaders before the game starts, with a visible notice.
+- Cause of the slow, frozen startup: `PipelineCache::WarmUp` built every cached pipeline on the window thread with no event pumping, and it ran before the `VkPipelineCache` was created, which was never saved anyway, so the driver recompiled everything on each launch (3.5 minutes for 17,718 pipelines; about 65 ms each on the fresh cache).
+- Changes:
+  - `vk_pipeline_cache.cpp`: create the `VkPipelineCache` before `WarmUp`, from `user/cache/<serial>.vkpipelinecache` when its header (version, vendor, device, pipeline cache UUID) matches this GPU and driver. Save it (temp file + rename, on a background thread) after the precompile, every 1,000 pipelines during it, every 64 new pipelines (at most every 30 s) during play, and on shutdown.
+  - `vk_pipeline_serialization.cpp`: graphics pipelines found in the cache are built on up to 13 worker threads (inputs copied per pipeline); the window title shows "Compiling shaders N / M (P%)" and window events are pumped, so the window stays responsive.
+  - `emulator.cpp`: fork builds use the title "<game> - Current Build" (revision still logged).
+- Measured on the player's PC (6,241 cached pipelines): first launch about 50 s, second launch 10 s with the saved driver cache; window responsive throughout (0 not-responding samples).
