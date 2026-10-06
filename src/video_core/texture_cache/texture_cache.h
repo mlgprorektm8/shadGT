@@ -11,6 +11,7 @@
 #include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -360,6 +361,34 @@ private:
     u64 gc_tick = 0;
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
+    /// A recorded image readback waiting for the GPU before its guest write.
+    struct PendingReadback {
+        VAddr address;
+        Vulkan::StagingBufferRef download;
+        u32 size;
+    };
+    std::optional<PendingReadback> RecordImageReadback(ImageId image_id);
+
+public:
+    /// True when GPU-written images are waiting to be read back to guest memory.
+    bool HasPendingReadbacks();
+    bool ReadbackLinearImages() const {
+        return readback_linear_images;
+    }
+    /// Records the copies for all pending readbacks (no wait).
+    std::vector<PendingReadback> RecordPendingReadbacks();
+    /// Writes recorded readbacks to guest memory; the GPU work must have completed.
+    void CompleteReadbacks(std::span<const PendingReadback> readbacks);
+    /// Frees staging memory of completed readbacks (GPU thread).
+    void ReleaseFinishedReadbacks();
+
+private:
+    std::mutex finished_readbacks_mutex;
+    std::vector<Vulkan::StagingBufferRef> finished_readbacks;
+
+    /// Linear-image readback: small GPU-written linear images the guest CPU may read.
+    bool ShouldReadBack(const Image& image);
+
     const bool readback_linear_images;
     std::mutex download_images_mutex;
     struct MetaDataInfo {

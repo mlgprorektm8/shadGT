@@ -8,6 +8,7 @@
 #include "common/types.h"
 #include "shader_recompiler/frontend/tessellation.h"
 #include "video_core/amdgpu/pixel_format.h"
+#include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_shader.h"
 #include "video_core/amdgpu/regs_vertex.h"
 
@@ -179,6 +180,15 @@ struct PsColorBuffer {
     u32 blend_self_scale : 1;
     // The secondary blend source carries logical alpha independently of physical channel order.
     u32 blend_swizzled_alpha : 1;
+    // General swizzled blend: each logical channel is exported premultiplied by its source factor
+    // and the secondary source carries one minus its destination factor, in physical order.
+    u32 blend_swizzled_factors : 1;
+    // Effective guest factors for blend_swizzled_factors; alpha factors already account for a
+    // shared color/alpha equation. Zero when the general swizzled blend is not used.
+    AmdGpu::BlendControl::BlendFactor swizzled_color_src : 5;
+    AmdGpu::BlendControl::BlendFactor swizzled_color_dst : 5;
+    AmdGpu::BlendControl::BlendFactor swizzled_alpha_src : 5;
+    AmdGpu::BlendControl::BlendFactor swizzled_alpha_dst : 5;
     AmdGpu::CompMapping swizzle;
 
     bool operator==(const PsColorBuffer& other) const = default;

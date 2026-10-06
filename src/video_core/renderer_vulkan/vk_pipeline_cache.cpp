@@ -193,7 +193,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         } else {
             info.hw.fs.dual_source_blending = false;
         }
-        info.hw.fs.dual_source_blending |= graphics_key.color_buffers[0].blend_swizzled_alpha;
+        info.hw.fs.dual_source_blending |= graphics_key.color_buffers[0].blend_swizzled_alpha ||
+                                           graphics_key.color_buffers[0].blend_swizzled_factors;
         const auto& ps_inputs = regs.ps_inputs;
         for (u32 i = 0; i < regs.num_interp; i++) {
             info.hw.fs.inputs[i] = {
@@ -406,6 +407,86 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
+void PipelineCache::RefreshSwizzledBlend(u32 cb, Shader::PsColorBuffer& color_buffer,
+                                         const AmdGpu::BlendControl& bc) {
+    const auto& regs = liverpool->regs;
+    // Dual-source blending needs attachment 0 as the only written color target. Hardware writes
+    // another MRT only when it is bound, unmasked, and has a shader export format.
+    const auto writes_other_mrt = [&] {
+        for (u32 other = 1; other < AmdGpu::NUM_COLOR_BUFFERS; ++other) {
+            if (regs.color_buffers[other] && regs.color_target_mask.GetMask(other) != 0 &&
+                regs.color_export_format.GetFormat(other) != AmdGpu::ShaderExportFormat::Zero) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const char* rejection = nullptr;
+    if (cb != 0) {
+        rejection = "not attachment 0";
+    } else if (!instance.IsDualSourceBlendSupported()) {
+        rejection = "dual-source blending unsupported";
+    } else if (writes_other_mrt()) {
+        rejection = "other MRT exports";
+    } else if ((regs.color_shader_mask.GetMask(cb) & AmdGpu::ColorBufferMask::ComponentA) == 0) {
+        rejection = "alpha not exported";
+    }
+    if (!rejection && LiverpoolToVK::NeedsSwizzledAlphaBlend(color_buffer.swizzle, bc)) {
+        color_buffer.blend_swizzled_alpha = 1;
+        return;
+    }
+
+    using NumberFormat = AmdGpu::NumberFormat;
+    const auto num_format = color_buffer.num_format;
+    const bool blendable_format = num_format == NumberFormat::Unorm ||
+                                  num_format == NumberFormat::Snorm ||
+                                  num_format == NumberFormat::Srgb ||
+                                  num_format == NumberFormat::Float;
+    if (!rejection && color_buffer.num_conversion != AmdGpu::NumberConversion::None) {
+        rejection = "number conversion";
+    } else if (!rejection && !blendable_format) {
+        rejection = "number format";
+    }
+    const auto general = LiverpoolToVK::GetSwizzledFactorBlend(color_buffer.swizzle, bc);
+    if (!rejection && general) {
+        color_buffer.blend_swizzled_factors = 1;
+        color_buffer.swizzled_color_src = general->color_src;
+        color_buffer.swizzled_color_dst = general->color_dst;
+        color_buffer.swizzled_alpha_src = general->alpha_src;
+        color_buffer.swizzled_alpha_dst = general->alpha_dst;
+        return;
+    }
+    if (!rejection) {
+        rejection = "unsupported equation";
+    }
+
+    // Report each remaining configuration once; it still blends with the wrong lane order.
+    const auto& swizzle = color_buffer.swizzle;
+    const u64 config = u64(std::bit_cast<u32>(bc)) | u64(cb) << 32 |
+                       u64(u32(num_format)) << 36 | u64(swizzle.r) << 40 |
+                       u64(swizzle.g) << 44 | u64(swizzle.b) << 48 | u64(swizzle.a) << 52 |
+                       u64(writes_other_mrt()) << 56 |
+                       u64((regs.color_shader_mask.GetMask(cb) &
+                            AmdGpu::ColorBufferMask::ComponentA) != 0)
+                           << 57;
+    static constexpr size_t MaxLoggedSwizzledBlends = 32;
+    if (logged_swizzled_blends.size() >= MaxLoggedSwizzledBlends ||
+        !logged_swizzled_blends.insert(config).second) {
+        return;
+    }
+    const auto blend = LiverpoolToVK::EffectiveBlend(bc);
+    LOG_WARNING(Render_Vulkan,
+                "Unhandled swizzled blend ({}): cb={} swizzle={},{},{},{} format={}/{} "
+                "color={}*src {} {}*dst alpha={}*src {} {}*dst separate={} export_formats={:#x} "
+                "shader_mask={:#x} target_mask={:#x}",
+                rejection, cb, u32(swizzle.r), u32(swizzle.g), u32(swizzle.b), u32(swizzle.a),
+                u32(color_buffer.data_format), u32(num_format), u32(blend.color_src),
+                u32(blend.color_func), u32(blend.color_dst), u32(blend.alpha_src),
+                u32(blend.alpha_func), u32(blend.alpha_dst), u32(bc.separate_alpha_blend),
+                regs.color_export_format.raw, regs.color_shader_mask.raw,
+                regs.color_target_mask.raw);
+}
+
 bool PipelineCache::RefreshGraphicsKey() {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = liverpool->regs;
@@ -467,12 +548,10 @@ bool PipelineCache::RefreshGraphicsKey() {
              bc.color_func == AmdGpu::BlendControl::BlendFunc::Max) &&
             bc.color_src_factor == AmdGpu::BlendControl::BlendFactor::SrcColor &&
             bc.color_dst_factor == AmdGpu::BlendControl::BlendFactor::DstColor;
-        color_buffer.blend_swizzled_alpha =
-            cb == 0 && !col_buf.info.blend_bypass && instance.IsDualSourceBlendSupported() &&
-            regs.color_export_format.GetFormat(1) == AmdGpu::ShaderExportFormat::Zero &&
-            (regs.color_target_mask.raw & ~0xfu) == 0 &&
-            (regs.color_shader_mask.GetMask(cb) & AmdGpu::ColorBufferMask::ComponentA) != 0 &&
-            LiverpoolToVK::NeedsSwizzledAlphaBlend(color_buffer.swizzle, bc);
+        if (!col_buf.info.blend_bypass &&
+            LiverpoolToVK::IsLaneDependentSwizzledBlend(color_buffer.swizzle, bc)) {
+            RefreshSwizzledBlend(cb, color_buffer, bc);
+        }
     }
 
     // Compile and bind shader stages
@@ -708,6 +787,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     }
 
     auto& program = it_pgm.value();
+    // Diagnostic for runaway permutations: why each existing permutation was rejected.
+    std::string mismatch_reasons;
     for (size_t perm_idx = 0; perm_idx < program->modules.size(); ++perm_idx) {
         auto& permutation = program->modules[perm_idx];
         if (!permutation.info) {
@@ -721,6 +802,12 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         // Newly active resources must match the compiled specialization; inactive ones can reuse
         // it.
         if (permutation.spec != spec) {
+            if (program->modules.size() >= 4 && mismatch_reasons.size() < 600) {
+                u32 index{};
+                const char* reason = permutation.spec.FirstDifference(spec, index);
+                mismatch_reasons += fmt::format(" {}:{}[{}]", perm_idx, reason ? reason : "none",
+                                                index);
+            }
             continue;
         }
         info.AddBindings(binding);
@@ -732,9 +819,21 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
     const size_t perm_idx = program->modules.size();
     const u64 perm_hash = HashCombine(params.hash, perm_idx);
+    if (!mismatch_reasons.empty()) {
+        static u64 runaway_events = 0;
+        if (++runaway_events <= 40 || runaway_events % 500 == 0) {
+            LOG_WARNING(Render_Vulkan, "New permutation {} of {}_{:#x} (event {}); rejected:{}",
+                        perm_idx, hw_stage, params.hash, runaway_events, mismatch_reasons);
+        }
+    }
     const auto start = binding;
     auto info = std::make_unique<Shader::Info>(hw_stage, sw_stage, params);
-    const auto module = CompileModule(*info, runtime_info, params.code, perm_idx, binding);
+    // Compilation passes may adjust their runtime info (clip-distance emulation adds a fragment
+    // input). The stored key must use the unmodified runtime info, or it never matches the next
+    // lookup and the same module is recompiled for every draw.
+    auto compile_runtime_info = runtime_info;
+    const auto module =
+        CompileModule(*info, compile_runtime_info, params.code, perm_idx, binding);
     auto spec = Shader::StageSpecialization(*info, runtime_info, profile, start);
     RegisterShaderMeta(*info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
     const auto* info_ptr = info.get();

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -160,7 +161,12 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
     }
 
     if (flipMode != 1) {
-        LOG_WARNING(Lib_VideoOut, "flipmode = {}", flipMode);
+        // Games submit every frame with the same mode; report each distinct value only once.
+        static std::atomic<u32> logged_modes{};
+        const u32 mode_bit = flipMode >= 0 && flipMode < 32 ? 1u << flipMode : 0u;
+        if (mode_bit == 0 || (logged_modes.fetch_or(mode_bit) & mode_bit) == 0) {
+            LOG_WARNING(Lib_VideoOut, "flipmode = {}", flipMode);
+        }
     }
 
     if (bufferIndex < -1 || bufferIndex > 15) {

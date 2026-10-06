@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_set>
 #include <limits>
 #include <xxhash.h>
 
@@ -71,11 +72,122 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
+    auto readbacks = RecordPendingReadbacks();
+    if (readbacks.empty()) {
+        ReleaseFinishedReadbacks();
+        return;
+    }
+    scheduler.Finish();
+    CompleteReadbacks(readbacks);
+    ReleaseFinishedReadbacks();
+}
+
+bool TextureCache::HasPendingReadbacks() {
     std::unique_lock lk{download_images_mutex};
+    return !download_images.empty();
+}
+
+std::vector<TextureCache::PendingReadback> TextureCache::RecordPendingReadbacks() {
+    std::unique_lock lk{download_images_mutex};
+    std::vector<PendingReadback> readbacks;
     for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, true);
+        if (auto readback = RecordImageReadback(image_id)) {
+            readbacks.push_back(*readback);
+        }
     }
     download_images.clear();
+    return readbacks;
+}
+
+void TextureCache::CompleteReadbacks(std::span<const PendingReadback> readbacks) {
+    // May run on the scheduler thread after the GPU work completed. The guest may have unmapped
+    // the memory meanwhile (for example while loading a race); skip those writes.
+    auto* memory = Core::Memory::Instance();
+    for (const auto& readback : readbacks) {
+        if (memory->IsValidMapping(readback.address, readback.size)) {
+            readback.download.Invalidate();
+            memory->TryWriteBacking(std::bit_cast<u8*>(readback.address), readback.download.mapped,
+                                    readback.size);
+        }
+    }
+    std::scoped_lock lk{finished_readbacks_mutex};
+    for (const auto& readback : readbacks) {
+        finished_readbacks.push_back(readback.download);
+    }
+}
+
+void TextureCache::ReleaseFinishedReadbacks() {
+    // Staging memory is owned by the GPU thread.
+    std::scoped_lock lk{finished_readbacks_mutex};
+    for (const auto& download : finished_readbacks) {
+        runtime.GetStagingPool().FreeDeferred(download);
+    }
+    finished_readbacks.clear();
+}
+
+std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        return std::nullopt;
+    }
+    const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
+                              image.info.resources.layers * (image.info.num_bits / 8);
+    if (download_size == 0 || download_size > image.info.guest_size) {
+        return std::nullopt;
+    }
+    const auto download =
+        runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, true);
+    const vk::BufferImageCopy image_download = {
+        .bufferOffset = download.offset,
+        .bufferRowLength = image.info.pitch,
+        .bufferImageHeight = image.info.size.height,
+        .imageSubresource =
+            {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+    };
+    runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
+    return PendingReadback{image.info.guest_address, download, download_size};
+}
+
+static u32 ImageDownloadSize(const Image& image) {
+    return image.info.pitch * image.info.size.height * image.info.size.depth *
+           image.info.resources.layers * (image.info.num_bits / 8);
+}
+
+bool TextureCache::ShouldReadBack(const Image& image) {
+    if (!readback_linear_images || (image.info.props.is_tiled && image.info.size.width > 8) ||
+        image.info.guest_address == 0 || image.info.props.is_depth ||
+        image.info.size.depth > 1 || image.info.num_samples > 1 ||
+        image.info.resources.layers > 1 || ImageDownloadSize(image) > image.info.guest_size) {
+        return false;
+    }
+    // CPU-read GPU results such as luminance chains are tiny; large linear targets are not
+    // read back, which avoids heavy copies every submission.
+    static constexpr u32 MaxReadbackSize = 64_KB;
+    const u32 size = ImageDownloadSize(image);
+    if (size <= MaxReadbackSize) {
+        static std::unordered_set<VAddr> logged_readbacks;
+        if (logged_readbacks.size() < 16 && logged_readbacks.insert(image.info.guest_address).second) {
+            LOG_WARNING(Render_Vulkan, "Reading back {}x{} linear image at {:#x} ({} bytes)",
+                        image.info.size.width, image.info.size.height, image.info.guest_address,
+                        size);
+        }
+        return true;
+    }
+    static std::unordered_set<u64> logged_sizes;
+    const u64 key = u64(image.info.size.width) << 32 | image.info.size.height;
+    if (logged_sizes.size() < 16 && logged_sizes.insert(key).second) {
+        LOG_WARNING(Render_Vulkan, "Not reading back {}x{} linear image at {:#x} ({} bytes)",
+                    image.info.size.width, image.info.size.height, image.info.guest_address,
+                    size);
+    }
+    return false;
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
@@ -83,8 +195,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
-    const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
-                              image.info.resources.layers * (image.info.num_bits / 8);
+    const u32 download_size = ImageDownloadSize(image);
     ASSERT(download_size <= image.info.guest_size);
     const auto download =
         runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
@@ -656,8 +767,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.MarkGpuModified();
-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
-            image.info.guest_address != 0) {
+        if (ShouldReadBack(image)) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
         }
@@ -669,7 +779,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.MarkGpuModified();
-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+    if (ShouldReadBack(image)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     }

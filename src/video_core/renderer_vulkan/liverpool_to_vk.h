@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include <span>
 #include "common/assert.h"
 #include "video_core/amdgpu/pixel_format.h"
@@ -36,6 +37,31 @@ bool IsDualSourceBlendFactor(AmdGpu::BlendControl::BlendFactor factor);
 bool NeedsSwizzledAlphaBlend(AmdGpu::CompMapping swizzle, const AmdGpu::BlendControl& control);
 
 void SetSwizzledAlphaBlend(vk::PipelineColorBlendAttachmentState& attachment);
+
+/// Guest blend equation as applied to logical lanes, with a shared equation expanded to alpha.
+struct SwizzledFactorBlend {
+    AmdGpu::BlendControl::BlendFactor color_src;
+    AmdGpu::BlendControl::BlendFactor color_dst;
+    AmdGpu::BlendControl::BlendFactor alpha_src;
+    AmdGpu::BlendControl::BlendFactor alpha_dst;
+    AmdGpu::BlendControl::BlendFunc color_func;
+    AmdGpu::BlendControl::BlendFunc alpha_func;
+};
+
+SwizzledFactorBlend EffectiveBlend(const AmdGpu::BlendControl& control);
+
+/// True when an enabled blend gives a different result depending on which physical lane holds
+/// logical alpha, so the native Vulkan blend is wrong for this swizzle.
+bool IsLaneDependentSwizzledBlend(AmdGpu::CompMapping swizzle,
+                                  const AmdGpu::BlendControl& control);
+
+/// Lane-dependent blends that the general dual-source emulation reproduces exactly. Returns
+/// nullopt for blends handled by NeedsSwizzledAlphaBlend and for unsupported equations.
+std::optional<SwizzledFactorBlend> GetSwizzledFactorBlend(AmdGpu::CompMapping swizzle,
+                                                          const AmdGpu::BlendControl& control);
+
+void SetSwizzledFactorBlend(vk::PipelineColorBlendAttachmentState& attachment,
+                            AmdGpu::BlendControl::BlendFunc func);
 
 vk::BlendOp BlendOp(AmdGpu::BlendControl::BlendFunc func);
 

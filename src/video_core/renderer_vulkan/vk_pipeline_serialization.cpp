@@ -12,11 +12,14 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-// Synthetic dual-source exports change the fragment shader interface.
-static constexpr u32 ShaderBinaryVersion = 12u;
+// Synthetic dual-source exports change the fragment shader interface. Version 13 adds the
+// general swizzled factor blend, which also changes the runtime color-buffer layout.
+static constexpr u32 ShaderBinaryVersion = 14u;
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
-static constexpr u32 ShaderMetaVersion = 11u;
-static constexpr u32 PipelineKeyVersion = 7u;
+// Version 13: stored SRT walker code also records flattened source addresses.
+// Version 14: stored specializations no longer include compile-time runtime-info changes.
+static constexpr u32 ShaderMetaVersion = 14u;
+static constexpr u32 PipelineKeyVersion = 8u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -114,7 +117,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
-    info.Deserialize(ar);
+    info.Deserialize(ar, perm_hash_ar);
     return true;
 }
 
@@ -408,13 +411,13 @@ void Info::Serialize(Serialization::Archive& ar) const {
     srt_info.Serialize(ar);
 }
 
-bool Info::Deserialize(Serialization::Archive& ar) {
+bool Info::Deserialize(Serialization::Archive& ar, u64 walker_key) {
     Serialization::Reader info{ar};
 
     info.Read(this, sizeof(Shader::InfoPersistent));
     info.Read(flattened_ud_buf);
 
-    return srt_info.Deserialize(ar);
+    return srt_info.Deserialize(ar, walker_key);
 }
 
 void Gcn::FetchShaderData::Serialize(Serialization::Archive& ar) const {
@@ -447,13 +450,13 @@ void PersistentSrtInfo::Serialize(Serialization::Archive& ar) const {
     }
 }
 
-bool PersistentSrtInfo::Deserialize(Serialization::Archive& ar) {
+bool PersistentSrtInfo::Deserialize(Serialization::Archive& ar, u64 walker_key) {
     Serialization::Reader srt{ar};
 
     srt.Read(this, sizeof(*this));
 
     if (walker_func_size) {
-        walker_func = RegisterWalkerCode(ar.CurrPtr(), walker_func_size);
+        walker_func = RegisterWalkerCode(ar.CurrPtr(), walker_func_size, walker_key);
         ar.Advance(walker_func_size);
     }
 

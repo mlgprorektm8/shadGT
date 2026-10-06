@@ -24,6 +24,10 @@ $gtPatterns = [ordered]@{
     UnsupportedLayerExport = 'RenderTargetIndex.*tessellation'
     MalformedCommands = 'Invalid PM4|malformed.*packet|Invalid.*packet'
     SwizzledAlphaEmulation = 'Using dual-source swizzled source-alpha blend emulation'
+    SwizzledFactorBlendEmulation = 'Using dual-source swizzled factor blend emulation'
+    UnhandledSwizzledBlend = 'Unhandled swizzled blend'
+    GpuWrittenConstantShaders = 'GPU-written flattened constants on the GPU for shader'
+    GpuWrittenConstantTotals = 'GPU-written flattened constants refreshed for'
     FarDepthPrecisionWorkaround = 'Applying read-only far-depth precision workaround'
 }
 Write-Output "GT Sport log: $((Resolve-Path -LiteralPath $LogPath).Path)"

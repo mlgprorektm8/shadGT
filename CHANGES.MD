@@ -4,9 +4,11 @@ Updated: October 5, 2026. Original base revision: `8e23388af83fe31ec6372a29e3940
 October 4 work started from local revision `014635d7` with the preceding graphics edits present.
 Tested title: Gran Turismo Sport, CUSA03220, update 1.69.
 
-Latest user retest: map backgrounds are correct, track outlines and icons remain
-cyan, and the frozen top strip remains. Race loading has not crashed in that test;
-long-term stability is still unconfirmed.
+Latest user retest confirms that the frozen strip is gone and in-race track icons
+are white. Map backgrounds remain correct. The bottom in-race track HUD is still
+cyan. Race loading has been stable in the latest checks; long-term stability is
+still unconfirmed. Source commit `8021b5f2` is the confirmed graphics checkpoint.
+`GT_SPORT_BASELINE.md` records the separate recovery copy and performance launcher.
 
 The follow-up capture inspection corrected the earlier map-blend diagnosis. The
 map uses alpha Zero / OneMinusSrcAlpha, not destination-alpha preservation. Its
@@ -28,7 +30,8 @@ emulation of guest viewport precision. Other captured scene artifacts remain.
 
 The follow-up Clang Debug build, CLI smoke check, and 69 selected regressions pass,
 including logical/physical blend equations and synthetic SPIR-V output checks.
-Both changes still require a fresh in-game visual check. The capture launcher now
+The user confirmed the strip fix and white race icons in the subsequent check;
+the bottom track HUD remains cyan. The capture launcher now
 accepts Debug, retaining the isolated profile and its enabled red-zone protection.
 
 The October 5 GPU capture traced the solid red map background to color fast-clear

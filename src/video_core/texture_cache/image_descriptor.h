@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <limits>
+#include "video_core/amdgpu/pixel_format.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -20,6 +21,7 @@ enum class ImageDescriptorGeometryError {
     MipLevels,
     ViewMipLevels,
     SampleCount,
+    GuestSizeLimit,
 };
 
 inline ImageDescriptorGeometryError CheckImageDescriptorGeometry(
@@ -50,6 +52,18 @@ inline ImageDescriptorGeometryError CheckImageDescriptorGeometry(
              width > limits.maxImageDimension1D)) {
             return ImageDescriptorGeometryError::DeviceExtentLimit;
         }
+    }
+    // A descriptor read from stale memory can describe gigabytes of guest memory; uploading or
+    // detiling it would run far out of bounds. No real texture comes near 4 GiB.
+    static constexpr u64 MaxGuestSize = 4ULL << 30;
+    const auto data_format = image.GetDataFmt();
+    const u32 block = AmdGpu::IsBlockCoded(data_format) ? 4 : 1;
+    const u64 row_blocks = (u64(image.Pitch()) + block - 1) / block;
+    const u64 rows = (u64(height) + block - 1) / block;
+    const u64 slices = volume ? depth : layers;
+    const u64 block_bytes = std::max(AmdGpu::NumBitsPerBlock(data_format) / 8, 1U);
+    if (row_blocks * rows * slices * block_bytes > MaxGuestSize) {
+        return ImageDescriptorGeometryError::GuestSizeLimit;
     }
     if (image.NumLevels() > std::bit_width(std::max({width, height, depth}))) {
         return ImageDescriptorGeometryError::MipLevels;

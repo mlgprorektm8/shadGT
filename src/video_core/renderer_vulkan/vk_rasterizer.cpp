@@ -10,6 +10,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/renderer_vulkan/depth_attachment.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/resource_binding.h"
@@ -187,6 +188,7 @@ void Rasterizer::EliminateFastClear() {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
+    SubmitChunkIfNeeded();
     scheduler.PopPendingOperations();
 
     if (!FilterDraw()) {
@@ -234,7 +236,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 
-    scheduler.EndRendering();
     ResetBindings(false);
 }
 
@@ -243,6 +244,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
 
+    SubmitChunkIfNeeded();
     scheduler.PopPendingOperations();
 
     if (!FilterDraw()) {
@@ -320,6 +322,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
 
+    SubmitChunkIfNeeded();
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->GetCsRegs();
@@ -355,6 +358,7 @@ void Rasterizer::DispatchDirect() {
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
 
+    SubmitChunkIfNeeded();
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->GetCsRegs();
@@ -396,15 +400,180 @@ void Rasterizer::Finish() {
     scheduler.Finish();
 }
 
+// DIAG-011: constants the traced tonemap draw used, re-checked after later submissions.
+struct TonemapConstantCheck {
+    VAddr address{};
+    std::array<u32, 76> used{};
+    u32 checks_left{};
+    u64 id{};
+};
+static std::vector<TonemapConstantCheck> g_tonemap_checks;
+
+static void RecheckTonemapConstants() {
+    for (auto& check : g_tonemap_checks) {
+        if (check.checks_left == 0) {
+            continue;
+        }
+        --check.checks_left;
+        const auto* now = reinterpret_cast<const u32*>(check.address);
+        u32 changed{};
+        for (u32 i = 0; i < check.used.size(); ++i) {
+            changed += now[i] != check.used[i];
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "Tonemap constants recheck {} at {:#x} (pass {}): {} dwords changed; "
+                    "used [4..7]={:08x} {:08x} {:08x} {:08x} [47]={:08x}, now [4..7]={:08x} "
+                    "{:08x} {:08x} {:08x} [47]={:08x}",
+                    check.id, check.address, 2 - check.checks_left, changed, check.used[4],
+                    check.used[5], check.used[6], check.used[7], check.used[47], now[4], now[5],
+                    now[6], now[7], now[47]);
+    }
+    std::erase_if(g_tonemap_checks, [](const auto& check) { return check.checks_left == 0; });
+}
+
 void Rasterizer::OnSubmit() {
+    RecheckTonemapConstants();
+    texture_cache.ReleaseFinishedReadbacks();
     buffer_cache.TickFrame();
-    texture_cache.ProcessDownloadImages();
+    ProcessDownloadsTimed(DrainSource::Submit);
     texture_cache.RunGarbageCollector();
     runtime.TickFrame();
 }
 
-void Rasterizer::OnFence() {
+void Rasterizer::OnFence(DrainSource source) {
+    ProcessDownloadsTimed(source);
+}
+
+void Rasterizer::FinishForGds() {
+    const auto start = std::chrono::steady_clock::now();
+    scheduler.Finish();
+    RecordDrain(DrainSource::GdsStore, start);
+}
+
+void Rasterizer::ProcessDownloadsTimed(DrainSource source) {
+    if (!texture_cache.HasPendingReadbacks()) {
+        texture_cache.ProcessDownloadImages();
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
     texture_cache.ProcessDownloadImages();
+    RecordDrain(source, start);
+}
+
+void Rasterizer::RecordDrain(DrainSource source, std::chrono::steady_clock::time_point start) {
+    // DIAG-016: synchronous GPU drains per source, reported every 2 seconds.
+    const auto now = std::chrono::steady_clock::now();
+    auto& stats = drain_stats;
+    if (stats.window_start == std::chrono::steady_clock::time_point{}) {
+        stats.window_start = now;
+    }
+    const u32 index = static_cast<u32>(source);
+    ++stats.count[index];
+    stats.total_us[index] +=
+        std::chrono::duration_cast<std::chrono::microseconds>(now - start).count();
+    if (now - stats.window_start < std::chrono::seconds{2}) {
+        return;
+    }
+    static constexpr std::array names = {"submit",    "gfx_eos",         "gfx_eop", "gfx_write",
+                                         "asc_write", "asc_release_mem", "gds_store"};
+    std::string summary;
+    for (u32 i = 0; i < names.size(); ++i) {
+        if (stats.count[i] != 0) {
+            summary += fmt::format(" {}={}/{:.1f}ms", names[i], stats.count[i],
+                                   stats.total_us[i] / 1000.0);
+        }
+    }
+    LOG_WARNING(Render_Vulkan, "GPU drains in {:.1f} s (count/total):{}",
+                std::chrono::duration<double>(now - stats.window_start).count(), summary);
+    stats = {};
+    stats.window_start = now;
+}
+
+bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal) {
+    // Hardware writes a fence when the work before it has finished. With readbacks pending,
+    // signal after the GPU completes instead of draining the GPU now. A later write to an address
+    // that already has a deferred write is deferred too, so that address keeps its order;
+    // fences to other addresses are signaled immediately as before.
+    const bool readbacks_pending = texture_cache.HasPendingReadbacks();
+    bool address_pending;
+    {
+        std::scoped_lock lk{deferred_fences_mutex};
+        address_pending = deferred_fence_addresses.contains(address);
+    }
+    if (!readbacks_pending && !address_pending) {
+        return false;
+    }
+    texture_cache.ReleaseFinishedReadbacks();
+    auto readbacks = texture_cache.RecordPendingReadbacks();
+    {
+        std::scoped_lock lk{deferred_fences_mutex};
+        ++deferred_fence_addresses[address];
+    }
+    ++deferred_fences;
+    const auto deferred_at = std::chrono::steady_clock::now();
+    scheduler.DeferPriorityOperation([this, address, deferred_at, readbacks = std::move(readbacks),
+                                      signal = std::move(signal)]() mutable {
+        texture_cache.CompleteReadbacks(readbacks);
+        signal();
+        RecordDeferredFenceLatency(deferred_at);
+        {
+            std::scoped_lock lk{deferred_fences_mutex};
+            if (--deferred_fence_addresses[address] == 0) {
+                deferred_fence_addresses.erase(address);
+            }
+        }
+        --deferred_fences;
+    });
+    // Submit so the deferred tick can complete; the GPU thread does not wait.
+    scheduler.Flush();
+    return true;
+}
+
+void Rasterizer::RecordDeferredFenceLatency(std::chrono::steady_clock::time_point deferred_at) {
+    // DIAG-015: how long the guest waits on a deferred fence, reported every 2 seconds.
+    const auto now = std::chrono::steady_clock::now();
+    const u64 latency_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(now - deferred_at).count();
+    std::scoped_lock lk{deferred_fences_mutex};
+    auto& stats = deferred_fence_stats;
+    if (stats.count == 0 && stats.window_start == std::chrono::steady_clock::time_point{}) {
+        stats.window_start = now;
+        stats.window_frame = u64(DebugState.GetFrameNum());
+    }
+    ++stats.count;
+    stats.total_us += latency_us;
+    stats.max_us = std::max(stats.max_us, latency_us);
+    if (now - stats.window_start >= std::chrono::seconds{2}) {
+        const u64 frames = u64(DebugState.GetFrameNum()) - stats.window_frame;
+        LOG_WARNING(Render_Vulkan,
+                    "Deferred fences: {} in {} frames, latency avg {:.2f} ms max {:.2f} ms",
+                    stats.count, frames, stats.total_us / 1000.0 / stats.count,
+                    stats.max_us / 1000.0);
+        stats = {};
+        stats.window_start = now;
+        stats.window_frame = u64(DebugState.GetFrameNum());
+    }
+}
+
+void Rasterizer::SubmitChunkIfNeeded() {
+    // PERF-003: with readback on, the guest waits for GPU completion at fences. Submitting in
+    // chunks lets the GPU run the frame while it is still being recorded.
+    static constexpr u32 DrawsPerSubmit = 128;
+    if (!texture_cache.ReadbackLinearImages()) {
+        return;
+    }
+    if (++draws_since_submit >= DrawsPerSubmit) {
+        draws_since_submit = 0;
+        scheduler.Flush();
+    }
+}
+
+void Rasterizer::FlushForDeferredFences() {
+    // A GPU-side wait may depend on a deferred fence (directly or through the guest CPU). Submit
+    // any recorded work so the deferred operations can complete instead of deadlocking.
+    if (deferred_fences.load() != 0) {
+        scheduler.Flush();
+    }
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -758,6 +927,18 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
+// DIAG-017: bindings on the page that precedes every device loss in GT Sport.
+static bool ShouldTraceCrashPage(VAddr address) {
+    static constexpr VAddr TracedBegin = 0x3f80000000;
+    static constexpr VAddr TracedEnd = TracedBegin + 0x10000;
+    if (address < TracedBegin || address >= TracedEnd) {
+        return false;
+    }
+    static std::atomic<u64> count{};
+    const u64 n = ++count;
+    return n <= 64 || n % 1000 == 0;
+}
+
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
@@ -774,6 +955,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+                RefreshGpuWrittenConstants(stage, vk_buffer, offset);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
@@ -803,11 +985,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->GetCsRegs();
-                const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
-                const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
-                std::memset(data, 0, lds_size);
-                lds_buffer.Commit();
-                buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
+                const u64 lds_size =
+                    u64(cs_program.SharedMemSize()) * cs_program.NumWorkgroups();
+                // GCN LDS is undefined at workgroup launch, so only reserve a GPU-only region.
+                const auto offset = lds_buffer.Reserve(lds_size, alignment);
+                ASSERT_MSG(offset, "Emulated shared memory size {:#x} exceeds the stream buffer",
+                           lds_size);
+                buffer_infos.emplace_back(lds_buffer.Handle(), *offset, lds_size);
             } else {
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
@@ -825,6 +1009,92 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                               "records={:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash, u64(vsharp.base_address),
                               vsharp.GetStride(), vsharp.num_records);
+                }
+                // DIAG-006: trace GT Sport's 304-byte fragment constant buffers (tonemap).
+                if (stage.sw_stage == Shader::SwStage::Fragment && size == 304 && !desc.is_written) {
+                    static std::unordered_set<u64> seen_shaders;
+                    static u64 traced = 0;
+                    const bool first = seen_shaders.size() < 64 &&
+                                       seen_shaders.insert(stage.pgm_hash).second;
+                    if (first || (stage.pgm_hash == 0xb33ec4df && (++traced <= 20 ||
+                                                                   traced % 300 == 0))) {
+                        const auto* words = reinterpret_cast<const u32*>(vsharp.base_address);
+                        // DIAG-008: where each V# dword came from (user data or guest memory).
+                        std::string vsharp_source;
+                        const auto& fetch = desc.sharp_fetch;
+                        for (u32 i = 0; i < 4; ++i) {
+                            const bool single = fetch.summary == std::remove_cvref_t<
+                                                                     decltype(fetch)>::Summary::SingleLoad;
+                            if (!single && !((fetch.load_mask >> i) & 1)) {
+                                vsharp_source += fmt::format(" imm={:08x}", fetch.immediates[i]);
+                                continue;
+                            }
+                            const u32 off = single ? u32(fetch.offsets[0]) + i : u32(fetch.offsets[i]);
+                            const u64 src =
+                                off < stage.flattened_ud_src.size() ? stage.flattened_ud_src[off] : 0;
+                            const u32 now = src ? *reinterpret_cast<const u32*>(src) : 0;
+                            vsharp_source += fmt::format(" [{}]={:08x}{}", off,
+                                                         off < stage.flattened_ud_buf.size()
+                                                             ? stage.flattened_ud_buf[off]
+                                                             : 0,
+                                                         src ? fmt::format("@{:#x}/now {:08x}", src, now)
+                                                             : std::string(" ud"));
+                        }
+                        const auto dump =
+                            liverpool->FindRecentConstDump(vsharp.base_address, size);
+                        const auto describe_cmd = [&](VAddr address, u64 bytes) {
+                            const auto cmd = liverpool->FindRecentCmdBuffer(address, bytes);
+                            return cmd ? fmt::format("{}{:#x}+{:#x}@{} ago",
+                                                     cmd->ce_count ? "ib " : "dcb ", cmd->address,
+                                                     cmd->size,
+                                                     liverpool->CmdBufferSequence() - cmd->sequence)
+                                       : std::string("none");
+                        };
+                        const u64 table_address =
+                            !stage.flattened_ud_src.empty() && fetch.offsets[0] <
+                                                                 stage.flattened_ud_src.size()
+                                ? stage.flattened_ud_src[fetch.offsets[0]]
+                                : 0;
+                        if (g_tonemap_checks.size() < 32) {
+                            static u64 check_id = 0;
+                            auto& check = g_tonemap_checks.emplace_back();
+                            check.address = vsharp.base_address;
+                            std::memcpy(check.used.data(), words, sizeof(check.used));
+                            check.checks_left = 2;
+                            check.id = ++check_id;
+                        }
+                        LOG_WARNING(Render_Vulkan, "Constants in cmdbuf: buffer {} table {}",
+                                    describe_cmd(vsharp.base_address, size),
+                                    table_address ? describe_cmd(table_address, 16)
+                                                  : std::string("ud"));
+                        const auto [ce, de] = liverpool->CeDeCounters();
+                        LOG_WARNING(Render_Vulkan,
+                                    "Constants V# source{} pending_submits={} ce={} de={} dump={}",
+                                    vsharp_source, liverpool->PendingSubmits(), ce, de,
+                                    dump ? fmt::format("{:#x}+{:#x} {} dumps ago at ce={} de={}",
+                                                       dump->address, dump->size,
+                                                       liverpool->ConstDumpSequence() -
+                                                           dump->sequence,
+                                                       dump->ce_count, dump->de_count)
+                                         : std::string("none"));
+                        LOG_WARNING(Render_Vulkan,
+                                    "Constants {}_{:#x} at {:#x} frame {} cpu_modified={} "
+                                    "gpu_modified={} [4..7]={:08x} {:08x} {:08x} {:08x} "
+                                    "[47]={:08x}",
+                                    stage.hw_stage, stage.pgm_hash, u64(vsharp.base_address),
+                                    DebugState.GetFrameNum(),
+                                    buffer_cache.IsRegionCpuModified(vsharp.base_address, size),
+                                    buffer_cache.IsRegionGpuModified(vsharp.base_address, size),
+                                    words[4], words[5], words[6], words[7], words[47]);
+                    }
+                }
+                if (ShouldTraceCrashPage(vsharp.base_address)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Crash-page V# shader={}_{:#x} base={:#x} size={:#x} stride={} "
+                                "records={:#x} written={} formatted={}",
+                                stage.hw_stage, stage.pgm_hash, u64(vsharp.base_address), size,
+                                vsharp.GetStride(), vsharp.num_records, desc.is_written,
+                                desc.is_formatted);
                 }
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
@@ -854,6 +1124,56 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
+    }
+}
+
+void Rasterizer::RefreshGpuWrittenConstants(const Shader::Info& stage,
+                                            const VideoCore::Buffer& flat_buffer, u64 flat_offset) {
+    // The SRT walker copied these dwords from guest memory while recording. A GPU write to that
+    // memory is not visible there (and may not have executed yet), so replace the stale values
+    // with a copy that runs after earlier GPU work, as hardware scalar loads would.
+    constexpr u64 TrackedAddressLimit = 1ULL << VideoCore::MemoryTracker::MAX_CPU_PAGE_BITS;
+    const auto& sources = stage.flattened_ud_src;
+    u32 refreshed{};
+    for (u32 begin = Shader::NUM_USER_DATA_REGS; begin < sources.size();) {
+        const VAddr address = sources[begin];
+        u32 end = begin + 1;
+        while (end < sources.size() && address != 0 &&
+               sources[end] == address + u64(end - begin) * sizeof(u32)) {
+            ++end;
+        }
+        const u64 size = u64(end - begin) * sizeof(u32);
+        if (address != 0 && address + size <= TrackedAddressLimit &&
+            buffer_cache.IsRegionGpuModified(address, size)) {
+            const auto [buffer, buffer_offset] = buffer_cache.ObtainBuffer(address, size, false);
+            const vk::BufferCopy copy = {
+                .srcOffset = buffer_offset,
+                .dstOffset = flat_offset + u64(begin) * sizeof(u32),
+                .size = size,
+            };
+            runtime.CopyBuffer(buffer, &flat_buffer, std::span{&copy, 1});
+            refreshed += end - begin;
+        }
+        begin = end;
+    }
+    if (refreshed == 0) {
+        return;
+    }
+    // The copies are tracked writes to the flat buffer; order them before this draw's reads.
+    needs_barrier = true;
+    // Each refresh ends the current render pass, so report how often it happens.
+    if (const u64 count = ++gpu_constant_refresh_count;
+        count >= 1000 && count == next_gpu_constant_refresh_report) {
+        next_gpu_constant_refresh_report *= 10;
+        LOG_WARNING(Render_Vulkan, "GPU-written flattened constants refreshed for {} bindings",
+                    count);
+    }
+    static constexpr size_t MaxLoggedShaders = 64;
+    if (logged_gpu_constant_shaders.size() < MaxLoggedShaders &&
+        logged_gpu_constant_shaders.insert(stage.pgm_hash).second) {
+        LOG_WARNING(Render_Vulkan,
+                    "Refreshing {} GPU-written flattened constants on the GPU for shader {}_{:#x}",
+                    refreshed, stage.hw_stage, stage.pgm_hash);
     }
 }
 
@@ -967,6 +1287,18 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             continue;
         }
 
+        if (ShouldTraceCrashPage(tsharp.Address())) {
+            LOG_WARNING(Render_Vulkan,
+                        "Crash-page T# shader={}_{:#x} address={:#x} type={} extent={}x{}x{} "
+                        "pitch={} layers={} levels={} tiling={} data_format={} num_format={} "
+                        "written={} sharp_offset={}",
+                        stage.hw_stage, stage.pgm_hash, tsharp.Address(),
+                        AmdGpu::NameOf(tsharp.GetType()), tsharp.width + 1, tsharp.height + 1,
+                        tsharp.depth + 1, tsharp.Pitch(), tsharp.NumLayers(), tsharp.NumLevels(),
+                        u32(tsharp.tiling_index), static_cast<u32>(data_fmt),
+                        static_cast<u32>(num_fmt), image_desc.is_written,
+                        image_desc.sharp_fetch.offsets[0]);
+        }
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const u32 num_bindings = image_desc.NumBindings(stage);
 

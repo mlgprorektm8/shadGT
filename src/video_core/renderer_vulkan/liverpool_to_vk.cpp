@@ -244,9 +244,8 @@ bool IsDualSourceBlendFactor(AmdGpu::BlendControl::BlendFactor factor) {
     }
 }
 
-bool NeedsSwizzledAlphaBlend(AmdGpu::CompMapping swizzle, const AmdGpu::BlendControl& control) {
-    using Factor = AmdGpu::BlendControl::BlendFactor;
-    using Func = AmdGpu::BlendControl::BlendFunc;
+// True when the swizzle permutes RGBA and moves logical alpha out of the physical alpha lane.
+static bool MovesAlphaLane(AmdGpu::CompMapping swizzle) {
     std::array<bool, 4> channels{};
     for (const auto channel : swizzle.array) {
         if (channel < AmdGpu::CompSwizzle::Red || channel > AmdGpu::CompSwizzle::Alpha) {
@@ -257,7 +256,98 @@ bool NeedsSwizzledAlphaBlend(AmdGpu::CompMapping swizzle, const AmdGpu::BlendCon
             return false;
         }
     }
-    return swizzle.a != AmdGpu::CompSwizzle::Alpha && control.enable &&
+    return swizzle.a != AmdGpu::CompSwizzle::Alpha;
+}
+
+static bool ReadsSourceOrDestAlpha(AmdGpu::BlendControl::BlendFactor factor) {
+    using Factor = AmdGpu::BlendControl::BlendFactor;
+    switch (factor) {
+    case Factor::SrcAlpha:
+    case Factor::OneMinusSrcAlpha:
+    case Factor::DstAlpha:
+    case Factor::OneMinusDstAlpha:
+    case Factor::SrcAlphaSaturate:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool IsSourceOnlyFactor(AmdGpu::BlendControl::BlendFactor factor) {
+    using Factor = AmdGpu::BlendControl::BlendFactor;
+    switch (factor) {
+    case Factor::Zero:
+    case Factor::One:
+    case Factor::SrcColor:
+    case Factor::OneMinusSrcColor:
+    case Factor::SrcAlpha:
+    case Factor::OneMinusSrcAlpha:
+        return true;
+    default:
+        return false;
+    }
+}
+
+SwizzledFactorBlend EffectiveBlend(const AmdGpu::BlendControl& control) {
+    // Without separate alpha blending, the alpha lane uses the color function and factors.
+    const bool separate = control.separate_alpha_blend;
+    return {
+        .color_src = control.color_src_factor,
+        .color_dst = control.color_dst_factor,
+        .alpha_src = separate ? control.alpha_src_factor : control.color_src_factor,
+        .alpha_dst = separate ? control.alpha_dst_factor : control.color_dst_factor,
+        .color_func = control.color_func,
+        .alpha_func = separate ? control.alpha_func : control.color_func,
+    };
+}
+
+bool IsLaneDependentSwizzledBlend(AmdGpu::CompMapping swizzle,
+                                  const AmdGpu::BlendControl& control) {
+    if (!control.enable || !MovesAlphaLane(swizzle)) {
+        return false;
+    }
+    const auto blend = EffectiveBlend(control);
+    // An equation shared by every lane that never reads alpha is already exact natively.
+    return blend.color_src != blend.alpha_src || blend.color_dst != blend.alpha_dst ||
+           blend.color_func != blend.alpha_func || ReadsSourceOrDestAlpha(blend.color_src) ||
+           ReadsSourceOrDestAlpha(blend.color_dst);
+}
+
+std::optional<SwizzledFactorBlend> GetSwizzledFactorBlend(AmdGpu::CompMapping swizzle,
+                                                          const AmdGpu::BlendControl& control) {
+    using Func = AmdGpu::BlendControl::BlendFunc;
+    if (!IsLaneDependentSwizzledBlend(swizzle, control) ||
+        NeedsSwizzledAlphaBlend(swizzle, control)) {
+        return std::nullopt;
+    }
+    const auto blend = EffectiveBlend(control);
+    // Min/max ignore Vulkan factors, and every lane must share one Vulkan operation.
+    const bool linear_func = blend.color_func == Func::Add || blend.color_func == Func::Subtract ||
+                             blend.color_func == Func::ReverseSubtract;
+    if (!linear_func || blend.color_func != blend.alpha_func ||
+        !IsSourceOnlyFactor(blend.color_src) || !IsSourceOnlyFactor(blend.color_dst) ||
+        !IsSourceOnlyFactor(blend.alpha_src) || !IsSourceOnlyFactor(blend.alpha_dst)) {
+        return std::nullopt;
+    }
+    return blend;
+}
+
+void SetSwizzledFactorBlend(vk::PipelineColorBlendAttachmentState& attachment,
+                            AmdGpu::BlendControl::BlendFunc func) {
+    // Source 0 is already scaled by its logical source factor. Source 1 holds one minus each
+    // logical destination factor in physical lane order.
+    attachment.srcColorBlendFactor = vk::BlendFactor::eOne;
+    attachment.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrc1Color;
+    attachment.colorBlendOp = BlendOp(func);
+    attachment.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+    attachment.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrc1Alpha;
+    attachment.alphaBlendOp = BlendOp(func);
+}
+
+bool NeedsSwizzledAlphaBlend(AmdGpu::CompMapping swizzle, const AmdGpu::BlendControl& control) {
+    using Factor = AmdGpu::BlendControl::BlendFactor;
+    using Func = AmdGpu::BlendControl::BlendFunc;
+    return MovesAlphaLane(swizzle) && control.enable &&
            control.separate_alpha_blend && control.color_func == Func::Add &&
            control.color_src_factor == Factor::SrcAlpha &&
            control.color_dst_factor == Factor::OneMinusSrcAlpha &&

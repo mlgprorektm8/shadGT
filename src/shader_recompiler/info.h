@@ -102,6 +102,8 @@ struct Info : InfoPersistent {
 
     std::span<const u32> user_data;
     std::vector<u32> flattened_ud_buf;
+    // Guest source address of each flattened dword, or zero for user data and unread slots.
+    std::vector<u64> flattened_ud_src;
     PersistentSrtInfo srt_info;
 
     AttributeFlags loads{};
@@ -169,10 +171,12 @@ struct Info : InfoPersistent {
 
     void RefreshFlatBuf() {
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
+        flattened_ud_src.assign(srt_info.flattened_bufsize_dw, 0);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
-            srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+            srt_info.walker_func(user_data.data(), flattened_ud_buf.data(),
+                                 flattened_ud_src.data());
         }
     }
 
@@ -187,7 +191,7 @@ struct Info : InfoPersistent {
     }
 
     void Serialize(Serialization::Archive& ar) const;
-    bool Deserialize(Serialization::Archive& ar);
+    bool Deserialize(Serialization::Archive& ar, u64 walker_key = 0);
 };
 DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
 

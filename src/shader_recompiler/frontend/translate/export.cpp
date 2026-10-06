@@ -50,6 +50,13 @@ static u32 MaskFromExportFormat(u8 mask, AmdGpu::ShaderExportFormat export_forma
 void Translator::ExportRenderTarget(const GcnInst& inst) {
     const auto& exp = inst.control.exp;
     const IR::Attribute mrt{exp.target};
+    const auto& cb0 = runtime_info.hw.fs.color_buffers[0];
+    if ((cb0.blend_swizzled_alpha || cb0.blend_swizzled_factors) &&
+        mrt != IR::Attribute::RenderTarget0) {
+        // Swizzled blend emulation requires a Zero export format on every other MRT, so hardware
+        // discards these exports. Keep them from becoming the synthetic second source.
+        return;
+    }
     info.mrt_mask |= 1u << static_cast<u8>(mrt);
 
     // Dual source blending uses MRT1 for exporting src1
@@ -108,6 +115,72 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
         for (u32 i = 0; i < 4; ++i) {
             const auto factor = color_buffer.swizzle.Map(i) == 3 ? ir.Imm32(0.f) : alpha;
             ir.SetAttribute(IR::Attribute::RenderTarget1, factor, i);
+        }
+    }
+
+    if (color_buffer.blend_swizzled_factors && mrt == IR::Attribute::RenderTarget0) {
+        using Factor = AmdGpu::BlendControl::BlendFactor;
+        // Fixed-function blending clamps normalized sources and factors to the format range.
+        const auto clamp_source = [&](const IR::F32& value) -> IR::F32 {
+            switch (color_buffer.num_format) {
+            case AmdGpu::NumberFormat::Unorm:
+            case AmdGpu::NumberFormat::Srgb:
+                return IR::F32{ir.FPClamp(value, ir.Imm32(0.f), ir.Imm32(1.f))};
+            case AmdGpu::NumberFormat::Snorm:
+                return IR::F32{ir.FPClamp(value, ir.Imm32(-1.f), ir.Imm32(1.f))};
+            default:
+                return value;
+            }
+        };
+        std::array<IR::F32, 4> source;
+        for (u32 i = 0; i < 4; ++i) {
+            // An alpha the shader does not export blends as one, matching the exact path.
+            source[i] = components[i].IsEmpty() ? ir.Imm32(i == 3 ? 1.f : 0.f)
+                                                : clamp_source(components[i]);
+        }
+        // Each factor applies to one logical channel; SrcColor on alpha reads source alpha.
+        const auto factor = [&](Factor blend_factor, u32 channel) -> IR::F32 {
+            switch (blend_factor) {
+            case Factor::Zero:
+                return ir.Imm32(0.f);
+            case Factor::One:
+                return ir.Imm32(1.f);
+            case Factor::SrcColor:
+                return source[channel];
+            case Factor::OneMinusSrcColor:
+                return IR::F32{ir.FPSub(ir.Imm32(1.f), source[channel])};
+            case Factor::SrcAlpha:
+                return source[3];
+            case Factor::OneMinusSrcAlpha:
+                return IR::F32{ir.FPSub(ir.Imm32(1.f), source[3])};
+            default:
+                UNREACHABLE_MSG("Unexpected swizzled blend factor {}", u32(blend_factor));
+            }
+        };
+        // Secondary source in physical lane order: one minus that lane's destination factor.
+        for (u32 i = 0; i < 4; ++i) {
+            const u32 channel = color_buffer.swizzle.Map(i);
+            const auto dst_factor =
+                channel == 3 ? color_buffer.swizzled_alpha_dst : color_buffer.swizzled_color_dst;
+            const auto one_minus = dst_factor == Factor::Zero  ? ir.Imm32(1.f)
+                                   : dst_factor == Factor::One ? ir.Imm32(0.f)
+                                                               : IR::F32{ir.FPSub(
+                                                                     ir.Imm32(1.f),
+                                                                     factor(dst_factor, channel))};
+            ir.SetAttribute(IR::Attribute::RenderTarget1, one_minus, i);
+        }
+        // Primary source premultiplied by each logical channel's source factor.
+        for (u32 channel = 0; channel < 4; ++channel) {
+            if (components[channel].IsEmpty()) {
+                continue;
+            }
+            const auto src_factor =
+                channel == 3 ? color_buffer.swizzled_alpha_src : color_buffer.swizzled_color_src;
+            components[channel] =
+                src_factor == Factor::Zero  ? ir.Imm32(0.f)
+                : src_factor == Factor::One ? source[channel]
+                                            : IR::F32{ir.FPMul(factor(src_factor, channel),
+                                                               source[channel])};
         }
     }
 

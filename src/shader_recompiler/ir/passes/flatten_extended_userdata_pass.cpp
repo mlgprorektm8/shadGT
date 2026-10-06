@@ -27,15 +27,45 @@
 
 using namespace Xbyak::util;
 
-static Xbyak::CodeGenerator g_srt_codegen(32_MB);
+// GT Sport has on the order of ten thousand shader permutations with walkers; 32 MB overflowed
+// ("code is too big") in long sessions.
+static constexpr size_t SrtCodegenSize = 256_MB;
+static Xbyak::CodeGenerator g_srt_codegen(SrtCodegenSize);
 static const u8* g_srt_codegen_start = nullptr;
+
+// Reports walker code use each time it crosses another 16 MB.
+static void ReportSrtCodegenUse() {
+    static size_t next_report = 16_MB;
+    const size_t used = g_srt_codegen.getSize();
+    if (used >= next_report) {
+        next_report = (used / 16_MB + 1) * 16_MB;
+        LOG_WARNING(Render_Recompiler, "SRT walker code uses {} MB of {} MB", used >> 20,
+                    SrtCodegenSize >> 20);
+    }
+}
 
 namespace Shader {
 
-PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
+PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size, u64 key) {
+    // Cache warm-up deserializes a permutation's metadata once per cached pipeline that uses
+    // it. Reuse the copy already registered for that permutation when its code is identical,
+    // instead of appending another copy to the fixed-size code buffer. Only that first copy is
+    // ever executed; later duplicates are discarded by the pipeline cache.
+    static std::unordered_map<u64, std::vector<std::pair<const u8*, size_t>>> registered;
+    if (key != 0) {
+        for (const auto& [code, code_size] : registered[key]) {
+            if (code_size == size && std::memcmp(code, ptr, size) == 0) {
+                return (PFN_SrtWalker)code;
+            }
+        }
+    }
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
     g_srt_codegen.db(ptr, size);
     g_srt_codegen.ready();
+    ReportSrtCodegenUse();
+    if (key != 0) {
+        registered[key].emplace_back(reinterpret_cast<const u8*>(func_addr), size);
+    }
     return func_addr;
 }
 
@@ -637,15 +667,20 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         if (GetFlatbufOffset(use) != 0 || !CanComputeOffset(pass_info, src_off_dw)) {
             continue;
         }
+        // rcx receives the guest source address. lea cannot fault, so the access-violation
+        // handler still only sees the r10d load below.
         if (src_off_dw.IsImmediate()) {
+            c.lea(rcx, ptr[rdi + (src_off_dw.U32() << 2)]);
             c.mov(r10d, ptr[rdi + (src_off_dw.U32() << 2)]);
         } else {
             ASSERT(ComputeOffset(c, r10d, pass_info, src_off_dw));
             c.shl(r10d, 2);
             c.mov(r10d, r10d);
+            c.lea(rcx, ptr[rdi + r10]);
             c.mov(r10d, dword[rdi + r10]);
         }
         c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
+        c.mov(ptr[r11 + (u32(pass_info.dst_off_dw) << 3)], rcx);
 
         SetFlatbufOffset(use, pass_info.dst_off_dw);
         pass_info.dst_off_dw++;
@@ -678,6 +713,8 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     }
 
     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
+    // Offset computations clobber rcx and rdx, so keep the source-address array in r11.
+    c.mov(r11, rdx);
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
@@ -732,6 +769,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
 
     info.srt_info.walker_func_size =
         c.getCurr() - reinterpret_cast<const u8*>(info.srt_info.walker_func);
+    ReportSrtCodegenUse();
 
     if (EmulatorSettings.IsDumpShaders()) {
         DumpSrtProgram(info, reinterpret_cast<const u8*>(info.srt_info.walker_func),
@@ -934,7 +972,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
 
 namespace Shader {
 
-PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
+PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size, u64 key) {
     UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");
 }
 

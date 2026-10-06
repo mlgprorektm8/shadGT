@@ -9,6 +9,24 @@
 #include "video_core/renderer_vulkan/resource_binding.h"
 #include "video_core/texture_cache/image_descriptor.h"
 
+#include <cstdlib>
+#include "common/assert.h"
+#include "common/logging/log.h"
+
+// pixel_format.cpp reports through the logger and assertion handlers.
+void Common::Log::VLog(Class, Level, const char* file, int line, const char*, fmt::string_view,
+                       fmt::format_args) {
+    ADD_FAILURE() << "Unexpected diagnostic at " << file << ':' << line;
+}
+
+void assert_fail_impl() {
+    std::abort();
+}
+
+[[noreturn]] void unreachable_impl() {
+    std::abort();
+}
+
 TEST(ResourceBinding, MalformedMipRangeUsesOneBindingBeforeStageCompilation) {
     Shader::Info stage;
     stage.buffers.emplace_back();

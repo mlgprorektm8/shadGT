@@ -401,6 +401,13 @@ GraphicsPipeline::GraphicsPipeline(
                 LOG_INFO(Render_Vulkan, "Using dual-source swizzled source-alpha blend emulation");
                 return true;
             }();
+        } else if (key.color_buffers[i].blend_swizzled_factors) {
+            // Both functions match for this emulation.
+            LiverpoolToVK::SetSwizzledFactorBlend(attachments[i], control.color_func);
+            static const bool logged = [] {
+                LOG_INFO(Render_Vulkan, "Using dual-source swizzled factor blend emulation");
+                return true;
+            }();
         }
     }
 

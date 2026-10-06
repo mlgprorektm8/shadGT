@@ -195,7 +195,7 @@ Id EmitPackUnorm2_10_10_10(EmitContext& ctx, Id value) {
                                                ctx.ConstF32(0.f), ctx.ConstF32(0.f))};
     const auto unorm_max{ctx.ConstantComposite(ctx.F32[4], ctx.ConstF32(1.f), ctx.ConstF32(1.f),
                                                ctx.ConstF32(1.f), ctx.ConstF32(1.f))};
-    const auto clamped{ctx.OpFClamp(ctx.F32[4], value, unorm_min, unorm_max)};
+    const auto clamped{ctx.OpNMin(ctx.F32[4], ctx.OpNMax(ctx.F32[4], value, unorm_min), unorm_max)};
     const auto unorm_mul{ctx.ConstantComposite(ctx.F32[4], ctx.ConstF32(1023.f),
                                                ctx.ConstF32(1023.f), ctx.ConstF32(1023.f),
                                                ctx.ConstF32(3.f))};
@@ -218,7 +218,7 @@ Id EmitPackSnorm2_10_10_10(EmitContext& ctx, Id value) {
                                                ctx.ConstF32(-1.f), ctx.ConstF32(-1.f))};
     const auto snorm_max{ctx.ConstantComposite(ctx.F32[4], ctx.ConstF32(1.f), ctx.ConstF32(1.f),
                                                ctx.ConstF32(1.f), ctx.ConstF32(1.f))};
-    const auto clamped{ctx.OpFClamp(ctx.F32[4], value, snorm_min, snorm_max)};
+    const auto clamped{ctx.OpNMin(ctx.F32[4], ctx.OpNMax(ctx.F32[4], value, snorm_min), snorm_max)};
     const auto snorm_mul{ctx.ConstantComposite(ctx.F32[4], ctx.ConstF32(511.f), ctx.ConstF32(511.f),
                                                ctx.ConstF32(511.f), ctx.ConstF32(1.f))};
     const auto as_float{ctx.OpFMul(ctx.F32[4], clamped, snorm_mul)};

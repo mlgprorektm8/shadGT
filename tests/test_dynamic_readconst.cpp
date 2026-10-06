@@ -198,6 +198,12 @@ TEST_F(DynamicReadConst, FlattensDescriptorIndexFromLaterNestedSiblingTable) {
     info.RefreshFlatBuf();
     for (u32 i = 0; i < descriptor.size(); ++i) {
         EXPECT_EQ(info.flattened_ud_buf[first + i], texture_table[48 + i]);
+        // The recorded source follows the dynamic index, so GPU writes can be refreshed later.
+        EXPECT_EQ(info.flattened_ud_src[first + i], reinterpret_cast<u64>(&texture_table[48 + i]));
+    }
+    ASSERT_EQ(info.flattened_ud_src.size(), info.flattened_ud_buf.size());
+    for (u32 i = 0; i < Shader::NUM_USER_DATA_REGS; ++i) {
+        EXPECT_EQ(info.flattened_ud_src[i], 0U);
     }
 }
 
@@ -224,6 +230,13 @@ TEST_F(DynamicReadConst, FlattensOffsetDependencyFromLaterRoot) {
     ASSERT_NE(location, 0U);
     EXPECT_EQ(duplicate.Inst()->Flags<u16>(), location);
     EXPECT_EQ(info.flattened_ud_buf[location], data[3]);
+    EXPECT_EQ(info.flattened_ud_src[location], reinterpret_cast<u64>(&data[3]));
+    // The index itself was read from guest memory through the other root.
+    bool found_index_source = false;
+    for (const u64 source : info.flattened_ud_src) {
+        found_index_source |= source == reinterpret_cast<u64>(index_data.data());
+    }
+    EXPECT_TRUE(found_index_source);
 }
 
 TEST_F(DynamicReadConst, LeavesGpuDependentDescriptorOffsetsUnresolved) {
@@ -242,6 +255,7 @@ TEST_F(DynamicReadConst, LeavesGpuDependentDescriptorOffsetsUnresolved) {
     // The unresolved group is logged, and the generated no-load walker is still safe to rerun.
     info.RefreshFlatBuf();
     EXPECT_EQ(info.flattened_ud_buf.size(), Shader::NUM_USER_DATA_REGS);
+    EXPECT_EQ(info.flattened_ud_src, std::vector<u64>(Shader::NUM_USER_DATA_REGS, 0));
 }
 
 } // namespace

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -125,6 +127,60 @@ public:
         gfx_queue.dcb_buffer.reserve(GfxReservedSize);
     }
 
+    /// Diagnostic (DIAG-009): most recent CE constant dump covering a range, if any.
+    struct ConstDumpRecord {
+        VAddr address{};
+        u32 size{};
+        u32 ce_count{};
+        u32 de_count{};
+        u64 sequence{};
+    };
+    std::optional<ConstDumpRecord> FindRecentConstDump(VAddr address, u64 size) const {
+        std::optional<ConstDumpRecord> found;
+        for (const auto& dump : recent_const_dumps) {
+            if (dump.size != 0 && address >= dump.address &&
+                address + size <= dump.address + dump.size &&
+                (!found || dump.sequence > found->sequence)) {
+                found = dump;
+            }
+        }
+        return found;
+    }
+    u64 ConstDumpSequence() const {
+        return const_dump_sequence;
+    }
+    /// Diagnostic (DIAG-010): most recent graphics command buffer covering a range.
+    std::optional<ConstDumpRecord> FindRecentCmdBuffer(VAddr address, u64 size) const {
+        std::optional<ConstDumpRecord> found;
+        for (const auto& range : recent_cmd_buffers) {
+            if (range.size != 0 && address >= range.address &&
+                address + size <= range.address + range.size &&
+                (!found || range.sequence > found->sequence)) {
+                found = range;
+            }
+        }
+        return found;
+    }
+    u64 CmdBufferSequence() const {
+        return cmd_buffer_sequence;
+    }
+    void RecordCmdBuffer(const void* data, u64 size_bytes, bool indirect) {
+        recent_cmd_buffers[cmd_buffer_sequence % recent_cmd_buffers.size()] = {
+            .address = reinterpret_cast<VAddr>(data),
+            .size = static_cast<u32>(size_bytes),
+            .ce_count = indirect,
+            .sequence = ++cmd_buffer_sequence,
+        };
+    }
+    std::pair<u32, u32> CeDeCounters() const {
+        return {cblock.ce_count, cblock.de_count};
+    }
+
+    /// Diagnostic: submissions queued but not yet fully processed.
+    u32 PendingSubmits() const {
+        return num_submits;
+    }
+
     inline ComputeProgram& GetCsRegs() {
         return mapped_queues[curr_qid].cs_state;
     }
@@ -182,6 +238,11 @@ private:
         using Handle = std::coroutine_handle<promise_type>;
         Handle handle;
     };
+
+    std::array<ConstDumpRecord, 256> recent_const_dumps{};
+    u64 const_dump_sequence{};
+    std::array<ConstDumpRecord, 256> recent_cmd_buffers{};
+    u64 cmd_buffer_sequence{};
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);

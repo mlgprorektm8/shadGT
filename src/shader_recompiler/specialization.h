@@ -249,6 +249,110 @@ struct StageSpecialization {
         return true;
     }
 
+    /// Diagnostic: names the first component that makes operator== fail, following its order.
+    /// Returns nullptr when the specializations compare equal.
+    const char* FirstDifference(const StageSpecialization& other, u32& index) const {
+        index = 0;
+        if (!Valid() || !other.Valid()) {
+            return "invalid";
+        }
+        if (buffers.size() != other.buffers.size()) {
+            return "buffer count";
+        }
+        if (images.size() != other.images.size()) {
+            return "image count";
+        }
+        if (samplers.size() != other.samplers.size()) {
+            return "sampler count";
+        }
+        if (vs_attribs != other.vs_attribs) {
+            return "vs attributes";
+        }
+        if (runtime_info != other.runtime_info) {
+            const auto& a = runtime_info;
+            const auto& b = other.runtime_info;
+            if (a.hw_stage != b.hw_stage || a.sw_stage != b.sw_stage) {
+                return "runtime stage";
+            }
+            if (!(a.props == b.props)) {
+                return "runtime props";
+            }
+            if (!a.HasSameSwInfo(b.sw)) {
+                return "runtime sw info";
+            }
+            if (a.hw_stage == HwStage::Fragment) {
+                const auto& fa = a.hw.fs;
+                const auto& fb = b.hw.fs;
+                for (u32 i = 0; i < MaxColorBuffers; ++i) {
+                    if (!(fa.color_buffers[i] == fb.color_buffers[i])) {
+                        index = i;
+                        return "fs color buffer";
+                    }
+                }
+                if (!(fa.en_flags == fb.en_flags) || !(fa.addr_flags == fb.addr_flags)) {
+                    return "fs input enables";
+                }
+                if (fa.num_inputs != fb.num_inputs) {
+                    return "fs input count";
+                }
+                if (fa.z_export_format != fb.z_export_format || fa.mrtz_mask != fb.mrtz_mask) {
+                    return "fs depth export";
+                }
+                if (fa.num_samples != fb.num_samples) {
+                    return "fs samples";
+                }
+                if (fa.front_face_all_bits != fb.front_face_all_bits) {
+                    return "fs front face";
+                }
+                if (fa.dual_source_blending != fb.dual_source_blending) {
+                    return "fs dual source";
+                }
+                if (fa.clip_distance_emulation != fb.clip_distance_emulation) {
+                    return "fs clip distance";
+                }
+                for (u32 i = 0; i < fa.num_inputs; ++i) {
+                    if (!(fa.inputs[i] == fb.inputs[i])) {
+                        index = i;
+                        return "fs input";
+                    }
+                }
+            }
+            return "runtime hw info";
+        }
+        if (fetch_shader_data != other.fetch_shader_data) {
+            return "fetch shader";
+        }
+        if (fmasks != other.fmasks) {
+            return "fmasks";
+        }
+        if (buffers.empty() && images.empty() && samplers.empty()) {
+            return nullptr;
+        }
+        if (start != other.start) {
+            return "start bindings";
+        }
+        u32 binding{};
+        for (u32 i = 0; i < buffers.size(); i++) {
+            if (other.bitset[binding++] && buffers[i] != other.buffers[i]) {
+                index = i;
+                return "buffer";
+            }
+        }
+        for (u32 i = 0; i < images.size(); i++) {
+            if (other.bitset[binding++] && images[i] != other.images[i]) {
+                index = i;
+                return "image";
+            }
+        }
+        for (u32 i = 0; i < samplers.size(); i++) {
+            if (samplers[i] != other.samplers[i]) {
+                index = i;
+                return "sampler";
+            }
+        }
+        return nullptr;
+    }
+
     void Serialize(Serialization::Archive& ar) const;
     bool Deserialize(Serialization::Archive& ar);
 };

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <unordered_set>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -77,6 +78,9 @@ public:
 
 private:
     bool RefreshGraphicsKey();
+    /// Selects swizzled-alpha blend emulation for a lane-dependent blend, or reports it once.
+    void RefreshSwizzledBlend(u32 cb, Shader::PsColorBuffer& color_buffer,
+                              const AmdGpu::BlendControl& bc);
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
 
@@ -113,6 +117,7 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    std::unordered_set<u64> logged_swizzled_blends;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

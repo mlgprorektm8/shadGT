@@ -4,6 +4,24 @@
 #include <gtest/gtest.h>
 #include "video_core/texture_cache/image_descriptor.h"
 
+#include <cstdlib>
+#include "common/assert.h"
+#include "common/logging/log.h"
+
+// pixel_format.cpp reports through the logger and assertion handlers.
+void Common::Log::VLog(Class, Level, const char* file, int line, const char*, fmt::string_view,
+                       fmt::format_args) {
+    ADD_FAILURE() << "Unexpected diagnostic at " << file << ':' << line;
+}
+
+void assert_fail_impl() {
+    std::abort();
+}
+
+[[noreturn]] void unreachable_impl() {
+    std::abort();
+}
+
 namespace {
 
 vk::PhysicalDeviceLimits MakeLimits() {
@@ -117,4 +135,33 @@ TEST(ImageDescriptorGeometry, RejectsNonTextureDescriptorTypes) {
         EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
                   ImageDescriptorGeometryError::InvalidType);
     }
+}
+
+TEST(ImageDescriptorGeometry, RejectsGuestSizeAboveFourGiB) {
+    // GT Sport stale-table descriptor that preceded a device loss.
+    auto image = MakeImage(AmdGpu::ImageType::Cube);
+    image.width = 0;
+    image.height = 15872;
+    image.pitch = 15360;
+    image.depth = 0;
+    image.pow2pad = true;
+    image.last_level = 0;
+    image.data_format = u64(AmdGpu::DataFormat::Format2_10_10_10);
+    ASSERT_EQ(image.NumLayers(), 8u);
+    EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
+              ImageDescriptorGeometryError::GuestSizeLimit);
+}
+
+TEST(ImageDescriptorGeometry, AcceptsLargeRealisticTextures) {
+    auto image = MakeImage(AmdGpu::ImageType::Color2D);
+    image.width = 16383;
+    image.height = 16383;
+    image.pitch = 16383;
+    image.last_level = 0;
+    image.data_format = u64(AmdGpu::DataFormat::Format8_8_8_8);
+    EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
+              ImageDescriptorGeometryError::None);
+    image.data_format = u64(AmdGpu::DataFormat::FormatBc7);
+    EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
+              ImageDescriptorGeometryError::None);
 }
