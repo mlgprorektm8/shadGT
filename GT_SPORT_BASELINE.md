@@ -16,8 +16,8 @@ The player called this "the most accurate it's ever been" on October 6, 2026
   `user/cache/CUSA03220-before-cache-reset-20261006`).
 
 Tag: `gt-sport-graphics-baseline-20261006`. Release build, `Build/gt-sport-fixed` profile,
-launched with `scripts/Run-GTSportPerformance.ps1` (the run may have used
-`-ReadbacksMode 1`; confirm before relying on it). Reference copy:
+launched with `scripts/Run-GTSportPerformance.ps1 -ReadbacksMode 1` (player confirmed;
+the saved profile itself keeps `readbacks_mode` 0, so pass the flag). Reference copy:
 `D:/Development/shadPS4-regression-baselines/GT-Sport-20261006` (Release binary,
 profile config and a source bundle; no saves or captures).
 
