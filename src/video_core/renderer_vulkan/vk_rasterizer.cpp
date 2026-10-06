@@ -1777,8 +1777,15 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
-        if (!buffer_cache.IsRegionGpuModified(address, num_bytes) &&
-            !buffer_cache.HasGpuImageAlias(address, num_bytes)) {
+        const bool cpu_path = !buffer_cache.IsRegionGpuModified(address, num_bytes) &&
+                              !buffer_cache.HasGpuImageAlias(address, num_bytes);
+        // DIAG-020: large DMA fills, to find what writes all-ones into lighting textures.
+        static std::atomic<u32> diag_fill_logs{0};
+        if (num_bytes >= 64_KB && diag_fill_logs++ < 500) {
+            LOG_WARNING(Render_Vulkan, "DIAG-020 fill {:#x} size {:#x} value {:#x} path {}",
+                        address, num_bytes, value, cpu_path ? "cpu" : "gpu");
+        }
+        if (cpu_path) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             return;

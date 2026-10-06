@@ -14,7 +14,7 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Synthetic dual-source exports change the fragment shader interface. Version 13 adds the
 // general swizzled factor blend, which also changes the runtime color-buffer layout.
-static constexpr u32 ShaderBinaryVersion = 14u;
+static constexpr u32 ShaderBinaryVersion = 15u;
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
 // Version 13: stored SRT walker code also records flattened source addresses.
 // Version 14: stored specializations no longer include compile-time runtime-info changes.

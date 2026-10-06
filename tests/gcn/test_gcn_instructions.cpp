@@ -329,6 +329,31 @@ TEST_F(GcnTest, mul_nan) {
     EXPECT_TRUE(std::isnan(*result));
 }
 
+TEST_F(GcnTest, cvt_pkrtz_saturates_finite_overflow) {
+    auto runner = gcn_test::Runner::instance().value();
+
+    auto spirv = TranslateToSpirv(VOP2(OpcodeVOP2::V_CVT_PKRTZ_F16_F32, VOperand8::V0, SOperand9::V0, VOperand8::V1).Get());
+    auto result = runner->run<u32>(spirv, F32x2{65535.0f, -1.0e6f});
+
+    EXPECT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 0xfbff7bffU); // +-65504, not +-Inf
+}
+
+TEST_F(GcnTest, cvt_pkrtz_rounds_toward_zero) {
+    auto runner = gcn_test::Runner::instance().value();
+
+    auto spirv = TranslateToSpirv(VOP2(OpcodeVOP2::V_CVT_PKRTZ_F16_F32, VOperand8::V0, SOperand9::V0, VOperand8::V1).Get());
+    // 1 + 1.5 f16 ULP truncates to 1 + 1 ULP; Inf stays Inf.
+    auto normal = runner->run<u32>(spirv, F32x2{std::numeric_limits<float>::infinity(), 1.00146484375f});
+    // f16 denormals: 1e-7 truncates to 2^-24, -3e-8 is below 2^-24 and becomes -0.
+    auto denormal = runner->run<u32>(spirv, F32x2{1.0e-7f, -3.0e-8f});
+
+    EXPECT_TRUE(normal.has_value());
+    EXPECT_EQ(*normal, 0x3c017c00U);
+    EXPECT_TRUE(denormal.has_value());
+    EXPECT_EQ(*denormal, 0x80000001U);
+}
+
 TEST_F(GcnTest, min_legacy_nan) {
     auto runner = gcn_test::Runner::instance().value();
 

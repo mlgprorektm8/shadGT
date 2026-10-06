@@ -353,8 +353,13 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 }
 
 void Runtime::CopySubrect(VideoCore::Image* src, VideoCore::Image* dst) {
-    ASSERT(dst->info.IsSubrectOf(src->info));
-    SetBackingSamples(dst, dst->info.num_samples, false);
+    // Either direction: a cropped image refreshed from its full image, or a newer cropped
+    // image written back into the full image. Only the cropped rectangle is copied, so the
+    // full image keeps its pixels outside it.
+    const bool to_subrect = dst->info.IsSubrectOf(src->info);
+    ASSERT(to_subrect || src->info.IsSubrectOf(dst->info));
+    const auto rect = to_subrect ? dst->info.size : src->info.size;
+    SetBackingSamples(dst, dst->info.num_samples, !to_subrect);
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
 
@@ -373,7 +378,7 @@ void Runtime::CopySubrect(VideoCore::Image* src, VideoCore::Image* dst) {
         .srcOffset = {0, 0, 0},
         .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
         .dstOffset = {0, 0, 0},
-        .extent = {dst->info.size.width, dst->info.size.height, 1},
+        .extent = {rect.width, rect.height, 1},
     };
     scheduler.CommandBuffer().copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                                         dst->GetImage(), vk::ImageLayout::eTransferDstOptimal,

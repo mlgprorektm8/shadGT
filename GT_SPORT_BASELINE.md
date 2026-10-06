@@ -1,5 +1,32 @@
 # GT Sport Graphics Baseline
 
+## Current baseline: October 6, 2026
+
+The player called this "the most accurate it's ever been" on October 6, 2026
+(CUSA03220 update 1.69), after these changes (details in `GT_SPORT_OPTIMIZATION_LOG.md`):
+
+- FIX-009: cropped render targets are written back into their full image (car on the
+  loading and transmission screens).
+- FIX-010: render targets on a mip level keep that mip when other images overlap
+  (rental-car top-left square fixed, player confirmed).
+- ACC-007: `V_CVT_PKRTZ_F16_F32` rounds toward zero (finite overflow is 65504, not Inf).
+- DIAG-020/021 diagnostics are still in the build (log only; remove before the next
+  performance work).
+- Shader cache rebuilt from empty on October 6 (old cache kept as
+  `user/cache/CUSA03220-before-cache-reset-20261006`).
+
+Tag: `gt-sport-graphics-baseline-20261006`. Release build, `Build/gt-sport-fixed` profile,
+launched with `scripts/Run-GTSportPerformance.ps1` (the run may have used
+`-ReadbacksMode 1`; confirm before relying on it). Reference copy:
+`D:/Development/shadPS4-regression-baselines/GT-Sport-20261006` (binary, symbols,
+profile config and a source bundle; no saves or captures).
+
+Still open at this baseline: anti-aliasing history on the transmission screen,
+"R" drawn as "9" in some headings, and the race-preview flicker (not rechecked on the
+clean cache).
+
+## Previous baseline: October 5, 2026
+
 Confirmed by the player on October 5, 2026, with CUSA03220 update 1.69:
 
 - The frozen/glitchy top strip is gone.

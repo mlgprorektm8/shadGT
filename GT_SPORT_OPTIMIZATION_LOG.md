@@ -948,3 +948,74 @@ Findings from the October 5, 11:47 Release run (`Build/gt-sport-fixed/user/log/s
 - Change: emit GLSL `NMin`/`NMax`/`NClamp` instead of `FMin`/`FMax`/`FClamp` for FPMin/FPMax/FPClamp (32 and 64 bit) and for the non-AMD fallbacks of MinTri/MaxTri/MedTri. The `VK_AMD_shader_trinary_minmax` path is unchanged (not available on this GPU). Bump `ShaderBinaryVersion` so cached SPIR-V is rebuilt.
 - Accuracy: identical results for all non-NaN inputs. With a NaN input, the result now matches GCN (the other operand, or 0 for clamp to [0,1]).
 - Risk: low; possibly slightly more ALU on some drivers. Needs player check at Tokyo (night) and on the approved tracks for lighting regressions.
+
+### REG-003: Restore the state of the ACC-005 hand-off (player request)
+
+- Status: Done (Oct 6, 11:21).
+- Player asked to restore the code to the state at the ACC-005 hand-off message. That state is commit 97e4157f: FIX-008 and ACC-005 in, `ShaderBinaryVersion` 14, log ending at ACC-005.
+- Discarded the later uncommitted work, which was not made through this log's hand-off: TEST-001, ACC-006, ACC-005b, ENV-001, INV-001, DIAG-019/019b. Files: `src/common/logging/log.cpp`, `emit_spirv_floating_point.cpp`, `scalar_alu.cpp`, `vk_pipeline_serialization.cpp` (version 15 back to 14), `tests/gcn/gcn_test_runner.cpp`, `tests/gcn/test_gcn_instructions.cpp`, and their log entries. Saved first to `Build/post-message-changes-20261006-112148.patch` (`git apply` restores it).
+- Release rebuilt from the restored source.
+
+### Finding: Tokyo NaN lives in a lighting-probe feedback loop seeded by all-ones texels
+
+- Captures 27-29 (Tsukuba): the HDR target 62954 and every probe texture (32x32 cube 62951, 256x256x8 cube array 75960, probe arrays 171549/171551/225279/232232) have no NaN or Inf at any sampled event.
+- Capture 30 (Tokyo event menu) already starts with 62951 fully NaN and 75960 at 379,794 NaN texels (6 cube faces of mip 0 by capture 31). So the poison appears between leaving Tsukuba and the Tokyo menu, before any capture.
+- Chain in capture 30 (`capture-inspect ... usage`, new mode): draws 1805-1895 render the environment cube 406792, sampling (among others) the Tokyo-only array 338678 and the previous ambient cube 62951; compute 1904-2016 filters 406792; compute 2023+ writes 75960; compute 2353/2359 rebuild 62951 from 406792. The ambient cube feeds its own next update, so one NaN persists forever. This also fits lighting going wrong when a car loads (probes are rebuilt then).
+- 338678 is 64x64, 2048 layers, 7 mips, R11G11B10, guest 0x1081e4c400 size 0x2c00000, sampled by the env-cube pixel shader (binding 17, next to a 4x4x48 R32G32_UINT table at 0x201603c00 that looks like an indirection table). 7,688,439 of its 8,388,608 mip-0 dwords are 0xFFFFFFFF (NaN in all three channels); 532 layers fully, 1436 partly. Identical in captures 30 and 33. It is only ever read (PS_Resource) in these frames, so its contents come from a guest-memory upload, not GPU rendering.
+- Unknown: whether PS4 memory at that address also holds 0xFFFFFFFF (and the game avoids sampling it), or whether the emulator misses the real data (stale image, DMA fill ordering, or layout). DIAG-020 is built to decide this.
+- Ruled out: GT Sport's 5,027 dumped shaders contain no V_MUL/MAC/MAD/MIN/MAX_LEGACY, RCP/RSQ_CLAMP or LEGACY opcodes (scanned with a GCN decoder; 0 undecodable), so the IEEE translation of the legacy multiply-adds is not the cause.
+
+### ACC-007: V_CVT_PKRTZ_F16_F32 rounds toward zero
+
+- Status: Implemented (Oct 6), Release build OK. `ShaderBinaryVersion` 14 -> 15. The bit logic was checked against an exact round-toward-zero reference on 200,008 inputs (0 mismatches). New GcnTests `cvt_pkrtz_*` added, but the GcnTest GPU runner returns 0 for every test on this machine (even `add_f32`), so they cannot pass here.
+- Evidence: LLVM's AMDGPU instcombine folds `llvm.amdgcn.cvt.pkrtz(65535.0)` to half 65504 (`amdgcn-intrinsics.ll`, `constant_rtz_pkrtz`), i.e. IEEE round-toward-zero: finite overflow saturates to +-65504.
+- Before: the recompiler emitted GLSL `PackHalf2x16` (rounding undefined; NVIDIA rounds to nearest), so values >= 65520 became +-Inf. Also, `Unpack(Pack(x))` folds to `x` for compressed exports, so the attachment received the raw f32 and the host conversion decided (Vulkan allows Inf for out-of-range values).
+- Change (`vector_alu.cpp`): truncate each f32 to the f16-representable value toward zero (normals keep 10 mantissa bits, f16 denormals fewer, below 2^-24 -> +-0, finite overflow -> +-65504, Inf/NaN unchanged), then pack. The pack is then exact on any host.
+- Used by 2,963 shaders (VOP2) and 1,917 (VOP3) in the dump. Not shown to be the Tokyo seed; it removes one documented Inf source in HDR output.
+
+### DIAG-020: where the all-ones lighting texels come from
+
+- Status: Implemented (Oct 6), Release build OK. Warning-level log lines, bounded.
+- `DIAG-020 upload`: each upload of a float image of 1 MB or more (B10G11R11, RGBA16F, RG16F, RGBA32F, E5B9G9R9): address, size, extent, layers, mips, format, tile mode, whether the data came from guest memory (`cpu`) or the buffer cache (`gpu`), and the share of 0xFFFFFFFF dwords in guest memory. First 400 lines without all-ones, up to 2000 with.
+- `DIAG-020 stale`: every 5 s per CPU-sourced clean image, rehash guest memory; log once per image if it changed without an invalidation (the image would keep old data).
+- `DIAG-020 fill`: every DMA fill of 64 KB or more: address, size, value, and whether it ran on the CPU fast path or the GPU (first 500).
+- Files: `texture_cache.cpp`, `image.h`, `vk_rasterizer.cpp`. Remove after the run.
+- Reading the result: upload `cpu` with high all-ones and no stale line means guest memory really holds 0xFFFFFFFF (then look at who should have written it). A stale line means the emulator missed the real data. A large `fill ... value 0xffffffff` covering the address shows the fill that wrote it.
+
+### Player result, October 6 12:42 (ACC-007 + DIAG-020 build)
+
+- Race lighting fine, including Tokyo (afternoon). The Tokyo 2048-layer lighting array was never uploaded in this session (no DIAG-020 line for it), so the Tokyo fix is not proven; the broken captures were at night.
+- New reports: race preview flickers and the leaderboard rows change color; garage car not drawn on the transmission screen; square glitch top-left when picking a rental car; headings show "R" as "9" ("9ANKING BOA9D").
+
+### FIX-009: write newer cropped render targets back into the full image
+
+- Capture 25 (car loading screen): the car is drawn at event 3969 into 195763, a 1200x1080 crop of the 1920x1080 target 62957 (same address 0x1006bc8000, same pitch and size 0x7f8000). At 4113 the game blends depth of field over it through the full-width descriptor 62957. The emulator bound its own stale 62957 (no car), then at 4118 copied 62957 over 195763 (crop refresh), erasing the car. The composite at 4514 reads 195763, so the car is black.
+- Change: `FindImage` now copies any crop of the requested image that is newer (`contents_version`) back into it, oldest first, before use; `Runtime::CopySubrect` copies in either direction and only the crop rectangle (the full image keeps its other pixels).
+- Files: `texture_cache.cpp`, `vk_runtime.cpp`.
+
+### FIX-010: keep the mip found for a render target when later overlaps keep the same image
+
+- Capture 5 (rental car, Toyota 86): the top-left square comes from the depth-of-field chain 26691 (960x540, 8 mips, 0x1009e00000). Draws 3616/3629/3642 sample mip 0 and render the 480x270, 240x135 and 120x67 mips, but they are bound to a mip-0 view (the only views of 26691 are levels 0:7 and 0:0), so they paint shrinking copies over the top-left of mip 0. Mips 4-7 got their own images (26698-26704) at the end of the chain.
+- Cause (upstream code): `FindImage` resets `view_mip`/`view_slice` to -1 for every overlapping image, so a later overlap that returns the same image drops the mip found by `MipOf`. Inferred from the code and the missing views; `DIAG-021 kept mip` logs each case the fix now keeps (first 50).
+- Change: only replace the mip/slice when the overlap returns a different image or a subresource.
+- Possibly also related (not shown): leaderboard panels changing color and preview flicker, if those sample blurred mips.
+
+### Player result, October 6 13:35-16:30 (FIX-009 + FIX-010 build) and captures
+
+- Rental car top-left square: fixed (player confirmed). Transmission screen: car area now flat grey instead of black. Race preview: still flickers (less), ranking rows still change color.
+- Startup takes about 3.5 minutes: `PipelineCache::WarmUp` builds all 17,718 cached pipelines on the main thread, so the window does not respond. Not a hang.
+- The Tokyo 2048-layer lighting array (now 131314 at 0x10782e1400) has no all-ones or NaN texels in this session's capture 8 (5.7% zero words, real data).
+
+### Finding: ranking-board rows are a frosted-glass blur of the scene behind them
+
+- Capture 9 (old numbering, 12:54 run), row draw 19728 samples a 142x48 crop of a 142x96 blur target in the 0x1009bc0000 scratch pool; the blur reads the display buffer behind the row. Row colors follow the scene, so they go flat grey when the scene is missing. Unknown: whether the PS4 tints them the same way.
+
+### Finding: race preview grey/black frames do not reproduce in replay
+
+- Captures 8 and 10 (16:29 run): thumbnails (the frame as presented live) are black/grey, but replaying the same captured commands gives a correct frame: scene, TAA, composite at 18249 and UI are all present in the display buffer, and the presenter reads that buffer. Same commands, different live result, so the cause is timing-dependent (missing synchronization or a race), not shader math. Same conclusion as the earlier glare finding.
+- Next: a run with Vulkan synchronization validation (`Build/Run-GT-Sport.ps1 -Diagnostic`) to list hazards on the preview screen.
+
+### Finding: transmission screen grey comes from a stuck TAA history
+
+- Captures 1-5: the car renders into 26082 and its 1200x1080 crop 57860 (copy 3742) correctly. The TAA pass (fs_0x184b619c, viewport x 720-1920) outputs one constant value over the whole car area in both ping-pong parities (captures 1/3/5 write 0x10083b0000, capture 4 writes 0x10073c0000), while the same shader works for the cockpit view.
+- Lead (unconfirmed): the TAA shader's output channel order differs from the morning build (z and w swapped: old `(s.w, s.z, s.x, s.y)`, new `(s.w, s.z, s.y, s.x)` in the copy-through path). GCN code: `v_cvt_pkrtz v0, v0, v1; v_cvt_pkrtz_e64 v1, v2, 1.0; exp mrt1 v0 v1; v_cvt_pkrtz v2, v2, v3; exp mrt0 v0 v2`. Not resolved which order is correct.

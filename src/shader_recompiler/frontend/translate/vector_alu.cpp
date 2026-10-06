@@ -844,9 +844,35 @@ void Translator::V_CVT_PKNORM_I16_F32(const GcnInst& inst) {
 }
 
 void Translator::V_CVT_PKRTZ_F16_F32(const GcnInst& inst) {
-    const IR::Value vec_f32 =
-        ir.CompositeConstruct(GetSrc<IR::F32>(inst.src[0]), GetSrc<IR::F32>(inst.src[1]));
-    SetDst(inst.dst[0], ir.Pack2x16(AmdGpu::NumberFormat::Float, vec_f32));
+    // GCN converts with round toward zero, so finite values above the f16 range become
+    // +-65504 instead of +-Inf (LLVM folds amdgcn.cvt.pkrtz(65535.0) to 65504).
+    // PackHalf2x16 has no defined rounding mode, so first truncate each value to one that
+    // f16 represents exactly; the pack is then exact on any host.
+    const auto truncate_to_f16 = [&](const IR::F32& value) {
+        const IR::U32 bits{ir.BitCast<IR::U32>(value)};
+        const IR::U32 sign{ir.BitwiseAnd(bits, ir.Imm32(0x80000000u))};
+        const IR::U32 exponent{ir.BitFieldExtract(bits, ir.Imm32(23u), ir.Imm32(8u))};
+        // f32 biased exponents 113..142 are f16 normals (keep 10 mantissa bits). Below that,
+        // f16 denormals keep one bit fewer per exponent step, down to 2^-24 at exponent 103.
+        const IR::U32 denorm_steps{
+            ir.ISub(ir.UMax(exponent, ir.Imm32(103u)), ir.Imm32(103u))};
+        const IR::U32 drop_bits{
+            ir.ISub(ir.Imm32(23u), ir.UMin(denorm_steps, ir.Imm32(10u)))};
+        const IR::U32 truncated{
+            ir.BitwiseAnd(bits, ir.ShiftLeftLogical(ir.Imm32(0xffffffffu), drop_bits))};
+        const IR::U1 is_inf_nan{ir.IEqual(exponent, ir.Imm32(0xffu))};
+        const IR::U1 overflows{ir.IGreaterThan(exponent, ir.Imm32(142u), false)};
+        const IR::U1 underflows{ir.ILessThan(exponent, ir.Imm32(103u), false)};
+        const IR::U32 max_finite{ir.BitwiseOr(sign, ir.Imm32(0x477fe000u))}; // +-65504
+        IR::U32 result{ir.Select(underflows, sign, truncated)};
+        result = IR::U32{ir.Select(overflows, max_finite, result)};
+        result = IR::U32{ir.Select(is_inf_nan, bits, result)};
+        return ir.BitCast<IR::F32>(result);
+    };
+    const IR::F32 src0{truncate_to_f16(GetSrc<IR::F32>(inst.src[0]))};
+    const IR::F32 src1{truncate_to_f16(GetSrc<IR::F32>(inst.src[1]))};
+    SetDst(inst.dst[0],
+           ir.Pack2x16(AmdGpu::NumberFormat::Float, ir.CompositeConstruct(src0, src1)));
 }
 
 void Translator::V_ADD_F16(const GcnInst& inst) {

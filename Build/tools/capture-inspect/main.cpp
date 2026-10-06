@@ -153,6 +153,17 @@ static int Inspect(ICaptureFile* file, const std::filesystem::path& out, int arg
         return 3;
     }
     auto* replay = opened.second;
+    if (argc > 4 && std::string(argv[3]) == "usage") {
+        // Every event that reads or writes a resource, with RenderDoc's usage kind.
+        for (int i = 4; i < argc; ++i) {
+            for (const auto& use : replay->GetUsage(Resource(std::stoull(argv[i])))) {
+                std::cout << argv[i] << ' ' << use.eventId << ' ' << static_cast<int>(use.usage)
+                          << '\n';
+            }
+        }
+        replay->Shutdown();
+        return 0;
+    }
     std::vector<const ActionDescription*> actions;
     Flatten(replay->GetRootActions(), actions);
     Json summary;

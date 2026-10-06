@@ -184,6 +184,10 @@ public:
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
+    // DIAG-020: guest memory hash at the last CPU-sourced upload, for stale-image checks.
+    u64 diag_upload_hash{};
+    u64 diag_last_check_ms{};
+    bool diag_stale_logged{};
 
     struct {
         u32 texture : 1;
