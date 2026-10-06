@@ -1,4 +1,4 @@
-# GT Sport Graphics Baseline
+﻿# GT Sport Graphics Baseline
 
 ## Current baseline: October 6, 2026
 
@@ -18,7 +18,7 @@ The player called this "the most accurate it's ever been" on October 6, 2026
 Tag: `gt-sport-graphics-baseline-20261006`. Release build, `Build/gt-sport-fixed` profile,
 launched with `scripts/Run-GTSportPerformance.ps1` (the run may have used
 `-ReadbacksMode 1`; confirm before relying on it). Reference copy:
-`D:/Development/shadPS4-regression-baselines/GT-Sport-20261006` (binary, symbols,
+`D:/Development/shadPS4-regression-baselines/GT-Sport-20261006` (Release binary,
 profile config and a source bundle; no saves or captures).
 
 Still open at this baseline: anti-aliasing history on the transmission screen,
