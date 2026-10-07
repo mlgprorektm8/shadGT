@@ -71,8 +71,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       // store of the old value). With exact store sizes it produced corrupted (blue, exploded)
       // vertices around the track in a race, so CPU write faults drain the GPU again.
       split_write_faults{false},
-      split_gds_write_faults{EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Relaxed &&
-                             Common::PerfFeatureEnabled(15)} {
+      // PERF-015 is disabled: without the drain, GPU results near those records (GT Sport's
+      // sparks) no longer reached guest memory before the game's CPU used them, and sparks
+      // came with exploded vertices. The drain's wait for all earlier GPU work is what the game
+      // relies on there.
+      split_gds_write_faults{false} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -353,7 +356,7 @@ void BufferCache::InvalidateAsyncReadbacks(VAddr address, u64 size) {
         if (!readback->valid) {
             return;
         }
-        if (readback->is_gds) {
+        if (readback->is_gds && split_gds_write_faults) {
             // PERF-015: its page stays GPU-modified until ApplyCompletedReadbacks finds no
             // GPU-written bytes left, so only a write to its own bytes makes it stale.
             if (readback->address < address + size && address < readback->address + readback->size) {
@@ -364,6 +367,9 @@ void BufferCache::InvalidateAsyncReadbacks(VAddr address, u64 size) {
         }
         if (readback->address < end && start < readback->address + readback->size) {
             readback->valid = false;
+            if (readback->is_gds) {
+                --num_valid_gds_readbacks;
+            }
         }
     };
     std::ranges::for_each(pending_async_readbacks, invalidate);
@@ -810,7 +816,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     // PERF-015: bytes of pending GDS copies stay as they are in the arena until their value
     // reaches guest memory; uploading the stale guest copy would overwrite them.
     boost::container::small_vector<std::pair<VAddr, VAddr>, 8> gds_pending;
-    if (num_valid_gds_readbacks.load() != 0) {
+    if (split_gds_write_faults && num_valid_gds_readbacks.load() != 0) {
         std::scoped_lock lk{async_readbacks_mutex};
         for (const auto* list : {&pending_async_readbacks, &inflight_async_readbacks}) {
             for (const auto& readback : *list) {

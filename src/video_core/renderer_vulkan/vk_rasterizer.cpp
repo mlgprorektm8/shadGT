@@ -556,6 +556,10 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     buffer_cache.ReleaseFinishedAsyncReadbacks();
     auto readbacks = texture_cache.RecordPendingReadbacks();
     auto async_readbacks = buffer_cache.TakePendingAsyncReadbacks();
+    const bool brings_data = !readbacks.empty() || !async_readbacks.empty();
+    if (brings_data) {
+        ++readback_fences;
+    }
     {
         std::scoped_lock lk{deferred_fences_mutex};
         ++deferred_fence_addresses[address];
@@ -567,7 +571,8 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     }
     ++deferred_fences;
     const auto deferred_at = std::chrono::steady_clock::now();
-    scheduler.DeferPriorityOperation([this, address, deferred_at, readbacks = std::move(readbacks),
+    scheduler.DeferPriorityOperation([this, address, deferred_at, brings_data,
+                                      readbacks = std::move(readbacks),
                                       async_readbacks = std::move(async_readbacks),
                                       signal = std::move(signal)]() mutable {
         texture_cache.CompleteReadbacks(readbacks);
@@ -582,6 +587,9 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
             }
         }
         --deferred_fences;
+        if (brings_data) {
+            --readback_fences;
+        }
     });
     // Submit so the deferred tick can complete; the GPU thread does not wait.
     scheduler.Flush();

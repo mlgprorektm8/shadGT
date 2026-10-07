@@ -128,8 +128,13 @@ static std::vector<u8> FenceValueBytes(DataSelect data_sel, u32 low, u64 qword) 
 static bool SatisfiedByPendingFence(Vulkan::Rasterizer* rasterizer,
                                     const PM4CmdWaitRegMem* wait_reg_mem) {
     static const bool enabled = Common::PerfFeatureEnabled(14);
+    // PERF-014b: the command thread itself reads guest memory after the wait (resource
+    // descriptors, constants, GPU-written data fetched back). While a deferred fence is still
+    // bringing GPU data back to guest memory, going early would read stale data (exploded
+    // vertices in races), so it waits as before.
     if (!enabled || !rasterizer ||
-        wait_reg_mem->mem_space != PM4CmdWaitRegMem::MemSpace::Memory) {
+        wait_reg_mem->mem_space != PM4CmdWaitRegMem::MemSpace::Memory ||
+        rasterizer->HasReadbackFences()) {
         return false;
     }
     const auto value =

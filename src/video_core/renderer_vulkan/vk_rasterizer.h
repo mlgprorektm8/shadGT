@@ -114,6 +114,9 @@ public:
                           bool compute_queue = false, std::span<const u8> value = {});
     /// PERF-014: the dword at address once all deferred fence writes that cover it land.
     std::optional<u32> PendingFenceDword(VAddr address);
+    [[nodiscard]] bool HasReadbackFences() const {
+        return readback_fences.load() != 0;
+    }
     /// Submits recorded GPU work if deferred fences are outstanding (before blocking waits).
     void FlushForDeferredFences();
     void SubmitChunkIfNeeded();
@@ -229,6 +232,8 @@ private:
     u32 invalid_texture_context_count{};
     std::unordered_set<u64> logged_gpu_constant_shaders;
     std::atomic<u32> deferred_fences{};
+    /// PERF-014b: deferred fences that will also bring GPU data back to guest memory.
+    std::atomic<u32> readback_fences{};
     u32 draws_since_submit{};
     struct DrainStats {
         std::chrono::steady_clock::time_point window_start{};
