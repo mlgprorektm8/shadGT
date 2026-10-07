@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <chrono>
+#include <unordered_map>
+#include <vector>
 #include <boost/preprocessor/stringize.hpp>
 #include <fmt/ranges.h>
 
@@ -31,6 +34,50 @@ static void WriteDeferredFence(void* address, const void* data, u32 num_bytes) {
     if (memory->IsValidMapping(reinterpret_cast<VAddr>(address), num_bytes)) {
         memory->TryWriteBacking(address, data, num_bytes);
     }
+}
+
+// PERF-DIAG-009: how long each queue's command processing is blocked in wait packets, and on
+// which addresses, reported every 2 s. Only the command processor thread updates it.
+enum class FrontendWait : u32 { GfxWaitRegMem, GfxVoLabel, GfxMemSemaphore, GfxRewind,
+                                AscWaitRegMem, AscMemSemaphore, AscRewind, Count };
+static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
+                               std::chrono::steady_clock::time_point start) {
+    static constexpr std::array<const char*, size_t(FrontendWait::Count)> Names = {
+        "gfx WAIT_REG_MEM", "gfx VO label", "gfx MEM_SEMAPHORE", "gfx REWIND",
+        "asc WAIT_REG_MEM", "asc MEM_SEMAPHORE", "asc REWIND"};
+    static std::array<std::pair<u32, double>, size_t(FrontendWait::Count)> totals{};
+    static std::unordered_map<uintptr_t, std::pair<FrontendWait, double>> addresses;
+    static auto window_start = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - start).count();
+    auto& total = totals[size_t(kind)];
+    ++total.first;
+    total.second += ms;
+    auto& entry = addresses[address];
+    entry.first = kind;
+    entry.second += ms;
+    if (now - window_start < std::chrono::seconds{2}) {
+        return;
+    }
+    std::string summary;
+    for (size_t i = 0; i < Names.size(); ++i) {
+        if (totals[i].first != 0) {
+            summary += fmt::format(" {}={}/{:.1f}ms", Names[i], totals[i].first, totals[i].second);
+        }
+    }
+    std::vector<std::pair<uintptr_t, std::pair<FrontendWait, double>>> top(addresses.begin(),
+                                                                          addresses.end());
+    std::ranges::sort(top, std::greater{}, [](const auto& e) { return e.second.second; });
+    summary += ";";
+    for (size_t i = 0; i < std::min<size_t>(5, top.size()); ++i) {
+        summary += fmt::format(" {} {:#x} {:.1f}ms", Names[size_t(top[i].second.first)],
+                               top[i].first, top[i].second.second);
+    }
+    LOG_WARNING(Render, "Command processor waits in {:.1f} s (count/total):{}",
+                std::chrono::duration<double>(now - window_start).count(), summary);
+    totals = {};
+    addresses.clear();
+    window_start = now;
 }
 
 static const char* dcb_task_name{"DCB_TASK"};
@@ -863,6 +910,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     mem_semaphore->Signal();
                 } else {
                     GpuWaitDiagnostics diagnostics;
+                    const auto wait_start = std::chrono::steady_clock::now();
+                    const bool waited = !mem_semaphore->Signaled();
                     while (!mem_semaphore->Signaled()) {
                         if (diagnostics.Ready()) {
                             LOG_WARNING(Render,
@@ -871,6 +920,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                         *mem_semaphore->Address<u64*>());
                         }
                         YIELD_GFX();
+                    }
+                    if (waited) {
+                        RecordFrontendWait(FrontendWait::GfxMemSemaphore,
+                                           mem_semaphore->Address<uintptr_t>(), wait_start);
                     }
                     mem_semaphore->Decrement();
                 }
@@ -890,13 +943,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 GpuWaitDiagnostics diagnostics;
                 const auto snapshot =
                     std::span{const_cast<u32*>(submitted_dcb.data()), submitted_dcb.size()};
-                while (!RefreshRewindTailIfReady(snapshot, live_dcb, rewind_offset)) {
+                const auto rewind_start = std::chrono::steady_clock::now();
+                const bool rewind_waited =
+                    !RefreshRewindTailIfReady(snapshot, live_dcb, rewind_offset);
+                while (rewind_waited && !RefreshRewindTailIfReady(snapshot, live_dcb, rewind_offset)) {
                     if (diagnostics.Ready()) {
                         LOG_WARNING(Render, "GPU REWIND stalled: snapshot={:#x} live={:#x}",
                                     reinterpret_cast<uintptr_t>(header),
                                     reinterpret_cast<uintptr_t>(live_dcb.data() + rewind_offset));
                     }
                     YIELD_GFX();
+                }
+                if (rewind_waited) {
+                    RecordFrontendWait(FrontendWait::GfxRewind,
+                                       reinterpret_cast<uintptr_t>(header), rewind_start);
                 }
                 break;
             }
@@ -920,10 +980,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 wait_reg_mem->ref, wait_reg_mem->mask,
                                 u32(wait_reg_mem->function.Value()));
                 };
+                const auto wait_start = std::chrono::steady_clock::now();
+                const bool waited = !wait_reg_mem->Test(regs.reg_array);
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); },
                                          report_wait);
+                    if (waited) {
+                        RecordFrontendWait(FrontendWait::GfxVoLabel,
+                                           reinterpret_cast<uintptr_t>(wait_addr), wait_start);
+                    }
                     break;
                 }
                 GpuWaitDiagnostics diagnostics;
@@ -938,6 +1004,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         }
                     }
                     YIELD_GFX();
+                }
+                if (waited) {
+                    RecordFrontendWait(vo_port->IsVoLabel(wait_addr) ? FrontendWait::GfxVoLabel
+                                                                     : FrontendWait::GfxWaitRegMem,
+                                       reinterpret_cast<uintptr_t>(wait_addr), wait_start);
                 }
                 break;
             }
@@ -1150,8 +1221,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            const auto wait_start = std::chrono::steady_clock::now();
+            const bool waited = !rewind->Valid();
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
+            }
+            if (waited) {
+                RecordFrontendWait(FrontendWait::AscRewind, reinterpret_cast<uintptr_t>(header),
+                                   wait_start);
             }
             break;
         }
@@ -1241,8 +1318,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                const auto wait_start = std::chrono::steady_clock::now();
+                const bool waited = !mem_semaphore->Signaled();
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
+                }
+                if (waited) {
+                    RecordFrontendWait(FrontendWait::AscMemSemaphore,
+                                       mem_semaphore->Address<uintptr_t>(), wait_start);
                 }
                 mem_semaphore->Decrement();
             }
@@ -1251,8 +1334,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            const auto wait_start = std::chrono::steady_clock::now();
+            const bool waited = !wait_reg_mem->Test(regs.reg_array);
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
+            }
+            if (waited) {
+                RecordFrontendWait(FrontendWait::AscWaitRegMem,
+                                   reinterpret_cast<uintptr_t>(wait_reg_mem->Address<u64*>()),
+                                   wait_start);
             }
             break;
         }
