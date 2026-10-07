@@ -172,8 +172,10 @@ bool TextureCache::ShouldReadBack(const Image& image) {
         return false;
     }
     // CPU-read GPU results such as luminance chains are tiny; large linear targets are not
-    // read back, which avoids heavy copies every submission.
-    static constexpr u32 MaxReadbackSize = 64_KB;
+    // read back, which avoids heavy copies every submission. GT Sport renders car thumbnails
+    // into 448x126 linear targets (225 KB) that its CPU PNG-encodes; with a 64 KB limit the
+    // encoder saw empty memory and the game stopped with "BREAK! thumbnail_functions.ad:473".
+    static constexpr u32 MaxReadbackSize = 256_KB;
     const u32 size = ImageDownloadSize(image);
     if (size <= MaxReadbackSize) {
         static std::unordered_set<VAddr> logged_readbacks;
