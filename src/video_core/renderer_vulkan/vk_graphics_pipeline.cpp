@@ -8,11 +8,14 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perf_monitor.h"
 #include "common/thread.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
@@ -79,6 +82,52 @@ private:
     std::condition_variable_any cv;
     std::deque<std::function<void()>> jobs;
     std::vector<std::jthread> threads;
+};
+
+// PERF-018: shader stage libraries (pre-rasterization and fragment shader) of runtime
+// pipelines, shared by every pipeline whose stages, layout and stage state are the same. Many new
+// pipelines differ from an earlier one only in blending, targets or vertex input, so they reuse
+// both compiled shader libraries and only link. Libraries live until exit.
+class StageLibraryCache {
+public:
+    static StageLibraryCache& Instance() {
+        static StageLibraryCache cache;
+        return cache;
+    }
+
+    vk::Pipeline Find(u64 key) {
+        std::scoped_lock lk{mutex};
+        const auto it = libraries.find(key);
+        return it != libraries.end() ? it->second : vk::Pipeline{};
+    }
+
+    void Insert(u64 key, vk::Pipeline library) {
+        std::scoped_lock lk{mutex};
+        libraries.emplace(key, library);
+    }
+
+private:
+    std::mutex mutex;
+    std::unordered_map<u64, vk::Pipeline> libraries;
+};
+
+class LibraryKey {
+public:
+    explicit LibraryKey(u64 kind) {
+        Add(kind);
+    }
+    template <typename T>
+    void Add(const T& value) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        const auto* bytes = reinterpret_cast<const u8*>(&value);
+        data.insert(data.end(), bytes, bytes + sizeof(T));
+    }
+    u64 Hash() const {
+        return XXH3_64bits(data.data(), data.size());
+    }
+
+private:
+    std::vector<u8> data;
 };
 
 GraphicsPipeline::GraphicsPipeline(
@@ -519,14 +568,16 @@ GraphicsPipeline::GraphicsPipeline(
             vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader,
             vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentOutputInterface,
         };
-        std::array<vk::Pipeline, 4> library_handles{};
+        std::array<vk::GraphicsPipelineLibraryCreateInfoEXT, 4> library_infos{};
+        std::array<vk::GraphicsPipelineCreateInfo, 4> part_infos{};
         for (size_t i = 0; i < parts.size(); ++i) {
-            const vk::GraphicsPipelineLibraryCreateInfoEXT library_info = {
+            library_infos[i] = vk::GraphicsPipelineLibraryCreateInfoEXT{
                 .pNext = &pipeline_rendering_ci,
                 .flags = parts[i],
             };
-            auto part_info = pipeline_info;
-            part_info.pNext = &library_info;
+            auto& part_info = part_infos[i];
+            part_info = pipeline_info;
+            part_info.pNext = &library_infos[i];
             part_info.flags = vk::PipelineCreateFlagBits::eLibraryKHR |
                               vk::PipelineCreateFlagBits::eRetainLinkTimeOptimizationInfoEXT;
             part_info.stageCount = 0;
@@ -538,14 +589,93 @@ GraphicsPipeline::GraphicsPipeline(
                 part_info.stageCount = static_cast<u32>(fragment_stages.size());
                 part_info.pStages = fragment_stages.data();
             }
+        }
+        const auto create_library = [&](size_t i) {
             auto [library_result, library] =
-                device.createGraphicsPipelineUnique(pipeline_cache, part_info);
+                device.createGraphicsPipeline(pipeline_cache, part_infos[i]);
             ASSERT_MSG(library_result == vk::Result::eSuccess,
                        "Failed to create graphics pipeline library: {}",
                        vk::to_string(library_result));
-            library_handles[i] = *library;
-            library_link->libraries[i] = std::move(library);
+            return library;
+        };
+
+        // PERF-018: the shader libraries are keyed by everything their create info reads: the
+        // layout's bindings, the stage modules, and the state of their pipeline subset.
+        LibraryKey pre_raster_key{1};
+        pre_raster_key.Add(desc_layout_hash);
+        pre_raster_key.Add(uses_push_descriptors);
+        for (const auto& stage_info : pre_raster_stages) {
+            pre_raster_key.Add(stage_info.stage);
+            pre_raster_key.Add(static_cast<VkShaderModule>(stage_info.module));
         }
+        pre_raster_key.Add(tessellation_state.patchControlPoints);
+        pre_raster_key.Add(
+            raster_chain.get<vk::PipelineRasterizationStateCreateInfo>().depthClampEnable);
+        pre_raster_key.Add(key.polygon_mode);
+        pre_raster_key.Add(key.provoking_vtx_last);
+        pre_raster_key.Add(key.depth_clip_enable);
+        pre_raster_key.Add(key.clip_space);
+        for (const auto state : dynamic_states) {
+            pre_raster_key.Add(state);
+        }
+
+        LibraryKey fragment_key{2};
+        fragment_key.Add(desc_layout_hash);
+        fragment_key.Add(uses_push_descriptors);
+        for (const auto& stage_info : fragment_stages) {
+            fragment_key.Add(static_cast<VkShaderModule>(stage_info.module));
+        }
+        fragment_key.Add(sdata.multisampling.rasterizationSamples);
+        fragment_key.Add(sdata.multisampling.sampleShadingEnable);
+        fragment_key.Add(sdata.multisampling.minSampleShading);
+        fragment_key.Add(pipeline_rendering_ci.colorAttachmentCount);
+        for (u32 i = 0; i < pipeline_rendering_ci.colorAttachmentCount; ++i) {
+            fragment_key.Add(color_formats[i]);
+            fragment_key.Add(color_samples[i]);
+        }
+        fragment_key.Add(pipeline_rendering_ci.depthAttachmentFormat);
+        fragment_key.Add(pipeline_rendering_ci.stencilAttachmentFormat);
+        fragment_key.Add(mixed_samples.depthStencilAttachmentSamples);
+        for (const auto state : dynamic_states) {
+            fragment_key.Add(state);
+        }
+
+        auto& library_cache = StageLibraryCache::Instance();
+        const u64 pre_raster_hash = pre_raster_key.Hash();
+        const u64 fragment_hash = fragment_key.Hash();
+        // -DisablePerf 18 compiles every library for every pipeline, one after another.
+        const bool share_libraries = Common::PerfFeatureEnabled(18);
+        vk::Pipeline pre_raster_library =
+            share_libraries ? library_cache.Find(pre_raster_hash) : vk::Pipeline{};
+        vk::Pipeline fragment_library =
+            share_libraries ? library_cache.Find(fragment_hash) : vk::Pipeline{};
+        const bool pre_raster_reused = bool(pre_raster_library);
+        const bool fragment_reused = bool(fragment_library);
+        // PERF-018: the two shader libraries are compiled at the same time, the fragment one
+        // on another thread.
+        std::future<vk::Pipeline> fragment_future;
+        if (!fragment_library && share_libraries) {
+            fragment_future = std::async(std::launch::async, create_library, size_t{2});
+        }
+        std::array<vk::Pipeline, 4> library_handles{};
+        library_handles[0] = create_library(0);
+        if (!pre_raster_library) {
+            pre_raster_library = create_library(1);
+            library_cache.Insert(pre_raster_hash, pre_raster_library);
+        }
+        library_handles[3] = create_library(3);
+        if (fragment_future.valid()) {
+            fragment_library = fragment_future.get();
+        } else if (!fragment_library) {
+            fragment_library = create_library(2);
+        }
+        if (!fragment_reused) {
+            library_cache.Insert(fragment_hash, fragment_library);
+        }
+        library_handles[1] = pre_raster_library;
+        library_handles[2] = fragment_library;
+        library_link->owned_libraries[0] = vk::UniquePipeline{library_handles[0], device};
+        library_link->owned_libraries[1] = vk::UniquePipeline{library_handles[3], device};
         const auto libraries_done = std::chrono::steady_clock::now();
 
         const vk::PipelineLibraryCreateInfoKHR link_libraries = {
@@ -562,9 +692,13 @@ GraphicsPipeline::GraphicsPipeline(
         pipeline = std::move(linked);
         SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
         LOG_WARNING(Render_Vulkan,
-                    "Graphics pipeline {}: libraries {:.1f} ms, fast link {:.1f} ms", debug_str,
+                    "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
+                    "link {:.1f} ms",
+                    debug_str,
                     std::chrono::duration<double, std::milli>(libraries_done - create_start)
                         .count(),
+                    pre_raster_reused ? "reused" : "compiled",
+                    fragment_reused ? "reused" : "compiled",
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                               libraries_done)
                         .count());
@@ -718,6 +852,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         .bindingCount = static_cast<u32>(bindings.size()),
         .pBindings = bindings.data(),
     };
+    desc_layout_hash = XXH3_64bits(bindings.data(), bindings.size() * sizeof(bindings[0]));
     auto [layout_result, layout] =
         instance.GetDevice().createDescriptorSetLayoutUnique(desc_layout_ci);
     ASSERT_MSG(layout_result == vk::Result::eSuccess,

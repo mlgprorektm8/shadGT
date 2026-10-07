@@ -116,9 +116,13 @@ private:
 private:
     /// PERF-017: stage libraries of a runtime pipeline and the optimized link built from them.
     struct LibraryLink {
-        std::array<vk::UniquePipeline, 4> libraries;
+        /// Vertex input and fragment output libraries; the shader libraries are shared (PERF-018).
+        std::array<vk::UniquePipeline, 2> owned_libraries;
         std::future<void> optimized;
     };
+    /// PERF-018: hash of the descriptor set layout's bindings, so shader libraries are shared
+    /// only between pipelines with identically defined layouts.
+    u64 desc_layout_hash{};
     std::unique_ptr<LibraryLink> library_link;
 
     GraphicsPipelineKey key;
