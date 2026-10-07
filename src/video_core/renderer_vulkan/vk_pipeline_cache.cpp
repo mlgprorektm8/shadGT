@@ -864,8 +864,10 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 
     Shader::Optimization::g_diag_compiling_code = code;
     Shader::Optimization::g_diag_compiling_hash = info.pgm_hash;
+    const auto translate_start = std::chrono::steady_clock::now();
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    const auto translate_end = std::chrono::steady_clock::now();
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
     vk::ShaderModule module;
@@ -878,6 +880,14 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     } else {
         module = CompileSPV(spv, instance.GetDevice());
     }
+    // PERF-DIAG-013: where runtime shader compile time goes.
+    LOG_WARNING(Render_Vulkan, "Shader {} {:#x}: translate {:.1f} ms, module {:.1f} ms, {} words",
+                info.hw_stage, info.pgm_hash,
+                std::chrono::duration<double, std::milli>(translate_end - translate_start).count(),
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          translate_end)
+                    .count(),
+                spv.size());
 
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
 

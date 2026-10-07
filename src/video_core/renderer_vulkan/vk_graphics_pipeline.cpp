@@ -441,8 +441,16 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = *pipeline_layout,
     };
 
+    const auto create_start = std::chrono::steady_clock::now();
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    // PERF-DIAG-013: driver compile time of graphics pipelines created at runtime.
+    if (!preloading) {
+        LOG_WARNING(Render_Vulkan, "Graphics pipeline {}: driver create {:.1f} ms", debug_str,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                              create_start)
+                        .count());
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
