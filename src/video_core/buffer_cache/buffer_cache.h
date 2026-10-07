@@ -9,6 +9,8 @@
 #include <mutex>
 #include <memory>
 #include <atomic>
+#include <chrono>
+#include <unordered_set>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -105,25 +107,31 @@ public:
     /// Returns true when host-memory shortcuts would bypass rendered image contents.
     [[nodiscard]] bool HasGpuImageAlias(VAddr addr, size_t size);
 
-    /// GDS-to-memory copies, also read back to guest memory once the GPU has executed them,
-    /// so later CPU accesses to the destination do not have to drain the GPU (GPU thread).
-    struct GdsReadback {
+    /// GPU writes read back to guest memory once the GPU has executed them, so later CPU
+    /// accesses do not have to drain the GPU: GDS-to-memory copies (PERF-009) and GPU-written
+    /// pages the CPU has faulted on before (PERF-010). Recorded on the GPU thread.
+    struct AsyncReadback {
         VAddr address;
         u32 size;
         Vulkan::StagingBufferRef download;
         bool valid = true;
     };
     void RecordGdsReadback(VAddr address, u32 gds_offset, u32 size);
-    [[nodiscard]] bool HasPendingGdsReadbacks() const {
-        return num_pending_gds_readbacks.load() != 0;
+    [[nodiscard]] bool HasPendingAsyncReadbacks() const {
+        return num_pending_async_readbacks.load() != 0;
     }
+    /// Remembers pages the CPU read while they held GPU-written data (GPU thread).
+    void NoteCpuReadFault(VAddr address, u64 size);
+    /// Records readbacks of remembered pages that hold GPU-written data again (GPU thread).
+    /// Returns true when any were recorded.
+    bool RecordHotPageReadbacks();
     /// Hands the recorded readbacks to a deferred fence (GPU thread).
-    std::vector<std::shared_ptr<GdsReadback>> TakePendingGdsReadbacks();
+    std::vector<std::shared_ptr<AsyncReadback>> TakePendingAsyncReadbacks();
     /// Writes completed readbacks to guest memory and clears their GPU-modified state, unless a
     /// later GPU write covered them (any thread, after the GPU work completed).
-    void CompleteGdsReadbacks(std::span<const std::shared_ptr<GdsReadback>> readbacks);
+    void CompleteAsyncReadbacks(std::span<const std::shared_ptr<AsyncReadback>> readbacks);
     /// Frees staging memory of completed readbacks (GPU thread).
-    void ReleaseFinishedGdsReadbacks();
+    void ReleaseFinishedAsyncReadbacks();
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
@@ -132,14 +140,28 @@ public:
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
 private:
-    void InvalidateGdsReadbacks(VAddr address, u64 size);
+    void InvalidateAsyncReadbacks(VAddr address, u64 size);
+    void LogHotPageStats();
 
-    std::mutex gds_readbacks_mutex;
-    std::vector<std::shared_ptr<GdsReadback>> pending_gds_readbacks;
-    std::vector<std::shared_ptr<GdsReadback>> inflight_gds_readbacks;
-    std::vector<Vulkan::StagingBufferRef> finished_gds_downloads;
-    std::atomic<u32> num_pending_gds_readbacks{};
-    std::atomic<u32> num_tracked_gds_readbacks{};
+    std::mutex async_readbacks_mutex;
+    std::vector<std::shared_ptr<AsyncReadback>> pending_async_readbacks;
+    std::vector<std::shared_ptr<AsyncReadback>> inflight_async_readbacks;
+    std::vector<Vulkan::StagingBufferRef> finished_async_downloads;
+    std::atomic<u32> num_pending_async_readbacks{};
+
+    static constexpr size_t MaxHotPages = 1024;
+    std::unordered_set<VAddr> hot_pages;
+    std::deque<VAddr> hot_page_order;
+    struct HotPageStats {
+        std::chrono::steady_clock::time_point window_start{};
+        u32 faults{};
+        u32 new_pages{};
+        u32 recorded{};
+        u64 recorded_bytes{};
+        std::atomic<u32> completed{};
+        std::atomic<u32> invalidated{};
+    } hot_page_stats;
+    std::atomic<u32> num_tracked_async_readbacks{};
 
     struct ArenaBinds {
         const Buffer* arena;

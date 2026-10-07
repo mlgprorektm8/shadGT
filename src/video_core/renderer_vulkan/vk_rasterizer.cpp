@@ -434,12 +434,12 @@ static void RecheckTonemapConstants() {
 void Rasterizer::OnSubmit() {
     RecheckTonemapConstants();
     texture_cache.ReleaseFinishedReadbacks();
-    buffer_cache.ReleaseFinishedGdsReadbacks();
+    buffer_cache.ReleaseFinishedAsyncReadbacks();
     // GDS readbacks not taken by a deferred fence complete once this submission executes.
-    if (auto gds_readbacks = buffer_cache.TakePendingGdsReadbacks(); !gds_readbacks.empty()) {
+    if (auto async_readbacks = buffer_cache.TakePendingAsyncReadbacks(); !async_readbacks.empty()) {
         scheduler.DeferPriorityOperation(
-            [this, gds_readbacks = std::move(gds_readbacks)] {
-                buffer_cache.CompleteGdsReadbacks(gds_readbacks);
+            [this, async_readbacks = std::move(async_readbacks)] {
+                buffer_cache.CompleteAsyncReadbacks(async_readbacks);
             });
     }
     buffer_cache.TickFrame();
@@ -497,14 +497,21 @@ void Rasterizer::RecordDrain(DrainSource source, std::chrono::steady_clock::time
     stats.window_start = now;
 }
 
-bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal) {
+bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
+                                  bool compute_queue) {
     // Hardware writes a fence when the work before it has finished. With readbacks pending,
     // signal after the GPU completes instead of draining the GPU now. A later write to an address
     // that already has a deferred write is deferred too, so that address keeps its order;
     // fences to other addresses are signaled immediately as before.
     // Pending GDS readbacks ride along with fences deferred for image readbacks; they do not
     // cause extra deferrals (each deferral adds a submit and a guest wait).
-    const bool readbacks_pending = texture_cache.HasPendingReadbacks();
+    // PERF-010: GPU-written pages the CPU faulted on before are read back with this fence;
+    // the fence is deferred so the guest sees the data once the GPU has written it.
+    // Compute-queue fences are deferred only for these: deferring them for image readbacks too
+    // cost more than it saved (PERF-009 v1).
+    const bool hot_pages_recorded = buffer_cache.RecordHotPageReadbacks();
+    const bool readbacks_pending =
+        hot_pages_recorded || (!compute_queue && texture_cache.HasPendingReadbacks());
     bool address_pending;
     {
         std::scoped_lock lk{deferred_fences_mutex};
@@ -514,9 +521,9 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         return false;
     }
     texture_cache.ReleaseFinishedReadbacks();
-    buffer_cache.ReleaseFinishedGdsReadbacks();
+    buffer_cache.ReleaseFinishedAsyncReadbacks();
     auto readbacks = texture_cache.RecordPendingReadbacks();
-    auto gds_readbacks = buffer_cache.TakePendingGdsReadbacks();
+    auto async_readbacks = buffer_cache.TakePendingAsyncReadbacks();
     {
         std::scoped_lock lk{deferred_fences_mutex};
         ++deferred_fence_addresses[address];
@@ -524,10 +531,10 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     ++deferred_fences;
     const auto deferred_at = std::chrono::steady_clock::now();
     scheduler.DeferPriorityOperation([this, address, deferred_at, readbacks = std::move(readbacks),
-                                      gds_readbacks = std::move(gds_readbacks),
+                                      async_readbacks = std::move(async_readbacks),
                                       signal = std::move(signal)]() mutable {
         texture_cache.CompleteReadbacks(readbacks);
-        buffer_cache.CompleteGdsReadbacks(gds_readbacks);
+        buffer_cache.CompleteAsyncReadbacks(async_readbacks);
         signal();
         RecordDeferredFenceLatency(deferred_at);
         {

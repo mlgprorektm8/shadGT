@@ -86,8 +86,8 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
-    [[nodiscard]] bool HasPendingGdsReadbacks() const {
-        return buffer_cache.HasPendingGdsReadbacks();
+    [[nodiscard]] bool HasPendingAsyncReadbacks() const {
+        return buffer_cache.HasPendingAsyncReadbacks();
     }
     /// DIAG-016: where a synchronous GPU drain came from.
     enum class DrainSource : u32 {
@@ -104,7 +104,8 @@ public:
     void FinishForGds();
     /// Defers a graphics fence signal until the GPU completes when readbacks are pending or
     /// another fence is already deferred. Returns false if the caller should signal now.
-    bool DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal);
+    bool DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
+                          bool compute_queue = false);
     /// Submits recorded GPU work if deferred fences are outstanding (before blocking waits).
     void FlushForDeferredFences();
     void SubmitChunkIfNeeded();
