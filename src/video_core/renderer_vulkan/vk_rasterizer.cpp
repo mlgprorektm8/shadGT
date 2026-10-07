@@ -190,38 +190,64 @@ void Rasterizer::EliminateFastClear() {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
     ++Common::GetWorkCounters().draws;
+    using Common::Phase;
+    using Common::PhaseTimer;
+    PhaseTimer total_timer{Phase::DrawTotal};
 
-    SubmitChunkIfNeeded();
-    scheduler.PopPendingOperations();
-
-    if (!FilterDraw()) {
-        return;
+    {
+        PhaseTimer t{Phase::DrawSetup};
+        SubmitChunkIfNeeded();
+        scheduler.PopPendingOperations();
     }
 
     const auto& regs = liverpool->regs;
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
-    if (!pipeline) {
-        return;
+    const GraphicsPipeline* pipeline{};
+    {
+        PhaseTimer t{Phase::Pipeline};
+        if (!FilterDraw()) {
+            return;
+        }
+        pipeline = pipeline_cache.GetGraphicsPipeline();
+        if (!pipeline) {
+            return;
+        }
     }
 
-    PrepareRenderState(pipeline);
-    BindVertexBuffers(pipeline);
-    if (is_indexed) {
-        BindIndexBuffer(index_offset);
+    {
+        PhaseTimer t{Phase::RenderTargets};
+        PrepareRenderState(pipeline);
+    }
+    {
+        PhaseTimer t{Phase::VertexIndex};
+        BindVertexBuffers(pipeline);
+        if (is_indexed) {
+            BindIndexBuffer(index_offset);
+        }
     }
     if (!BindResources(pipeline)) {
         return;
     }
-    auto state = BeginRendering(pipeline);
-    FinalizeTextureLayouts(&state);
+    RenderState state;
+    {
+        PhaseTimer t{Phase::BeginRendering};
+        state = BeginRendering(pipeline);
+        FinalizeTextureLayouts(&state);
 
-    if (needs_barrier) {
-        runtime.FlushBarriers();
+        if (needs_barrier) {
+            runtime.FlushBarriers();
+        }
     }
 
-    pipeline->BindResources(set_writes, push_data);
-    UpdateDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state);
+    {
+        PhaseTimer t{Phase::Descriptors};
+        pipeline->BindResources(set_writes, push_data);
+    }
+    {
+        PhaseTimer t{Phase::DynamicState};
+        UpdateDynamicState(pipeline, is_indexed);
+        scheduler.BeginRendering(state);
+    }
+    PhaseTimer record_timer{Phase::Record};
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -326,6 +352,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
     ++Common::GetWorkCounters().dispatches;
+    Common::PhaseTimer total_timer{Common::Phase::DispatchTotal};
 
     SubmitChunkIfNeeded();
     scheduler.PopPendingOperations();
@@ -638,6 +665,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                           stage->samplers.size());
         stage_bindings[i] = PlanStageResourceBindings(*stage, binding);
         auto buffer_binding = stage_bindings[i].buffers;
+        Common::PhaseTimer t{Common::Phase::Buffers};
         BindBuffers(*stage, buffer_binding, push_data);
         binding = stage_bindings[i].next;
         uses_dma |= stage->uses_dma;
@@ -650,6 +678,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     for (u32 i = 0; i < stages.size(); ++i) {
         if (const auto* stage = stages[i]) {
             auto texture_binding = stage_bindings[i].textures;
+            Common::PhaseTimer t{Common::Phase::Textures};
             BindTextures(*stage, texture_binding);
         }
     }
@@ -658,7 +687,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             ? 0u
             : std::bit_width(
                   static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().mrt_mask);
-    RebindTextures(pipeline->IsCompute(), num_color_targets);
+    {
+        Common::PhaseTimer t{Common::Phase::TextureRebind};
+        RebindTextures(pipeline->IsCompute(), num_color_targets);
+    }
     if (pipeline->IsCompute()) {
         FinalizeTextureLayouts();
     }

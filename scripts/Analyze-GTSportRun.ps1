@@ -31,6 +31,12 @@ foreach ($line in [System.IO.File]::ReadLines($LogPath)) {
             ImageLookups = [double]$Matches[4]; BufferBinds = [double]$Matches[5]; Uploads = [double]$Matches[7]
             UploadKB = [double]$Matches[8]; Protects = [double]$Matches[9]
             ShadersCompiled = [double]$Matches[10]; PipelinesCompiled = [double]$Matches[11] }
+        $current.Phases = [ordered]@{}
+        if ($line -match ';(.*)$') {
+            foreach ($m in [regex]::Matches($Matches[1], ' ([a-z/-]+)=([\d.]+)ms')) {
+                $current.Phases[$m.Groups[1].Value] = [double]$m.Groups[2].Value
+            }
+        }
     } elseif ($line -match 'Command processor waits in [\d.]+ s \(count/total\):([^;]*);') {
         $current.FrontendWaits = @{}
         foreach ($m in [regex]::Matches($Matches[1], ' ([a-z]+ [A-Z_ ]+?|[a-z]+ VO label)=(\d+)/([\d.]+)ms')) {
@@ -71,6 +77,13 @@ foreach ($key in 'Packets', 'Draws', 'Dispatches', 'ImageLookups', 'BufferBinds'
 foreach ($key in 'ShadersCompiled', 'PipelinesCompiled') {
     if ($withWork.Count -gt 0) {
         Write-Output ('  {0,-17} total in run: {1}' -f $key, (($withWork | ForEach-Object { $_.Work[$key] } | Measure-Object -Sum).Sum))
+    }
+}
+$withPhases = @($withWork | Where-Object { $_.Phases -and $_.Phases.Count -gt 0 })
+if ($withPhases.Count -gt 0) {
+    Write-Output '  Command thread ms per frame by draw step:'
+    foreach ($key in $withPhases[0].Phases.Keys) {
+        Write-Output ('    {0,-16} {1}' -f $key, (Stat ($withPhases | ForEach-Object { $_.Phases[$key] / ($_.Fps * 2) })))
     }
 }
 $waitKeys = @($play | Where-Object { $_.FrontendWaits } | ForEach-Object { $_.FrontendWaits.Keys } | Sort-Object -Unique)

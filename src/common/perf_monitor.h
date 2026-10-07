@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <string>
 #include "common/types.h"
@@ -30,6 +31,39 @@ struct WorkCounters {
     std::atomic<u64> pipelines_compiled{};
 };
 WorkCounters& GetWorkCounters();
+
+/// PERF-DIAG-011: command thread time per step of a draw, in TSC ticks, reported every 2 s.
+enum class Phase : u32 {
+    DrawSetup,
+    Pipeline,
+    RenderTargets,
+    VertexIndex,
+    Buffers,
+    Textures,
+    TextureRebind,
+    BeginRendering,
+    Descriptors,
+    DynamicState,
+    Record,
+    DrawTotal,
+    DispatchTotal,
+    Submit,
+    Count,
+};
+std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();
+
+class PhaseTimer {
+public:
+    explicit PhaseTimer(Phase phase_) : phase{phase_}, start{ReadTsc()} {}
+    ~PhaseTimer() {
+        GetPhaseTicks()[size_t(phase)].fetch_add(ReadTsc() - start, std::memory_order_relaxed);
+    }
+    static u64 ReadTsc();
+
+private:
+    Phase phase;
+    u64 start;
+};
 std::string TakeWorkCounters();
 
 } // namespace Common

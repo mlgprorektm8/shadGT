@@ -13,6 +13,7 @@
 #include "common/types.h"
 
 #ifdef _WIN32
+#include <intrin.h>
 #include <windows.h>
 #include <tlhelp32.h>
 #endif
@@ -127,6 +128,40 @@ std::string SampleThreadCpuUsage(size_t) {
 }
 #endif
 
+u64 PhaseTimer::ReadTsc() {
+#if defined(_WIN32) || defined(__x86_64__)
+    return __rdtsc();
+#else
+    return std::chrono::steady_clock::now().time_since_epoch().count();
+#endif
+}
+
+std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks() {
+    static std::array<std::atomic<u64>, size_t(Phase::Count)> ticks{};
+    return ticks;
+}
+
+static std::string TakePhaseTimes() {
+    static constexpr std::array<const char*, size_t(Phase::Count)> Names = {
+        "setup", "pipeline", "targets", "vtx/idx", "buffers", "textures", "rebind",
+        "begin-rendering", "descriptors", "dynamic", "record", "draw-total", "dispatch-total",
+        "submit"};
+    static u64 last_tsc = PhaseTimer::ReadTsc();
+    static auto last_time = std::chrono::steady_clock::now();
+    const u64 tsc = PhaseTimer::ReadTsc();
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - last_time).count();
+    const double ticks_per_ms = seconds > 0 ? double(tsc - last_tsc) / (seconds * 1000.0) : 1.0;
+    last_tsc = tsc;
+    last_time = now;
+    std::string out;
+    for (size_t i = 0; i < Names.size(); ++i) {
+        out += fmt::format(" {}={:.1f}ms", Names[i],
+                           double(GetPhaseTicks()[i].exchange(0)) / ticks_per_ms);
+    }
+    return out;
+}
+
 WorkCounters& GetWorkCounters() {
     static WorkCounters counters;
     return counters;
@@ -142,7 +177,8 @@ std::string TakeWorkCounters() {
                        c.obtain_stream.exchange(0), c.uploads.exchange(0),
                        c.upload_bytes.exchange(0) / 1024, c.protects.exchange(0),
                        c.protect_bytes.exchange(0) / 1024, c.shaders_compiled.exchange(0),
-                       c.pipelines_compiled.exchange(0));
+                       c.pipelines_compiled.exchange(0)) +
+           ";" + TakePhaseTimes();
 }
 
 } // namespace Common
