@@ -3,6 +3,9 @@
 
 #include <unordered_set>
 #include "common/assert.h"
+#include "common/io_file.h"
+#include "common/logging/log.h"
+#include "common/path_util.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
@@ -242,6 +245,44 @@ SamplerPatchResult CheckClearAnisoRatioAndThresholdPattern(IR::Value value) {
     return {inst->Arg(0), true};
 }
 
+// DIAG-026: GT Sport garage-car crash on an unrecognized sharp source. CompileModule sets the
+// shader being translated; on the failure it is written to user/shader/failed for disassembly.
+thread_local std::span<const u32> g_diag_compiling_code;
+thread_local u64 g_diag_compiling_hash;
+
+static std::string DescribeSharpSource(const IR::Inst* inst, int depth) {
+    std::string out{IR::NameOf(inst->GetOpcode())};
+    out += '(';
+    for (size_t i = 0; i < inst->NumArgs(); ++i) {
+        const IR::Value arg = inst->Arg(i);
+        if (i) {
+            out += ", ";
+        }
+        if (arg.IsImmediate()) {
+            out += arg.Type() == IR::Type::U32 ? fmt::format("{:#x}", arg.U32()) : "imm";
+        } else if (const IR::Inst* arg_inst = arg.TryInst()) {
+            out += depth > 0 ? DescribeSharpSource(arg_inst, depth - 1) : "...";
+        } else {
+            out += "?";
+        }
+    }
+    return out + ')';
+}
+
+static void ReportUnknownSharpSource(const IR::Inst* source, size_t dword) {
+    LOG_CRITICAL(Render_Recompiler, "DIAG-026 shader {:#x}: sharp dword {} comes from {}",
+                 g_diag_compiling_hash, dword, DescribeSharpSource(source, 4));
+    if (!g_diag_compiling_code.empty()) {
+        using namespace Common::FS;
+        const auto dir = GetUserPath(PathType::ShaderDir) / "failed";
+        std::filesystem::create_directories(dir);
+        const auto path = dir / fmt::format("{:#x}.bin", g_diag_compiling_hash);
+        IOFile file{path, FileAccessMode::Create};
+        file.WriteSpan(g_diag_compiling_code);
+        LOG_CRITICAL(Render_Recompiler, "DIAG-026 shader binary written to {}", path.string());
+    }
+}
+
 IR::Inst* FindSharpSource(IR::Inst* handle) {
     ASSERT(IsSharpSource(handle));
     return handle;
@@ -254,6 +295,9 @@ void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
         IR::Inst* source = sharp.dwords[i].TryInst();
         if (!source) {
             continue;
+        }
+        if (!IsSharpSource(source)) {
+            ReportUnknownSharpSource(source, i);
         }
         ASSERT(IsSharpSource(source));
         if (source->GetOpcode() == IR::Opcode::ReadConstBuffer) {

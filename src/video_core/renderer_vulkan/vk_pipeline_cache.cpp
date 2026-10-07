@@ -847,6 +847,13 @@ bool PipelineCache::RefreshComputeKey() {
     return true;
 }
 
+} // namespace Vulkan
+namespace Shader::Optimization {
+extern thread_local std::span<const u32> g_diag_compiling_code;
+extern thread_local u64 g_diag_compiling_hash;
+} // namespace Shader::Optimization
+namespace Vulkan {
+
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
@@ -855,6 +862,8 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
 
+    Shader::Optimization::g_diag_compiling_code = code;
+    Shader::Optimization::g_diag_compiling_hash = info.pgm_hash;
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
