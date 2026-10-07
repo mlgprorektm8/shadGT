@@ -137,6 +137,25 @@ void BufferCache::NoteCpuReadFault(VAddr address, u64 size) {
     // PERF-010: a CPU access that needed GPU-written data drains the GPU. Pages that saw such an
     // access are read back after each later GPU write, so the next access finds current data.
     ++hot_page_stats.faults;
+    // PERF-DIAG-008: does the access itself touch GPU-written bytes, or only share their page?
+    constexpr u64 LineSize = 64;
+    const VAddr line = Common::AlignDown(address, LineSize);
+    const bool touches_gpu_bytes = gpu_modified_ranges.Intersects(
+        line, Common::AlignUp(address + std::max<u64>(size, 1), LineSize) - line);
+    if (!touches_gpu_bytes) {
+        ++hot_page_stats.page_only_faults;
+    }
+    const VAddr fault_page = Common::AlignDown(address, 4_KB);
+    auto& page_stat = hot_page_stats.pages[fault_page];
+    if (page_stat.faults++ == 0) {
+        gpu_modified_ranges.ForEachInRange(fault_page, 4_KB, [&](VAddr start, VAddr end) {
+            page_stat.gpu_bytes += fmt::format("{}{:#x}+{:#x}", page_stat.gpu_bytes.empty() ? "" : ",",
+                                               start - fault_page, end - start);
+        });
+    }
+    page_stat.last_offset = address - fault_page;
+    page_stat.last_size = size;
+    page_stat.touches_gpu_bytes |= touches_gpu_bytes;
     constexpr u64 PageSize = 4_KB;
     const VAddr end = address + std::max<u64>(size, 1);
     for (VAddr page = Common::AlignDown(address, PageSize); page < end; page += PageSize) {
@@ -220,12 +239,27 @@ void BufferCache::LogHotPageStats() {
     if (now - stats.window_start < std::chrono::seconds{2}) {
         return;
     }
+    std::vector<std::pair<VAddr, const HotPageStats::PageFaults*>> pages;
+    for (const auto& [page, stat] : stats.pages) {
+        pages.emplace_back(page, &stat);
+    }
+    std::ranges::sort(pages, std::greater{}, [](const auto& p) { return p.second->faults; });
+    std::string top;
+    for (size_t i = 0; i < std::min<size_t>(4, pages.size()); ++i) {
+        const auto& [page, stat] = pages[i];
+        top += fmt::format(" {:#x}x{} (last +{:#x} size {:#x}, {}, gpu bytes [{}])", page,
+                           stat->faults, stat->last_offset, stat->last_size,
+                           stat->touches_gpu_bytes ? "touches them" : "page only",
+                           stat->gpu_bytes);
+    }
     LOG_WARNING(Render_Vulkan,
-                "Readback pages in 2.0 s: {} CPU faults, {} new pages ({} tracked), {} readbacks "
-                "({} KB), {} completed, {} superseded",
-                stats.faults, stats.new_pages, hot_page_order.size(), stats.recorded,
-                stats.recorded_bytes / 1024, stats.completed.exchange(0),
-                stats.invalidated.exchange(0));
+                "Readback pages in 2.0 s: {} CPU faults ({} only share a page with GPU writes), "
+                "{} new pages ({} tracked), {} readbacks ({} KB), {} completed, {} superseded;{}",
+                stats.faults, stats.page_only_faults, stats.new_pages, hot_page_order.size(),
+                stats.recorded, stats.recorded_bytes / 1024, stats.completed.exchange(0),
+                stats.invalidated.exchange(0), top);
+    stats.page_only_faults = 0;
+    stats.pages.clear();
     stats.window_start = now;
     stats.faults = 0;
     stats.new_pages = 0;
@@ -306,8 +340,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
-        DownloadMemory(arena, window_start, window_end - window_start);
         NoteCpuReadFault(device_addr, size);
+        DownloadMemory(arena, window_start, window_end - window_start);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }

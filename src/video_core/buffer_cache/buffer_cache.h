@@ -10,6 +10,8 @@
 #include <memory>
 #include <atomic>
 #include <chrono>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
 
@@ -155,6 +157,15 @@ private:
     struct HotPageStats {
         std::chrono::steady_clock::time_point window_start{};
         u32 faults{};
+        u32 page_only_faults{};
+        struct PageFaults {
+            u32 faults{};
+            u64 last_offset{};
+            u64 last_size{};
+            bool touches_gpu_bytes{};
+            std::string gpu_bytes;
+        };
+        std::unordered_map<VAddr, PageFaults> pages;
         u32 new_pages{};
         u32 recorded{};
         u64 recorded_bytes{};
