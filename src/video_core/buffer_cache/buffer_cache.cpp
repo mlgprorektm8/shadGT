@@ -183,7 +183,8 @@ bool BufferCache::RecordHotPageReadbacks() {
                 auto readback = std::make_shared<AsyncReadback>();
                 readback->address = start;
                 readback->size = static_cast<u32>(end - start);
-                readback->download = staging_pool.Request(readback->size, MemoryType::HostCached);
+                readback->download =
+                    staging_pool.Request(readback->size, MemoryType::HostCached, 4, true);
                 const vk::BufferCopy copy = {
                     .srcOffset = start - arena->cpu_addr,
                     .dstOffset = readback->download.offset,
