@@ -85,9 +85,35 @@ static std::optional<std::filesystem::path> GetBundleParentDirectory() {
 }
 #endif
 
+#ifdef _WIN32
+static std::filesystem::path ExecutableDir() {
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD length =
+            GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (length == 0) {
+            return std::filesystem::current_path();
+        }
+        if (length < buffer.size()) {
+            buffer.resize(length);
+            return std::filesystem::path(buffer).parent_path();
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+}
+#endif
+
 static auto UserPaths = [] {
     // Try the portable user directory first.
     auto user_dir = std::filesystem::current_path() / PORTABLE_DIR;
+#ifdef _WIN32
+    // This fork keeps everything next to the executable on Windows: a user folder in the
+    // working directory still wins (the GT Sport launch scripts use one), otherwise the one
+    // beside shadps4.exe is used and created if needed, never AppData.
+    if (!std::filesystem::exists(user_dir)) {
+        user_dir = ExecutableDir() / PORTABLE_DIR;
+    }
+#endif
     if (!std::filesystem::exists(user_dir)) {
         // If it doesn't exist, use the standard path for the platform instead.
         // NOTE: On Windows we currently just create the portable directory instead.
@@ -102,9 +128,7 @@ static auto UserPaths = [] {
             user_dir = std::filesystem::path(getenv("HOME")) / ".local" / "share" / "shadPS4";
         }
 #elif _WIN32
-        TCHAR appdata[MAX_PATH] = {0};
-        SHGetFolderPath(NULL, CSIDL_APPDATA, NULL, 0, appdata);
-        user_dir = std::filesystem::path(appdata) / "shadPS4";
+        // Created below, beside the executable.
 #endif
     }
 
