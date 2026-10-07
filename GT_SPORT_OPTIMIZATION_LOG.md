@@ -1055,3 +1055,25 @@ Findings from the October 5, 11:47 Release run (`Build/gt-sport-fixed/user/log/s
 ### Next (experimental branch)
 
 - Track GPU writes precisely enough that CPU stores into GPU-owned pages do not force a full drain.
+
+## Experimental branch `experimental/precise-gpu-write-tracking` (October 7, continued)
+
+Lance chose (October 7) to keep this branch separate from `main` until it reaches adequate speed, then to work toward 60 FPS in races through a multi-core redesign of command processing. Each run's log is kept under `Build/gt-sport-fixed/runs` with a summary from `scripts/Analyze-GTSportRun.ps1`.
+
+### Measurements (20-car race)
+
+- Per frame: about 4,000 draws, 25,000-38,000 PM4 packets, 15,000-50,000 texture lookups, 5,000-13,000 buffer binds (PERF-DIAG-010).
+- GPU busy 20-35% (PERF-DIAG-007, sampled from the scheduler's timeline semaphore). The GPU command thread is the limit; with `-ReadbacksMode 0` races were also 20-30 FPS, so readback waits are not the main cost.
+- Draw steps on the command thread (PERF-DIAG-011, before PERF-012): buffer binding about 25 of 38 ms per frame; Vulkan command recording (descriptors, dynamic state, draw) about 3 ms. Moving recording to another thread would gain little, so the redesign starts with buffer binding.
+
+### Kept
+
+- PERF-009: GDS-to-memory copies are read back asynchronously with the next deferred fence.
+- PERF-012: pages the CPU rewrites constantly (8 write faults) stay unprotected and CPU-modified, uploaded at most once per upload epoch. Epochs start at guest submissions, after GPU waits on memory, and after command processor writes to guest memory. GPU writes return such pages to normal tracking. Race: buffer binding 25 -> 5 ms per frame, protection calls 6,800 -> 40 per frame, average FPS 26 -> 36 (10th percentile 11 -> 22). No visual changes reported.
+- PERF-013: runtime shader permutations start after the highest stored index for their program, so they no longer overwrite stored shaders. About 1,085 cached pipelines had been rejected at every start and recompiled in races; after the fix about 20-30 pipelines compile per run.
+- Diagnostics PERF-DIAG-006 to 012 (fault pages, monitor, frontend waits, work counters, draw step timing, drain writers).
+
+### Tried and disabled
+
+- PERF-010 fence deferral for hot pages: deferring fences until page readbacks landed made races slower (14-18 vs 20-35 FPS). Page readbacks now only ride along with fences.
+- PERF-011 (skip GPU-written bytes in uploads instead of draining on CPU write faults next to them): fine with 64-byte granularity, but with exact store sizes (PERF-011b) it fired every frame and produced blue, exploded vertices around the track. Without byte-level CPU write tracking it can lose CPU stores to excluded bytes, so it is disabled.
