@@ -274,6 +274,7 @@ void BufferCache::LogHotPageStats() {
                 stats.recorded, stats.recorded_bytes / 1024, stats.completed.exchange(0),
                 stats.invalidated.exchange(0), top);
     stats.page_only_faults = 0;
+    stats.drain_reports = 0;
     stats.split_faults = 0;
     stats.pages.clear();
     stats.window_start = now;
@@ -452,6 +453,19 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
             return;
         }
+        if (hot_page_stats.drain_reports < 3) {
+            ++hot_page_stats.drain_reports;
+            const VAddr page = Common::AlignDown(device_addr, 4_KB);
+            const auto it = small_gpu_writers.find(page);
+            LOG_WARNING(Render_Vulkan,
+                        "Drain for CPU {} at {:#x}+{:#x}: last small GPU write to the page: {}",
+                        is_write ? "write" : "read", device_addr, exact_write_size,
+                        it == small_gpu_writers.end()
+                            ? std::string("none recorded")
+                            : fmt::format("{} {:#x} at {:#x}+{:#x}", it->second.kind,
+                                          it->second.tag, it->second.address,
+                                          it->second.size));
+        }
         DownloadMemory(arena, window_start, window_end - window_start);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -533,6 +547,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        if (size <= 4_KB) {
+            if (small_gpu_writers.size() > 65536) {
+                small_gpu_writers.clear();
+            }
+            small_gpu_writers[Common::AlignDown(device_addr, 4_KB)] =
+                GpuWriter{g_gpu_write_kind, g_gpu_write_tag, device_addr, size};
+        }
     }
     return {arena, arena->Offset(device_addr)};
 }

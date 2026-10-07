@@ -40,6 +40,10 @@ class StagingBufferPool;
 
 namespace VideoCore {
 
+/// PERF-DIAG-012: what the command thread is doing when it writes GPU memory, for reports.
+inline thread_local const char* g_gpu_write_kind = "unknown";
+inline thread_local u64 g_gpu_write_tag = 0;
+
 class TextureCache;
 struct Image;
 class MemoryTracker;
@@ -156,6 +160,13 @@ private:
     /// (GPU thread).
     void ApplyCompletedReadbacks();
     void LogHotPageStats();
+    struct GpuWriter {
+        const char* kind;
+        u64 tag;
+        VAddr address;
+        u64 size;
+    };
+    std::unordered_map<VAddr, GpuWriter> small_gpu_writers;
 
     std::mutex async_readbacks_mutex;
     std::vector<std::shared_ptr<AsyncReadback>> pending_async_readbacks;
@@ -183,6 +194,7 @@ private:
             std::string gpu_bytes;
         };
         std::unordered_map<VAddr, PageFaults> pages;
+        u32 drain_reports{};
         u32 new_pages{};
         u32 recorded{};
         u64 recorded_bytes{};

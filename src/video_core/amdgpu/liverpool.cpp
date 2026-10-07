@@ -3,6 +3,7 @@
 
 #include <array>
 #include <chrono>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 #include <boost/preprocessor/stringize.hpp>
@@ -31,7 +32,20 @@
 namespace AmdGpu {
 
 // A fence signaled after the GPU completes may target memory the guest unmapped meanwhile.
+// PERF-DIAG-012: when deferred fences last wrote each address, to tell waits on GPU completion
+// from waits on the CPU or another queue.
+static std::mutex g_deferred_fence_writes_mutex;
+static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> g_deferred_fence_writes;
+
 static void WriteDeferredFence(void* address, const void* data, u32 num_bytes) {
+    {
+        std::scoped_lock lk{g_deferred_fence_writes_mutex};
+        if (g_deferred_fence_writes.size() > 4096) {
+            g_deferred_fence_writes.clear();
+        }
+        g_deferred_fence_writes[reinterpret_cast<uintptr_t>(address)] =
+            std::chrono::steady_clock::now();
+    }
     auto* memory = Core::Memory::Instance();
     if (memory->IsValidMapping(reinterpret_cast<VAddr>(address), num_bytes)) {
         memory->TryWriteBacking(address, data, num_bytes);
@@ -50,6 +64,7 @@ static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
         "gfx WAIT_REG_MEM", "gfx VO label", "gfx MEM_SEMAPHORE", "gfx REWIND",
         "asc WAIT_REG_MEM", "asc MEM_SEMAPHORE", "asc REWIND"};
     static std::array<std::pair<u32, double>, size_t(FrontendWait::Count)> totals{};
+    static std::pair<u32, double> gfx_on_fence{};
     static std::unordered_map<uintptr_t, std::pair<FrontendWait, double>> addresses;
     static auto window_start = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
@@ -57,6 +72,14 @@ static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
     auto& total = totals[size_t(kind)];
     ++total.first;
     total.second += ms;
+    if (kind == FrontendWait::GfxWaitRegMem) {
+        std::scoped_lock lk{g_deferred_fence_writes_mutex};
+        const auto it = g_deferred_fence_writes.find(address);
+        if (it != g_deferred_fence_writes.end() && it->second >= start) {
+            ++gfx_on_fence.first;
+            gfx_on_fence.second += ms;
+        }
+    }
     auto& entry = addresses[address];
     entry.first = kind;
     entry.second += ms;
@@ -69,6 +92,9 @@ static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
             summary += fmt::format(" {}={}/{:.1f}ms", Names[i], totals[i].first, totals[i].second);
         }
     }
+    summary += fmt::format(" (gfx WAIT_REG_MEM ended by a deferred fence: {}/{:.1f}ms)",
+                           gfx_on_fence.first, gfx_on_fence.second);
+    gfx_on_fence = {};
     std::vector<std::pair<uintptr_t, std::pair<FrontendWait, double>>> top(addresses.begin(),
                                                                           addresses.end());
     std::ranges::sort(top, std::greater{}, [](const auto& e) { return e.second.second; });

@@ -1161,6 +1161,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                 vsharp.GetStride(), vsharp.num_records, desc.is_written,
                                 desc.is_formatted);
                 }
+                VideoCore::g_gpu_write_kind = "shader";
+                VideoCore::g_gpu_write_tag = stage.pgm_hash;
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
@@ -1855,6 +1857,8 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         if (is_gds) {
             return {buffer_cache.GetGdsBuffer(), address};
         }
+        VideoCore::g_gpu_write_kind = "FillBuffer";
+        VideoCore::g_gpu_write_tag = value;
         return buffer_cache.ObtainBuffer(address, num_bytes, true);
     }();
     if (!is_gds) {
@@ -1888,6 +1892,8 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (dst_gds) {
             return {gds_buffer, dst};
         }
+        VideoCore::g_gpu_write_kind = src_gds ? "CopyBuffer from GDS" : "CopyBuffer from";
+        VideoCore::g_gpu_write_tag = src;
         return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
     }();
     if (!dst_gds) {
