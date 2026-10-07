@@ -31,10 +31,15 @@ static constexpr u32 ShaderBinaryVersion = 15u;
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
 // Version 13: stored SRT walker code also records flattened source addresses.
 // Version 14: stored specializations no longer include compile-time runtime-info changes.
-// 15: shader attribute loads/stores are stored (FIX-012).
+// 15: shader attribute loads/stores are stored (FIX-012). Version 14 entries still load, with
+// their flags recovered on first use by a rect/quad-list pipeline.
 static constexpr u32 ShaderMetaVersion = 15u;
-// 9: rect/quad-list helper shaders built from complete attribute info (FIX-012).
+static constexpr u32 ShaderMetaVersionWithoutAttributeFlags = 14u;
+// 9: rect/quad-list helper shaders built from complete attribute info (FIX-012). Version 8
+// entries still load unless they carry such helper shaders, which may have been built from a
+// shader without flags.
 static constexpr u32 PipelineKeyVersion = 9u;
+static constexpr u32 PipelineKeyVersionWithoutAttributeFlags = 8u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -117,7 +122,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 meta_version{};
     meta.Read(meta_version);
-    if (meta_version != Serialization::ShaderMetaVersion) {
+    if (meta_version != Serialization::ShaderMetaVersion &&
+        meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags) {
         return false;
     }
 
@@ -132,7 +138,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
-    info.Deserialize(ar, perm_hash_ar);
+    info.Deserialize(ar, perm_hash_ar, meta_version == Serialization::ShaderMetaVersion);
     return true;
 }
 
@@ -299,11 +305,15 @@ private:
     std::vector<std::jthread> workers;
 };
 
-bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar, bool has_attribute_flags) {
     graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
+    if (!has_attribute_flags && (!sdata.tcs.empty() || !sdata.tes.empty())) {
+        // FIX-012: the stored rect/quad-list helper shaders may forward no vertex outputs.
+        return false;
+    }
 
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = graphics_key.stage_hashes[stage_idx];
@@ -509,7 +519,8 @@ void PipelineCache::WarmUp() {
 
             u32 version{};
             pldata.Read(version);
-            if (version != Serialization::PipelineKeyVersion) {
+            if (version != Serialization::PipelineKeyVersion &&
+                version != Serialization::PipelineKeyVersionWithoutAttributeFlags) {
                 ++num_direct;
                 return;
             }
@@ -522,7 +533,8 @@ void PipelineCache::WarmUp() {
             if (is_compute) {
                 result = LoadComputePipeline(ar);
             } else {
-                result = LoadGraphicsPipeline(ar);
+                result = LoadGraphicsPipeline(
+                    ar, version == Serialization::PipelineKeyVersion);
             }
             if (queue->NumQueued() == queued_before) {
                 ++num_direct;
@@ -583,13 +595,16 @@ void Info::Serialize(Serialization::Archive& ar) const {
     srt_info.Serialize(ar);
 }
 
-bool Info::Deserialize(Serialization::Archive& ar, u64 walker_key) {
+bool Info::Deserialize(Serialization::Archive& ar, u64 walker_key, bool has_attribute_flags) {
     Serialization::Reader info{ar};
 
     info.Read(this, sizeof(Shader::InfoPersistent));
     info.Read(flattened_ud_buf);
-    info.Read(loads.flags.data(), loads.flags.size());
-    info.Read(stores.flags.data(), stores.flags.size());
+    attribute_flags_known = has_attribute_flags;
+    if (has_attribute_flags) {
+        info.Read(loads.flags.data(), loads.flags.size());
+        info.Read(stores.flags.data(), stores.flags.size());
+    }
 
     return srt_info.Deserialize(ar, walker_key);
 }

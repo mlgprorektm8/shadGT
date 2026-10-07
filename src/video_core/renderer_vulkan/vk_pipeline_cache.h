@@ -58,7 +58,7 @@ public:
     void Sync();
 
     bool LoadComputePipeline(Serialization::Archive& ar);
-    bool LoadGraphicsPipeline(Serialization::Archive& ar);
+    bool LoadGraphicsPipeline(Serialization::Archive& ar, bool has_attribute_flags);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
@@ -95,6 +95,10 @@ private:
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
+    bool IsTessEmulatedDraw() const;
+    void RecoverAttributeFlags(Shader::Info& info, const Shader::StageSpecialization& spec,
+                               const Shader::ShaderParams& params,
+                               const Shader::RuntimeInfo& runtime_info, size_t perm_idx);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;

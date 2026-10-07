@@ -923,6 +923,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             }
             continue;
         }
+        if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
+            RecoverAttributeFlags(info, permutation.spec, params, runtime_info, perm_idx);
+        }
         info.AddBindings(binding);
         if (auto& fetch = permutation.spec.fetch_shader_data; !fetch.Empty()) {
             fetch_shader = &fetch;
@@ -963,6 +966,30 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         fetch_shader = &fetch;
     }
     return std::make_tuple(info_ptr, module, perm_hash);
+}
+
+bool PipelineCache::IsTessEmulatedDraw() const {
+    const auto prim = liverpool->regs.primitive_type;
+    return prim == AmdGpu::PrimitiveType::RectList || prim == AmdGpu::PrimitiveType::QuadList;
+}
+
+void PipelineCache::RecoverAttributeFlags(Shader::Info& info,
+                                          const Shader::StageSpecialization& spec,
+                                          const Shader::ShaderParams& params,
+                                          const Shader::RuntimeInfo& runtime_info,
+                                          size_t perm_idx) {
+    // FIX-012: a shader from a cache entry stored without its attribute loads/stores is
+    // translated again for them (its stored SPIR-V is kept), because the rect/quad-list helper
+    // shaders forward exactly the outputs these flags name. The entry is stored again with them.
+    Shader::Info translated{info.hw_stage, info.sw_stage, params};
+    auto translate_runtime_info = runtime_info;
+    [[maybe_unused]] const auto program =
+        Shader::TranslateProgram(params.code, pools, translated, translate_runtime_info, profile);
+    info.loads = translated.loads;
+    info.stores = translated.stores;
+    info.attribute_flags_known = true;
+    RegisterShaderMeta(info, spec.fetch_shader_data, spec, HashCombine(params.hash, perm_idx),
+                       perm_idx);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,

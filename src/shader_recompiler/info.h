@@ -108,6 +108,9 @@ struct Info : InfoPersistent {
 
     AttributeFlags loads{};
     AttributeFlags stores{};
+    // False for a shader loaded from a cache entry stored without loads/stores (FIX-012); its
+    // flags are recovered when a rect/quad-list helper shader needs them.
+    bool attribute_flags_known{true};
 
     ReadConstType readconst_types{};
     CopyShaderData gs_copy_data;
@@ -191,7 +194,8 @@ struct Info : InfoPersistent {
     }
 
     void Serialize(Serialization::Archive& ar) const;
-    bool Deserialize(Serialization::Archive& ar, u64 walker_key = 0);
+    bool Deserialize(Serialization::Archive& ar, u64 walker_key = 0,
+                     bool has_attribute_flags = true);
 };
 DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
 
