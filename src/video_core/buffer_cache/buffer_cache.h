@@ -126,6 +126,9 @@ public:
         /// PERF-011: guest bytes when recorded; a mismatch at completion means the CPU wrote the
         /// range meanwhile, and its value is kept.
         std::vector<u8> snapshot;
+        /// PERF-015: a GDS-to-memory copy; invalidated only by writes to its own bytes, and its
+        /// bytes are kept out of uploads until its value reaches guest memory.
+        bool is_gds = false;
     };
     void RecordGdsReadback(VAddr address, u32 gds_offset, u32 size);
     [[nodiscard]] bool HasPendingAsyncReadbacks() const {
@@ -156,6 +159,8 @@ private:
     /// not touch, without waiting for the GPU. Returns false when the exact path is needed.
     bool TrySplitWriteFault(const Buffer* arena, VAddr address, u64 size, VAddr window_start,
                             VAddr window_end, u64 exact_write_size);
+    /// PERF-015: TrySplitWriteFault for pages whose GPU-written bytes are all pending GDS copies.
+    bool TrySplitGdsWriteFault(VAddr address, u64 exact_write_size);
     /// Removes ranges whose read-back value reached guest memory from gpu_modified_ranges
     /// (GPU thread).
     void ApplyCompletedReadbacks();
@@ -175,6 +180,8 @@ private:
     std::atomic<u32> num_pending_async_readbacks{};
     std::vector<std::pair<VAddr, u64>> completed_readback_ranges;
     std::atomic<u32> num_completed_readback_ranges{};
+    std::atomic<u32> num_valid_gds_readbacks{};
+    const bool split_gds_write_faults;
     const bool split_write_faults;
 
     static constexpr size_t MaxHotPages = 1024;
@@ -185,6 +192,7 @@ private:
         u32 faults{};
         u32 page_only_faults{};
         u32 split_faults{};
+        u32 gds_split_faults{};
         std::atomic<u32> cpu_overwrote{};
         struct PageFaults {
             u32 faults{};

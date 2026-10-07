@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -162,6 +163,26 @@ static std::string TakePhaseTimes() {
     return out;
 }
 
+bool PerfFeatureEnabled(u32 id) {
+    static const std::vector<u32> disabled = [] {
+        std::vector<u32> ids;
+        if (const char* env = std::getenv("SHADPS4_DISABLE_PERF")) {
+            std::string list{env};
+            size_t pos = 0;
+            while (pos < list.size()) {
+                const size_t end = std::min(list.find(',', pos), list.size());
+                try {
+                    ids.push_back(static_cast<u32>(std::stoul(list.substr(pos, end - pos))));
+                } catch (...) {
+                }
+                pos = end + 1;
+            }
+        }
+        return ids;
+    }();
+    return std::ranges::find(disabled, id) == disabled.end();
+}
+
 WorkCounters& GetWorkCounters() {
     static WorkCounters counters;
     return counters;
@@ -171,13 +192,14 @@ std::string TakeWorkCounters() {
     auto& c = GetWorkCounters();
     return fmt::format("{} PM4 packets, {} draws, {} dispatches, {} image lookups, {} buffer "
                        "binds ({} streamed), {} uploads ({} KB), {} protection calls ({} KB), "
-                       "{} shaders and {} pipelines compiled, {} upload epochs",
+                       "{} shaders and {} pipelines compiled, {} upload epochs, {} GPU-side waits "
+                       "ordered behind pending fences",
                        c.pm4_packets.exchange(0), c.draws.exchange(0), c.dispatches.exchange(0),
                        c.find_image.exchange(0), c.obtain_buffer.exchange(0),
                        c.obtain_stream.exchange(0), c.uploads.exchange(0),
                        c.upload_bytes.exchange(0) / 1024, c.protects.exchange(0),
                        c.protect_bytes.exchange(0) / 1024, c.shaders_compiled.exchange(0),
-                       c.pipelines_compiled.exchange(0), c.upload_epochs.exchange(0)) +
+                       c.pipelines_compiled.exchange(0), c.upload_epochs.exchange(0), c.waits_skipped.exchange(0)) +
            ";" + TakePhaseTimes();
 }
 

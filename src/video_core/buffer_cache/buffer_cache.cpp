@@ -70,7 +70,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       // bytes that the snapshot check cannot see (a range superseded by a newer GPU write, or a
       // store of the old value). With exact store sizes it produced corrupted (blue, exploded)
       // vertices around the track in a race, so CPU write faults drain the GPU again.
-      split_write_faults{false} {
+      split_write_faults{false},
+      split_gds_write_faults{EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Relaxed &&
+                             Common::PerfFeatureEnabled(15)} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -116,6 +118,8 @@ void BufferCache::RecordGdsReadback(VAddr address, u32 gds_offset, u32 size) {
     auto readback = std::make_shared<AsyncReadback>();
     readback->address = address;
     readback->size = size;
+    readback->is_gds = true;
+    ++num_valid_gds_readbacks;
     readback->download = staging_pool.Request(size, MemoryType::HostCached, 4, true);
     const vk::BufferCopy copy = {
         .srcOffset = gds_offset,
@@ -267,15 +271,17 @@ void BufferCache::LogHotPageStats() {
     }
     LOG_WARNING(Render_Vulkan,
                 "Readback pages in 2.0 s: {} CPU faults ({} only share a page with GPU writes, "
-                "{} handled without a drain, {} GPU ranges then written by the CPU), "
-                "{} new pages ({} tracked), {} readbacks ({} KB), {} completed, {} superseded;{}",
-                stats.faults, stats.page_only_faults, stats.split_faults,
+                "{} handled without a drain, {} beside GDS copies, {} GPU ranges then written "
+                "by the CPU), {} new pages ({} tracked), {} readbacks ({} KB), {} completed, {} "
+                "superseded;{}",
+                stats.faults, stats.page_only_faults, stats.split_faults, stats.gds_split_faults,
                 stats.cpu_overwrote.exchange(0), stats.new_pages, hot_page_order.size(),
                 stats.recorded, stats.recorded_bytes / 1024, stats.completed.exchange(0),
                 stats.invalidated.exchange(0), top);
     stats.page_only_faults = 0;
     stats.drain_reports = 0;
     stats.split_faults = 0;
+    stats.gds_split_faults = 0;
     stats.pages.clear();
     stats.window_start = now;
     stats.faults = 0;
@@ -303,12 +309,15 @@ void BufferCache::CompleteAsyncReadbacks(std::span<const std::shared_ptr<AsyncRe
                                     readback->download.mapped, readback->size);
             completed_readback_ranges.emplace_back(readback->address, readback->size);
             num_completed_readback_ranges = static_cast<u32>(completed_readback_ranges.size());
-            // The guest copy is now current, so CPU accesses need no GPU drain. The arena keeps
-            // the same bytes from the GPU-side copy.
-            memory_tracker->UnmarkRegionAsGpuModified(readback->address, readback->size, false);
+            // The guest copy is now current. The page stops being GPU-modified once no other
+            // GPU-written bytes remain on it (ApplyCompletedReadbacks, GPU thread).
             ++hot_page_stats.completed;
         } else {
             ++hot_page_stats.invalidated;
+        }
+        if (readback->is_gds && readback->valid) {
+            readback->valid = false;
+            --num_valid_gds_readbacks;
         }
         std::erase(inflight_async_readbacks, readback);
         finished_async_downloads.push_back(readback->download);
@@ -341,6 +350,18 @@ void BufferCache::InvalidateAsyncReadbacks(VAddr address, u64 size) {
     const VAddr end = Common::AlignUp(address + size, PageSize);
     std::scoped_lock lk{async_readbacks_mutex};
     const auto invalidate = [&](const std::shared_ptr<AsyncReadback>& readback) {
+        if (!readback->valid) {
+            return;
+        }
+        if (readback->is_gds) {
+            // PERF-015: its page stays GPU-modified until ApplyCompletedReadbacks finds no
+            // GPU-written bytes left, so only a write to its own bytes makes it stale.
+            if (readback->address < address + size && address < readback->address + readback->size) {
+                readback->valid = false;
+                --num_valid_gds_readbacks;
+            }
+            return;
+        }
         if (readback->address < end && start < readback->address + readback->size) {
             readback->valid = false;
         }
@@ -362,6 +383,73 @@ void BufferCache::ApplyCompletedReadbacks() {
     for (const auto& [address, size] : ranges) {
         gpu_modified_ranges.Subtract(address, size);
     }
+    for (const auto& [address, size] : ranges) {
+        const VAddr first_page = Common::AlignDown(address, 4_KB);
+        const VAddr last_page = Common::AlignDown(address + size - 1, 4_KB);
+        for (VAddr page = first_page; page <= last_page; page += 4_KB) {
+            if (!gpu_modified_ranges.Intersects(page, 4_KB)) {
+                memory_tracker->UnmarkRegionAsGpuModified(page, 4_KB, false);
+            }
+        }
+    }
+}
+
+bool BufferCache::TrySplitGdsWriteFault(VAddr address, u64 exact_write_size) {
+    // PERF-015: GT Sport keeps 16-byte records whose second half a GDS copy writes (PERF-009)
+    // and whose first half the CPU writes, about once per frame, forcing a full drain. When every
+    // GPU-written byte of the page is a pending GDS copy and the store (exact size, PERF-011b)
+    // misses them, those bytes are kept out of uploads until their value reaches guest memory
+    // (SynchronizeMemory), and a CPU store to them meanwhile is detected by the snapshot and wins.
+    if (!split_gds_write_faults || exact_write_size == 0 ||
+        num_valid_gds_readbacks.load() == 0 ||
+        gpu_modified_ranges.Intersects(address, exact_write_size)) {
+        return false;
+    }
+    const VAddr page = Common::AlignDown(address, 4_KB);
+    if (HasGpuImageAlias(page, 4_KB)) {
+        return false;
+    }
+    std::scoped_lock lk{async_readbacks_mutex};
+    std::vector<std::shared_ptr<AsyncReadback>> page_readbacks;
+    for (const auto* list : {&pending_async_readbacks, &inflight_async_readbacks}) {
+        for (const auto& readback : *list) {
+            if (readback->valid && readback->address < page + 4_KB &&
+                page < readback->address + readback->size) {
+                if (!readback->is_gds) {
+                    return false;
+                }
+                page_readbacks.push_back(readback);
+            }
+        }
+    }
+    if (page_readbacks.empty()) {
+        return false;
+    }
+    bool covered = true;
+    gpu_modified_ranges.ForEachInRange(page, 4_KB, [&](VAddr start, VAddr end) {
+        for (VAddr byte = start; byte < end;) {
+            const auto it = std::ranges::find_if(page_readbacks, [&](const auto& readback) {
+                return readback->address <= byte && byte < readback->address + readback->size;
+            });
+            if (it == page_readbacks.end()) {
+                covered = false;
+                return;
+            }
+            byte = (*it)->address + (*it)->size;
+        }
+    });
+    if (!covered) {
+        return false;
+    }
+    for (const auto& readback : page_readbacks) {
+        if (readback->snapshot.empty()) {
+            readback->snapshot.resize(readback->size);
+            std::memcpy(readback->snapshot.data(), std::bit_cast<const void*>(readback->address),
+                        readback->size);
+        }
+    }
+    ++hot_page_stats.gds_split_faults;
+    return true;
 }
 
 bool BufferCache::TrySplitWriteFault(const Buffer* arena, VAddr address, u64 size,
@@ -448,8 +536,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
         ApplyCompletedReadbacks();
         NoteCpuReadFault(device_addr, size, exact_write_size);
-        if (is_write && TrySplitWriteFault(arena, device_addr, size, window_start, window_end,
-                                           exact_write_size)) {
+        if (is_write && (TrySplitGdsWriteFault(device_addr, exact_write_size) ||
+                         TrySplitWriteFault(arena, device_addr, size, window_start, window_end,
+                                            exact_write_size))) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
             return;
         }
@@ -718,20 +807,49 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         copies.emplace_back(total_size_bytes, start, end - start);
         total_size_bytes += end - start;
     };
+    // PERF-015: bytes of pending GDS copies stay as they are in the arena until their value
+    // reaches guest memory; uploading the stale guest copy would overwrite them.
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 8> gds_pending;
+    if (num_valid_gds_readbacks.load() != 0) {
+        std::scoped_lock lk{async_readbacks_mutex};
+        for (const auto* list : {&pending_async_readbacks, &inflight_async_readbacks}) {
+            for (const auto& readback : *list) {
+                if (readback->valid && readback->is_gds &&
+                    readback->address < device_addr + size &&
+                    device_addr < readback->address + readback->size) {
+                    gds_pending.emplace_back(readback->address,
+                                             readback->address + readback->size);
+                }
+            }
+        }
+        std::ranges::sort(gds_pending);
+    }
     memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
         // PERF-011: bytes the GPU wrote and guest memory does not have yet stay as they are in
         // the arena; uploading the stale guest copy would overwrite them.
-        if (!split_write_faults || !gpu_modified_ranges.Intersects(addr, size)) {
-            add_upload(addr, addr + size);
+        if (split_write_faults && gpu_modified_ranges.Intersects(addr, size)) {
+            VAddr cursor = addr;
+            gpu_modified_ranges.ForEachInRange(addr, size, [&](VAddr start, VAddr end) {
+                if (start > cursor) {
+                    add_upload(cursor, start);
+                }
+                cursor = std::max(cursor, end);
+            });
+            if (cursor < addr + size) {
+                add_upload(cursor, addr + size);
+            }
             return;
         }
         VAddr cursor = addr;
-        gpu_modified_ranges.ForEachInRange(addr, size, [&](VAddr start, VAddr end) {
+        for (const auto& [start, end] : gds_pending) {
+            if (end <= cursor || start >= addr + size) {
+                continue;
+            }
             if (start > cursor) {
                 add_upload(cursor, start);
             }
             cursor = std::max(cursor, end);
-        });
+        }
         if (cursor < addr + size) {
             add_upload(cursor, addr + size);
         }

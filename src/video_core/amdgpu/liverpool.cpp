@@ -110,6 +110,37 @@ static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
     window_start = now;
 }
 
+// PERF-014: the bytes a fence packet writes, when they are known when it is processed.
+static std::vector<u8> FenceValueBytes(DataSelect data_sel, u32 low, u64 qword) {
+    std::vector<u8> bytes;
+    if (data_sel == DataSelect::Data32Low) {
+        bytes.resize(sizeof(u32));
+        std::memcpy(bytes.data(), &low, sizeof(u32));
+    } else if (data_sel == DataSelect::Data64) {
+        bytes.resize(sizeof(u64));
+        std::memcpy(bytes.data(), &qword, sizeof(u64));
+    }
+    return bytes;
+}
+
+// PERF-014: whether a WAIT_REG_MEM on memory is satisfied by the value a fence the command
+// thread already processed will write once the GPU reaches it.
+static bool SatisfiedByPendingFence(Vulkan::Rasterizer* rasterizer,
+                                    const PM4CmdWaitRegMem* wait_reg_mem) {
+    static const bool enabled = Common::PerfFeatureEnabled(14);
+    if (!enabled || !rasterizer ||
+        wait_reg_mem->mem_space != PM4CmdWaitRegMem::MemSpace::Memory) {
+        return false;
+    }
+    const auto value =
+        rasterizer->PendingFenceDword(reinterpret_cast<VAddr>(wait_reg_mem->Address<u32*>()));
+    if (!value || !wait_reg_mem->TestValue(*value)) {
+        return false;
+    }
+    ++Common::GetWorkCounters().waits_skipped;
+    return true;
+}
+
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
 
@@ -812,11 +843,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* event_eos = &event;
                 const bool deferred =
                     rasterizer && event_eos->command != PM4CmdEventWriteEos::Command::GdsStore &&
-                    rasterizer->DeferFenceSignal(event_eos->Address<VAddr>(), [event] {
-                        event.SignalFence([](void* address, u64 data, u32 num_bytes) {
-                            WriteDeferredFence(address, &data, num_bytes);
-                        });
-                    });
+                    rasterizer->DeferFenceSignal(
+                        event_eos->Address<VAddr>(),
+                        [event] {
+                            event.SignalFence([](void* address, u64 data, u32 num_bytes) {
+                                WriteDeferredFence(address, &data, num_bytes);
+                            });
+                        },
+                        false,
+                        FenceValueBytes(DataSelect::Data32Low, event_eos->DataDWord(), 0));
                 if (!deferred) {
                     if (rasterizer) {
                         rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEos);
@@ -848,7 +883,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             WriteDeferredFence(address, &data, num_bytes);
                         },
                         [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
-                });
+                }, false, FenceValueBytes(event_eop->data_sel.Value(), event_eop->DataDWord(),
+                                          event_eop->DataQWord()));
                 if (!deferred) {
                     if (rasterizer) {
                         rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEop);
@@ -908,12 +944,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // Keep guest-visible writes in order behind deferred fences.
                     std::vector<u8> data(data_size);
                     std::memcpy(data.data(), write_data->data, data_size);
+                    const std::vector<u8> value = data;
                     const bool deferred =
                         rasterizer &&
-                        rasterizer->DeferFenceSignal(reinterpret_cast<VAddr>(address),
-                                                     [address, data = std::move(data)] {
-                            WriteDeferredFence(address, data.data(), u32(data.size()));
-                        });
+                        rasterizer->DeferFenceSignal(
+                            reinterpret_cast<VAddr>(address),
+                            [address, data = std::move(data)] {
+                                WriteDeferredFence(address, data.data(), u32(data.size()));
+                            },
+                            false, value);
                     if (!deferred) {
                         if (rasterizer) {
                             rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxWriteData);
@@ -1025,10 +1064,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 GpuWaitDiagnostics diagnostics;
+                if (waited && SatisfiedByPendingFence(rasterizer, wait_reg_mem)) {
+                    break;
+                }
                 if (rasterizer && !wait_reg_mem->Test(regs.reg_array)) {
                     rasterizer->FlushForDeferredFences();
                 }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
+                while (!wait_reg_mem->Test(regs.reg_array) &&
+                       !SatisfiedByPendingFence(rasterizer, wait_reg_mem)) {
                     if (diagnostics.Ready()) {
                         report_wait();
                         if (rasterizer) {
@@ -1369,8 +1412,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             const auto wait_start = std::chrono::steady_clock::now();
-            const bool waited = !wait_reg_mem->Test(regs.reg_array);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
+            const bool waited = !wait_reg_mem->Test(regs.reg_array) &&
+                                !SatisfiedByPendingFence(rasterizer, wait_reg_mem);
+            while (waited && !wait_reg_mem->Test(regs.reg_array) &&
+                   !SatisfiedByPendingFence(rasterizer, wait_reg_mem)) {
                 YIELD_ASC(vqid);
             }
             if (waited) {
@@ -1420,7 +1465,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         Platform::IrqC::Instance()->Signal(
                             static_cast<Platform::InterruptId>(pipe_id));
                     }
-                }, true);
+                }, true, FenceValueBytes(release.data_sel.Value(), release.DataDWord(),
+                                         release.DataQWord()));
             if (deferred) {
                 break;
             }

@@ -11,7 +11,9 @@ param(
     [int]$CopyGpuBuffers = -1,
     [ValidateSet(-1, 0, 1)]
     [int]$ReadbackLinearImages = -1,
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    # Experimental branch: PERF ids to switch off for an A/B run, e.g. '14,15'.
+    [string]$DisablePerf = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -93,7 +95,8 @@ $log = Join-Path $ProfileDirectory 'user/log/shad_log.txt'
 if (Test-Path -LiteralPath $log) {
     Copy-Item -LiteralPath $log -Destination (Join-Path $ProfileDirectory "log-before-performance-$stamp.txt")
 }
-$variables = @('VK_LOADER_LAYERS_DISABLE', 'VK_LOADER_LAYERS_ENABLE', 'VK_LAYER_PATH', 'CDL_OUTPUT_PATH')
+$variables = @('VK_LOADER_LAYERS_DISABLE', 'VK_LOADER_LAYERS_ENABLE', 'VK_LAYER_PATH', 'CDL_OUTPUT_PATH',
+    'SHADPS4_DISABLE_PERF')
 $environment = @{}
 foreach ($name in $variables) {
     $environment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -103,6 +106,10 @@ try {
     $env:VK_LOADER_LAYERS_DISABLE = '~implicit~'
     $env:VK_LOADER_LAYERS_ENABLE = $null
     $env:VK_LAYER_PATH = $null
+    $env:SHADPS4_DISABLE_PERF = $DisablePerf
+    if ($DisablePerf) {
+        Write-Output "Disabled for this run: PERF $DisablePerf"
+    }
     if ($CrashDiagnostics) {
         $env:VK_LAYER_PATH = $sdkLayers
         $env:CDL_OUTPUT_PATH = $crashDumps

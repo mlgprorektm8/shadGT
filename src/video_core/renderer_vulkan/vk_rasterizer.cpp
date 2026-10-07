@@ -531,7 +531,7 @@ void Rasterizer::RecordDrain(DrainSource source, std::chrono::steady_clock::time
 }
 
 bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
-                                  bool compute_queue) {
+                                  bool compute_queue, std::span<const u8> value) {
     // Hardware writes a fence when the work before it has finished. With readbacks pending,
     // signal after the GPU completes instead of draining the GPU now. A later write to an address
     // that already has a deferred write is deferred too, so that address keeps its order;
@@ -559,6 +559,11 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     {
         std::scoped_lock lk{deferred_fences_mutex};
         ++deferred_fence_addresses[address];
+        if (value.empty()) {
+            pending_fence_bytes.erase(address);
+        } else {
+            pending_fence_bytes[address].assign(value.begin(), value.end());
+        }
     }
     ++deferred_fences;
     const auto deferred_at = std::chrono::steady_clock::now();
@@ -573,6 +578,7 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
             std::scoped_lock lk{deferred_fences_mutex};
             if (--deferred_fence_addresses[address] == 0) {
                 deferred_fence_addresses.erase(address);
+                pending_fence_bytes.erase(address);
             }
         }
         --deferred_fences;
@@ -580,6 +586,22 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     // Submit so the deferred tick can complete; the GPU thread does not wait.
     scheduler.Flush();
     return true;
+}
+
+std::optional<u32> Rasterizer::PendingFenceDword(VAddr address) {
+    // PERF-014: GPU work that waits on a fence the command thread has already processed runs
+    // after the fenced work in the one Vulkan queue, so a GPU-side wait that the fence's value
+    // satisfies needs no CPU-side wait for GPU completion. This is the order the emulator
+    // already relies on when fences are not deferred.
+    std::scoped_lock lk{deferred_fences_mutex};
+    for (const auto& [fence_address, bytes] : pending_fence_bytes) {
+        if (address >= fence_address && address + sizeof(u32) <= fence_address + bytes.size()) {
+            u32 value;
+            std::memcpy(&value, bytes.data() + (address - fence_address), sizeof(u32));
+            return value;
+        }
+    }
+    return std::nullopt;
 }
 
 void Rasterizer::RecordDeferredFenceLatency(std::chrono::steady_clock::time_point deferred_at) {

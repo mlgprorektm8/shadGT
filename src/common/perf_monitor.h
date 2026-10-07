@@ -30,8 +30,13 @@ struct WorkCounters {
     std::atomic<u64> shaders_compiled{};
     std::atomic<u64> pipelines_compiled{};
     std::atomic<u64> upload_epochs{};
+    std::atomic<u64> waits_skipped{};
 };
 WorkCounters& GetWorkCounters();
+
+/// Experimental-branch switch: false when the PERF id (e.g. 14 for PERF-014) is listed in the
+/// SHADPS4_DISABLE_PERF environment variable (comma separated), for A/B runs without rebuilding.
+bool PerfFeatureEnabled(u32 id);
 
 /// PERF-DIAG-011: command thread time per step of a draw, in TSC ticks, reported every 2 s.
 enum class Phase : u32 {

@@ -186,7 +186,8 @@ public:
     void NoteCpuWriteFault(u64 offset, u64 size) noexcept {
         const auto [start_word, start_page, end_word, end_page] = GetBounds(offset, size);
         for (u64 page = start_page; page <= end_page; ++page) {
-            if (write_faults[page] < HotPageFaults && ++write_faults[page] == HotPageFaults) {
+            if (hot_pages_enabled && write_faults[page] < HotPageFaults &&
+                ++write_faults[page] == HotPageFaults) {
                 hot[page / PAGES_PER_WORD] |= 1ULL << (page % PAGES_PER_WORD);
             }
         }
@@ -341,6 +342,7 @@ private:
 
     // PERF-012: hot pages and their uploads in the current epoch.
     static constexpr u8 HotPageFaults = 8;
+    inline static const bool hot_pages_enabled = Common::PerfFeatureEnabled(12);
     RegionBits hot{};
     RegionBits uploaded{};
     u32 uploaded_epoch{};

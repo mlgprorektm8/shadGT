@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <optional>
+#include <span>
+
 #include <array>
 #include <chrono>
 #include <unordered_map>
@@ -106,8 +109,11 @@ public:
     void FinishForGds();
     /// Defers a graphics fence signal until the GPU completes when readbacks are pending or
     /// another fence is already deferred. Returns false if the caller should signal now.
+    /// value: the bytes the fence will write, when known when it is processed (PERF-014).
     bool DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
-                          bool compute_queue = false);
+                          bool compute_queue = false, std::span<const u8> value = {});
+    /// PERF-014: the dword at address once all deferred fence writes that cover it land.
+    std::optional<u32> PendingFenceDword(VAddr address);
     /// Submits recorded GPU work if deferred fences are outstanding (before blocking waits).
     void FlushForDeferredFences();
     void SubmitChunkIfNeeded();
@@ -240,6 +246,7 @@ private:
         u64 max_us{};
     } deferred_fence_stats;
     std::unordered_map<VAddr, u32> deferred_fence_addresses;
+    std::unordered_map<VAddr, std::vector<u8>> pending_fence_bytes;
     u64 gpu_constant_refresh_count{};
     u64 next_gpu_constant_refresh_report{1000};
 };
