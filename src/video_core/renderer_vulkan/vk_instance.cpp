@@ -6,6 +6,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/perf_monitor.h"
 #include "common/debug.h"
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
@@ -210,7 +211,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR>();
+        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
+        vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -277,6 +279,14 @@ bool Instance::CreateDevice() {
     }
     depth_range_unrestricted = add_extension(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     dynamic_state_3 = add_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+    // PERF-017: build runtime pipelines from separately compiled stage libraries.
+    if (feature_chain.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
+            .graphicsPipelineLibrary &&
+        Common::PerfFeatureEnabled(17) &&
+        add_extension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+        graphics_pipeline_library =
+            add_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+    }
     if (dynamic_state_3) {
         dynamic_state_3_features =
             feature_chain.get<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>();
@@ -528,7 +538,13 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
+        vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT{
+            .graphicsPipelineLibrary = true,
+        },
     };
+    if (!graphics_pipeline_library) {
+        device_chain.unlink<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
+    }
 
     if (!custom_border_color) {
         device_chain.unlink<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>();

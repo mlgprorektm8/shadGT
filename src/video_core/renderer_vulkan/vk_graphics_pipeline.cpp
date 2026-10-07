@@ -2,10 +2,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "common/thread.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -25,6 +33,52 @@ static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eVertex,
     vk::ShaderStageFlagBits::eGeometry,
     vk::ShaderStageFlagBits::eCompute,
+};
+
+// PERF-017: workers that link fully optimized pipelines from stage libraries, so the command
+// thread only waits for the fast link.
+class PipelineLinkWorkers {
+public:
+    static PipelineLinkWorkers& Instance() {
+        static PipelineLinkWorkers workers;
+        return workers;
+    }
+
+    void Push(std::function<void()>&& job) {
+        {
+            std::scoped_lock lk{mutex};
+            jobs.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+
+private:
+    PipelineLinkWorkers() {
+        const u32 count = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u);
+        for (u32 i = 0; i < count; ++i) {
+            threads.emplace_back([this](std::stop_token stop) {
+                Common::SetCurrentThreadName("shadPS4:PipelineLink");
+                while (true) {
+                    std::function<void()> job;
+                    {
+                        std::unique_lock lk{mutex};
+                        cv.wait(lk, stop, [this] { return !jobs.empty(); });
+                        if (stop.stop_requested()) {
+                            return;
+                        }
+                        job = std::move(jobs.front());
+                        jobs.pop_front();
+                    }
+                    job();
+                }
+            });
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::deque<std::function<void()>> jobs;
+    std::vector<std::jthread> threads;
 };
 
 GraphicsPipeline::GraphicsPipeline(
@@ -442,6 +496,102 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     const auto create_start = std::chrono::steady_clock::now();
+    if (!preloading && instance.IsGraphicsPipelineLibrarySupported()) {
+        // PERF-017: a pipeline first needed during play is built from four separately compiled
+        // libraries and linked without cross-stage optimization, which the driver does in a
+        // fraction of a full compile. A worker then links the same libraries with link-time
+        // optimization, and draws switch to that pipeline once it exists. Both pipelines come
+        // from the same create info, so they render the same.
+        library_link = std::make_unique<LibraryLink>();
+        boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
+            pre_raster_stages;
+        boost::container::static_vector<vk::PipelineShaderStageCreateInfo, 1> fragment_stages;
+        for (const auto& stage_info : shader_stages) {
+            if (stage_info.stage == vk::ShaderStageFlagBits::eFragment) {
+                fragment_stages.push_back(stage_info);
+            } else {
+                pre_raster_stages.push_back(stage_info);
+            }
+        }
+        const std::array<vk::GraphicsPipelineLibraryFlagsEXT, 4> parts = {
+            vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface,
+            vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders,
+            vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader,
+            vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentOutputInterface,
+        };
+        std::array<vk::Pipeline, 4> library_handles{};
+        for (size_t i = 0; i < parts.size(); ++i) {
+            const vk::GraphicsPipelineLibraryCreateInfoEXT library_info = {
+                .pNext = &pipeline_rendering_ci,
+                .flags = parts[i],
+            };
+            auto part_info = pipeline_info;
+            part_info.pNext = &library_info;
+            part_info.flags = vk::PipelineCreateFlagBits::eLibraryKHR |
+                              vk::PipelineCreateFlagBits::eRetainLinkTimeOptimizationInfoEXT;
+            part_info.stageCount = 0;
+            part_info.pStages = nullptr;
+            if (i == 1) {
+                part_info.stageCount = static_cast<u32>(pre_raster_stages.size());
+                part_info.pStages = pre_raster_stages.data();
+            } else if (i == 2) {
+                part_info.stageCount = static_cast<u32>(fragment_stages.size());
+                part_info.pStages = fragment_stages.data();
+            }
+            auto [library_result, library] =
+                device.createGraphicsPipelineUnique(pipeline_cache, part_info);
+            ASSERT_MSG(library_result == vk::Result::eSuccess,
+                       "Failed to create graphics pipeline library: {}",
+                       vk::to_string(library_result));
+            library_handles[i] = *library;
+            library_link->libraries[i] = std::move(library);
+        }
+        const auto libraries_done = std::chrono::steady_clock::now();
+
+        const vk::PipelineLibraryCreateInfoKHR link_libraries = {
+            .libraryCount = static_cast<u32>(library_handles.size()),
+            .pLibraries = library_handles.data(),
+        };
+        const vk::GraphicsPipelineCreateInfo link_info = {
+            .pNext = &link_libraries,
+            .layout = *pipeline_layout,
+        };
+        auto [link_result, linked] = device.createGraphicsPipelineUnique(pipeline_cache, link_info);
+        ASSERT_MSG(link_result == vk::Result::eSuccess, "Failed to link graphics pipeline: {}",
+                   vk::to_string(link_result));
+        pipeline = std::move(linked);
+        SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
+        LOG_WARNING(Render_Vulkan,
+                    "Graphics pipeline {}: libraries {:.1f} ms, fast link {:.1f} ms", debug_str,
+                    std::chrono::duration<double, std::milli>(libraries_done - create_start)
+                        .count(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                              libraries_done)
+                        .count());
+
+        auto promise = std::make_shared<std::promise<void>>();
+        library_link->optimized = promise->get_future();
+        const auto layout = *pipeline_layout;
+        PipelineLinkWorkers::Instance().Push(
+            [this, device, layout, library_handles, promise, cache = pipeline_cache] {
+                const vk::PipelineLibraryCreateInfoKHR libraries_info = {
+                    .libraryCount = static_cast<u32>(library_handles.size()),
+                    .pLibraries = library_handles.data(),
+                };
+                const vk::GraphicsPipelineCreateInfo optimized_info = {
+                    .pNext = &libraries_info,
+                    .flags = vk::PipelineCreateFlagBits::eLinkTimeOptimizationEXT,
+                    .layout = layout,
+                };
+                auto [result, optimized] = device.createGraphicsPipeline(cache, optimized_info);
+                if (result == vk::Result::eSuccess) {
+                    optimized_pipeline.store(optimized, std::memory_order_release);
+                }
+                promise->set_value();
+            });
+        return;
+    }
+
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
     // PERF-DIAG-013: driver compile time of graphics pipelines created at runtime.
@@ -457,7 +607,14 @@ GraphicsPipeline::GraphicsPipeline(
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
 }
 
-GraphicsPipeline::~GraphicsPipeline() = default;
+GraphicsPipeline::~GraphicsPipeline() {
+    if (library_link && library_link->optimized.valid()) {
+        library_link->optimized.wait();
+    }
+    if (const VkPipeline optimized = optimized_pipeline.exchange(VK_NULL_HANDLE)) {
+        instance.GetDevice().destroyPipeline(optimized);
+    }
+}
 
 template <typename Attribute, typename Binding>
 void GraphicsPipeline::GetVertexInputs(

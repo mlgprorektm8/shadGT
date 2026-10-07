@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <future>
+#include <memory>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -112,6 +114,13 @@ private:
     void BuildDescSetLayout(bool preloading);
 
 private:
+    /// PERF-017: stage libraries of a runtime pipeline and the optimized link built from them.
+    struct LibraryLink {
+        std::array<vk::UniquePipeline, 4> libraries;
+        std::future<void> optimized;
+    };
+    std::unique_ptr<LibraryLink> library_link;
+
     GraphicsPipelineKey key;
     Shader::Gcn::FetchShaderData fetch_shader{};
 };

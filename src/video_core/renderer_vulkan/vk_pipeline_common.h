@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -33,6 +35,10 @@ public:
     virtual ~Pipeline();
 
     vk::Pipeline Handle() const noexcept {
+        // PERF-017: the fully optimized pipeline once a worker has linked it.
+        if (const VkPipeline optimized = optimized_pipeline.load(std::memory_order_acquire)) {
+            return optimized;
+        }
         return *pipeline;
     }
 
@@ -68,6 +74,7 @@ protected:
     DescriptorHeap& desc_heap;
     const Shader::Profile& profile;
     vk::UniquePipeline pipeline;
+    std::atomic<VkPipeline> optimized_pipeline{};
     vk::UniquePipelineLayout pipeline_layout;
     vk::UniqueDescriptorSetLayout desc_layout;
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};

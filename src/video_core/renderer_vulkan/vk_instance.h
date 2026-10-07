@@ -160,6 +160,11 @@ public:
         return dynamic_state_3 && dynamic_state_3_features.extendedDynamicState3ColorWriteMask;
     }
 
+    /// PERF-017: VK_EXT_graphics_pipeline_library is enabled.
+    bool IsGraphicsPipelineLibrarySupported() const {
+        return graphics_pipeline_library;
+    }
+
     /// Returns true when VK_EXT_vertex_input_dynamic_state is supported.
     bool IsVertexInputDynamicState() const {
         return vertex_input_dynamic_state;
@@ -523,6 +528,7 @@ private:
     bool depth_clip_control{};
     bool depth_clip_enable{};
     bool dynamic_state_3{};
+    bool graphics_pipeline_library{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};
     bool list_restart{};
