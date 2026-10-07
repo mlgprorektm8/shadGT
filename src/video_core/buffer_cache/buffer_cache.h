@@ -134,6 +134,12 @@ public:
     [[nodiscard]] bool HasPendingAsyncReadbacks() const {
         return num_pending_async_readbacks.load() != 0;
     }
+    /// PERF-016: whether a CPU access drained the GPU in the last 100 ms (GPU thread).
+    [[nodiscard]] bool DrainedRecently() const {
+        return last_drain != std::chrono::steady_clock::time_point{} &&
+               std::chrono::steady_clock::now() - last_drain < std::chrono::milliseconds{100};
+    }
+
     /// Remembers pages the CPU read while they held GPU-written data (GPU thread).
     void NoteCpuReadFault(VAddr address, u64 size, u64 exact_write_size = 0);
     /// Records readbacks of remembered pages that hold GPU-written data again (GPU thread).
@@ -182,6 +188,7 @@ private:
     std::atomic<u32> num_completed_readback_ranges{};
     std::atomic<u32> num_valid_gds_readbacks{};
     const bool split_gds_write_faults;
+    std::chrono::steady_clock::time_point last_drain{};
     const bool split_write_faults;
 
     static constexpr size_t MaxHotPages = 1024;

@@ -651,7 +651,12 @@ void Rasterizer::SubmitChunkIfNeeded() {
     if (++draws_since_submit < DrawsPerSubmit) {
         return;
     }
-    if (deferred_fences.load() == 0 && !texture_cache.HasPendingReadbacks()) {
+    // PERF-016: a CPU access that drains the GPU waits for everything recorded so far. While
+    // such drains keep happening (GT Sport: once per race frame), submitting in chunks lets the
+    // GPU run ahead so less is left to wait for.
+    static const bool chunk_for_drains = Common::PerfFeatureEnabled(16);
+    if (deferred_fences.load() == 0 && !texture_cache.HasPendingReadbacks() &&
+        !(chunk_for_drains && buffer_cache.DrainedRecently())) {
         return;
     }
     draws_since_submit = 0;

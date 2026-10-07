@@ -128,13 +128,13 @@ static std::vector<u8> FenceValueBytes(DataSelect data_sel, u32 low, u64 qword) 
 static bool SatisfiedByPendingFence(Vulkan::Rasterizer* rasterizer,
                                     const PM4CmdWaitRegMem* wait_reg_mem) {
     static const bool enabled = Common::PerfFeatureEnabled(14);
-    // PERF-014b: the command thread itself reads guest memory after the wait (resource
-    // descriptors, constants, GPU-written data fetched back). While a deferred fence is still
-    // bringing GPU data back to guest memory, going early would read stale data (exploded
-    // vertices in races), so it waits as before.
+    // PERF-014b (id 1402, off by default): also wait while a deferred fence still brings GPU
+    // data back to guest memory. In GT Sport one always does, so it never went early. The
+    // exploded vertices first blamed on PERF-014 came from PERF-015.
+    static const bool wait_for_readbacks = !Common::PerfFeatureEnabled(1402);
     if (!enabled || !rasterizer ||
         wait_reg_mem->mem_space != PM4CmdWaitRegMem::MemSpace::Memory ||
-        rasterizer->HasReadbackFences()) {
+        (wait_for_readbacks && rasterizer->HasReadbackFences())) {
         return false;
     }
     const auto value =

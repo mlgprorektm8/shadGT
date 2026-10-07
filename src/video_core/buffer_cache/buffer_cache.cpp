@@ -603,6 +603,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
     runtime.CopyBuffer(arena, download.buffer, copies);
     scheduler.Finish();
+    last_drain = std::chrono::steady_clock::now();
     // This download is current; a readback recorded earlier must not complete over it after the
     // CPU has written the range.
     InvalidateAsyncReadbacks(device_addr, size);
