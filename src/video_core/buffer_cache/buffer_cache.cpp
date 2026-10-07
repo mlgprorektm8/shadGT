@@ -66,7 +66,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance},
-      split_write_faults{EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Relaxed} {
+      // PERF-011 is disabled: skipping GPU-written bytes in uploads loses CPU stores to those
+      // bytes that the snapshot check cannot see (a range superseded by a newer GPU write, or a
+      // store of the old value). With exact store sizes it produced corrupted (blue, exploded)
+      // vertices around the track in a race, so CPU write faults drain the GPU again.
+      split_write_faults{false} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -696,7 +700,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
         // PERF-011: bytes the GPU wrote and guest memory does not have yet stay as they are in
         // the arena; uploading the stale guest copy would overwrite them.
-        if (!gpu_modified_ranges.Intersects(addr, size)) {
+        if (!split_write_faults || !gpu_modified_ranges.Intersects(addr, size)) {
             add_upload(addr, addr + size);
             return;
         }
