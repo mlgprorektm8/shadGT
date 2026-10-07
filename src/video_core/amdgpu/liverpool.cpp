@@ -1260,6 +1260,42 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             // Signaling the fence can allow the guest to reuse the containing command buffer.
             const auto release = *reinterpret_cast<const PM4CmdReleaseMem*>(header);
             const auto* release_mem = &release;
+            // PERF-009: after GDS-to-memory copies, write this fence once the GPU has executed
+            // them and their values are in guest memory, instead of draining the GPU.
+            const auto pipe_id = queue.pipe_id;
+            // Disabled: deferring every compute-queue fence cost more than the drains it saved.
+            const bool deferred =
+                false && rasterizer && rasterizer->HasPendingGdsReadbacks() &&
+                release.data_sel != DataSelect::GdsMemStore &&
+                rasterizer->DeferFenceSignal(release.Address<VAddr>(), [release, pipe_id] {
+                    u64 value{};
+                    u32 num_bytes = sizeof(u64);
+                    switch (release.data_sel.Value()) {
+                    case DataSelect::Data32Low:
+                        value = release.DataDWord();
+                        num_bytes = sizeof(u32);
+                        break;
+                    case DataSelect::Data64:
+                        value = release.DataQWord();
+                        break;
+                    case DataSelect::GpuClock64:
+                        value = GetGpuClock64();
+                        break;
+                    case DataSelect::PerfCounter:
+                        value = GetGpuPerfCounter();
+                        break;
+                    default:
+                        UNREACHABLE();
+                    }
+                    WriteDeferredFence(release.Address<void*>(), &value, num_bytes);
+                    if (release.int_sel != InterruptSelect::None) {
+                        Platform::IrqC::Instance()->Signal(
+                            static_cast<Platform::InterruptId>(pipe_id));
+                    }
+                });
+            if (deferred) {
+                break;
+            }
             if (rasterizer) {
                 rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::AscReleaseMem);
             }

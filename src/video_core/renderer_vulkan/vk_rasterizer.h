@@ -86,6 +86,9 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
+    [[nodiscard]] bool HasPendingGdsReadbacks() const {
+        return buffer_cache.HasPendingGdsReadbacks();
+    }
     /// DIAG-016: where a synchronous GPU drain came from.
     enum class DrainSource : u32 {
         Submit,

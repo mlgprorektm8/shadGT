@@ -4,6 +4,11 @@
 #pragma once
 
 #include <deque>
+#include <vector>
+#include <span>
+#include <mutex>
+#include <memory>
+#include <atomic>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -12,6 +17,7 @@
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -99,6 +105,26 @@ public:
     /// Returns true when host-memory shortcuts would bypass rendered image contents.
     [[nodiscard]] bool HasGpuImageAlias(VAddr addr, size_t size);
 
+    /// GDS-to-memory copies, also read back to guest memory once the GPU has executed them,
+    /// so later CPU accesses to the destination do not have to drain the GPU (GPU thread).
+    struct GdsReadback {
+        VAddr address;
+        u32 size;
+        Vulkan::StagingBufferRef download;
+        bool valid = true;
+    };
+    void RecordGdsReadback(VAddr address, u32 gds_offset, u32 size);
+    [[nodiscard]] bool HasPendingGdsReadbacks() const {
+        return num_pending_gds_readbacks.load() != 0;
+    }
+    /// Hands the recorded readbacks to a deferred fence (GPU thread).
+    std::vector<std::shared_ptr<GdsReadback>> TakePendingGdsReadbacks();
+    /// Writes completed readbacks to guest memory and clears their GPU-modified state, unless a
+    /// later GPU write covered them (any thread, after the GPU work completed).
+    void CompleteGdsReadbacks(std::span<const std::shared_ptr<GdsReadback>> readbacks);
+    /// Frees staging memory of completed readbacks (GPU thread).
+    void ReleaseFinishedGdsReadbacks();
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 
@@ -106,6 +132,15 @@ public:
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
 private:
+    void InvalidateGdsReadbacks(VAddr address, u64 size);
+
+    std::mutex gds_readbacks_mutex;
+    std::vector<std::shared_ptr<GdsReadback>> pending_gds_readbacks;
+    std::vector<std::shared_ptr<GdsReadback>> inflight_gds_readbacks;
+    std::vector<Vulkan::StagingBufferRef> finished_gds_downloads;
+    std::atomic<u32> num_pending_gds_readbacks{};
+    std::atomic<u32> num_tracked_gds_readbacks{};
+
     struct ArenaBinds {
         const Buffer* arena;
         boost::container::small_vector<vk::SparseMemoryBind, 32> binds;

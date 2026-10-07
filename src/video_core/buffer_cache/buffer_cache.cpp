@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <string>
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
 
@@ -21,6 +24,9 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 #include <vk_mem_alloc.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace VideoCore {
 
@@ -97,6 +103,80 @@ void BufferCache::TickFrame() {
     }
 }
 
+
+void BufferCache::RecordGdsReadback(VAddr address, u32 gds_offset, u32 size) {
+    auto readback = std::make_shared<GdsReadback>();
+    readback->address = address;
+    readback->size = size;
+    readback->download = staging_pool.Request(size, MemoryType::HostCached, 4, true);
+    const vk::BufferCopy copy = {
+        .srcOffset = gds_offset,
+        .dstOffset = readback->download.offset,
+        .size = size,
+    };
+    runtime.CopyBuffer(&gds_buffer, readback->download.buffer, std::span{&copy, 1});
+    std::scoped_lock lk{gds_readbacks_mutex};
+    pending_gds_readbacks.push_back(std::move(readback));
+    num_pending_gds_readbacks = static_cast<u32>(pending_gds_readbacks.size());
+    num_tracked_gds_readbacks =
+        static_cast<u32>(pending_gds_readbacks.size() + inflight_gds_readbacks.size());
+}
+
+std::vector<std::shared_ptr<BufferCache::GdsReadback>> BufferCache::TakePendingGdsReadbacks() {
+    std::scoped_lock lk{gds_readbacks_mutex};
+    auto readbacks = std::move(pending_gds_readbacks);
+    pending_gds_readbacks.clear();
+    inflight_gds_readbacks.insert(inflight_gds_readbacks.end(), readbacks.begin(),
+                                  readbacks.end());
+    num_pending_gds_readbacks = 0;
+    return readbacks;
+}
+
+void BufferCache::CompleteGdsReadbacks(std::span<const std::shared_ptr<GdsReadback>> readbacks) {
+    std::scoped_lock lk{gds_readbacks_mutex};
+    for (const auto& readback : readbacks) {
+        if (readback->valid && memory->IsValidMapping(readback->address, readback->size)) {
+            readback->download.Invalidate();
+            memory->TryWriteBacking(std::bit_cast<void*>(readback->address),
+                                    readback->download.mapped, readback->size);
+            // The guest copy is now current, so CPU accesses need no GPU drain. The arena keeps
+            // the same bytes from the GPU-side copy.
+            memory_tracker->UnmarkRegionAsGpuModified(readback->address, readback->size, false);
+        }
+        std::erase(inflight_gds_readbacks, readback);
+        finished_gds_downloads.push_back(readback->download);
+    }
+    num_tracked_gds_readbacks =
+        static_cast<u32>(pending_gds_readbacks.size() + inflight_gds_readbacks.size());
+}
+
+void BufferCache::ReleaseFinishedGdsReadbacks() {
+    std::vector<Vulkan::StagingBufferRef> finished;
+    {
+        std::scoped_lock lk{gds_readbacks_mutex};
+        finished.swap(finished_gds_downloads);
+    }
+    for (const auto& download : finished) {
+        staging_pool.FreeDeferred(download);
+    }
+}
+
+void BufferCache::InvalidateGdsReadbacks(VAddr address, u64 size) {
+    // A later GPU write to the destination makes the read-back value stale; keep the
+    // GPU-modified state so the exact path downloads the newer data.
+    if (num_tracked_gds_readbacks.load() == 0) {
+        return;
+    }
+    std::scoped_lock lk{gds_readbacks_mutex};
+    const auto invalidate = [&](const std::shared_ptr<GdsReadback>& readback) {
+        if (readback->address < address + size && address < readback->address + readback->size) {
+            readback->valid = false;
+        }
+    };
+    std::ranges::for_each(pending_gds_readbacks, invalidate);
+    std::ranges::for_each(inflight_gds_readbacks, invalidate);
+}
+
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         ReadMemory(device_addr, size, true, assume_locks);
@@ -171,6 +251,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    if (is_written) {
+        InvalidateGdsReadbacks(device_addr, size);
+    }
     SynchronizeMemoryFromImage(device_addr, size);
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
@@ -442,6 +525,7 @@ void BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
             });
         }
         texture_cache.GetTileManager().TileImage(image, buffer_copies, arena, *arena_offset, true);
+        InvalidateGdsReadbacks(export_image.address, export_image.size);
         memory_tracker->MarkRegionAsGpuModified(export_image.address, export_image.size);
         gpu_modified_ranges.Add(export_image.address, export_image.size);
         image.flags |= ImageFlagBits::BufferCoherent;

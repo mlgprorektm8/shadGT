@@ -434,6 +434,14 @@ static void RecheckTonemapConstants() {
 void Rasterizer::OnSubmit() {
     RecheckTonemapConstants();
     texture_cache.ReleaseFinishedReadbacks();
+    buffer_cache.ReleaseFinishedGdsReadbacks();
+    // GDS readbacks not taken by a deferred fence complete once this submission executes.
+    if (auto gds_readbacks = buffer_cache.TakePendingGdsReadbacks(); !gds_readbacks.empty()) {
+        scheduler.DeferPriorityOperation(
+            [this, gds_readbacks = std::move(gds_readbacks)] {
+                buffer_cache.CompleteGdsReadbacks(gds_readbacks);
+            });
+    }
     buffer_cache.TickFrame();
     ProcessDownloadsTimed(DrainSource::Submit);
     texture_cache.RunGarbageCollector();
@@ -494,6 +502,8 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     // signal after the GPU completes instead of draining the GPU now. A later write to an address
     // that already has a deferred write is deferred too, so that address keeps its order;
     // fences to other addresses are signaled immediately as before.
+    // Pending GDS readbacks ride along with fences deferred for image readbacks; they do not
+    // cause extra deferrals (each deferral adds a submit and a guest wait).
     const bool readbacks_pending = texture_cache.HasPendingReadbacks();
     bool address_pending;
     {
@@ -504,7 +514,9 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         return false;
     }
     texture_cache.ReleaseFinishedReadbacks();
+    buffer_cache.ReleaseFinishedGdsReadbacks();
     auto readbacks = texture_cache.RecordPendingReadbacks();
+    auto gds_readbacks = buffer_cache.TakePendingGdsReadbacks();
     {
         std::scoped_lock lk{deferred_fences_mutex};
         ++deferred_fence_addresses[address];
@@ -512,8 +524,10 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     ++deferred_fences;
     const auto deferred_at = std::chrono::steady_clock::now();
     scheduler.DeferPriorityOperation([this, address, deferred_at, readbacks = std::move(readbacks),
+                                      gds_readbacks = std::move(gds_readbacks),
                                       signal = std::move(signal)]() mutable {
         texture_cache.CompleteReadbacks(readbacks);
+        buffer_cache.CompleteGdsReadbacks(gds_readbacks);
         signal();
         RecordDeferredFenceLatency(deferred_at);
         {
@@ -1839,6 +1853,10 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         .size = num_bytes,
     };
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
+    if (src_gds && !dst_gds) {
+        // PERF-009: GT Sport copies GDS counters to memory that its CPU then touches every frame.
+        buffer_cache.RecordGdsReadback(dst, src, num_bytes);
+    }
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
