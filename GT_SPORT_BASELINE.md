@@ -1,6 +1,42 @@
 ﻿# GT Sport Graphics Baseline
 
-## Current baseline: October 6, 2026
+## Current baseline: October 7, 2026 (performance)
+
+The player called this build "fantastic" on October 7, 2026 (CUSA03220 update 1.69): a
+solid 30+ FPS throughout races and no exploded vertices when sparks fly. Lighting, sparks
+and the leaderboard were last reported fine on the PERF-012 build ("just as stable as
+before"); this build was not separately rechecked for them.
+
+Measured in that race run (log `Build/gt-sport-fixed/runs/20261007-120935-6df44eb3.log`):
+average 44.6 FPS, 10th percentile 29.5, 90th 60.5 (2-second windows at 5+ FPS). The
+October 6 baseline averaged about 26 in races with dips to 11.
+
+Changes since October 6 (details in `GT_SPORT_OPTIMIZATION_LOG.md`):
+
+- PERF-009: GDS-to-memory copies read back asynchronously.
+- PERF-012: pages the CPU rewrites constantly stay unprotected and are uploaded once per
+  upload epoch (buffer binding about 25 -> 4 ms per frame).
+- PERF-013: runtime shader permutations no longer overwrite stored ones (about 1,085 cached
+  pipelines had been rejected and recompiled in every race).
+- PERF-014: GPU-side waits proceed behind fences the command thread already processed.
+- PERF-016: submits every 128 draws while CPU-access drains keep happening, so each drain
+  waits for little (about 250 per 2 s costing about 120 ms, down from 30-40 costing up
+  to 750 ms).
+- Off: PERF-011 and PERF-015 (both produced exploded vertices; PERF-015 with sparks).
+- Diagnostics in the build: performance monitor, frontend work and draw-step timing,
+  wait and drain reports, every 2 s at warning level. Each run's log and summary are kept
+  in `Build/gt-sport-fixed/runs`.
+
+Tag: `gt-sport-baseline-20261007`. Release build, `Build/gt-sport-fixed` profile
+(`readbacks_mode` 1 and `readback_linear_images_enabled` true are now the profile's own
+settings), launched with `scripts/Run-GTSportPerformance.ps1` and no extra flags.
+`-DisablePerf <ids>` switches individual changes off for comparisons. Reference copy:
+`D:/Development/shadPS4-regression-baselines/GT-Sport-20261007`.
+
+Still open: the items listed under the October 6 baseline below, and 60 FPS in races
+(heavy stretches are now about 30; the command thread's per-draw work is the limit).
+
+## Previous baseline: October 6, 2026
 
 The player called this "the most accurate it's ever been" on October 6, 2026
 (CUSA03220 update 1.69), after these changes (details in `GT_SPORT_OPTIMIZATION_LOG.md`):
@@ -25,7 +61,7 @@ Still open at this baseline: anti-aliasing history on the transmission screen,
 "R" drawn as "9" in some headings, and the race-preview flicker (not rechecked on the
 clean cache).
 
-## Previous baseline: October 5, 2026
+## Older baseline: October 5, 2026
 
 Confirmed by the player on October 5, 2026, with CUSA03220 update 1.69:
 
