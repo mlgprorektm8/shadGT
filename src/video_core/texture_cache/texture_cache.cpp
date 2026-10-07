@@ -26,50 +26,6 @@
 
 namespace VideoCore {
 
-// DIAG-020: large float images whose guest data may contain NaN bit patterns (GT Sport's
-// Tokyo lighting arrays hold 0xFFFFFFFF texels in the emulator).
-static bool IsDiagFloatImage(const ImageInfo& info) {
-    if (info.guest_size < 1_MB) {
-        return false;
-    }
-    switch (info.pixel_format) {
-    case vk::Format::eB10G11R11UfloatPack32:
-    case vk::Format::eR16G16B16A16Sfloat:
-    case vk::Format::eR16G16Sfloat:
-    case vk::Format::eR32G32B32A32Sfloat:
-    case vk::Format::eE5B9G9R9UfloatPack32:
-        return true;
-    default:
-        return false;
-    }
-}
-
-static u64 DiagNowMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-// Hash of the guest bytes plus the share (in 1/1000) of all-ones dwords.
-static std::pair<u64, u32> DiagScanGuest(const ImageInfo& info) {
-    static thread_local std::vector<u8> scratch;
-    scratch.resize(info.guest_size);
-    Core::Memory::Instance()->CopySparseMemory(info.guest_address, scratch.data(),
-                                               info.guest_size);
-    const auto* words = reinterpret_cast<const u32*>(scratch.data());
-    const size_t num_words = info.guest_size / sizeof(u32);
-    size_t ones = 0;
-    for (size_t i = 0; i < num_words; ++i) {
-        ones += words[i] == 0xffffffffu;
-    }
-    return {XXH3_64bits(scratch.data(), info.guest_size),
-            num_words ? static_cast<u32>(ones * 1000 / num_words) : 0u};
-}
-
-static std::atomic<u32> diag_upload_logs{0};
-static std::atomic<u32> diag_stale_logs{0};
-static std::atomic<u32> diag_ones_logs{0};
-
 static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
@@ -686,14 +642,24 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
-    SmallVector<ImageId, 8> image_ids;
-    ForEachImageInRegion(info.guest_address, info.guest_size,
-                         [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+    // A perfect match, and every crop of it, starts at the requested address, so look at those
+    // images first. Only walk the whole range (every page of a large target) when there is no
+    // perfect match and overlaps have to be resolved.
+    const auto collect_same_address = [&](SmallVector<ImageId, 8>& ids) {
+        ids.clear();
+        ForEachImageInRegion(info.guest_address, 1, [&](ImageId id, Image& image) {
+            if (image.info.guest_address == info.guest_address) {
+                ids.push_back(id);
+            }
+        });
+    };
+    SmallVector<ImageId, 8> same_address;
+    collect_same_address(same_address);
 
     ImageId image_id{};
 
     // Check for a perfect match first
-    for (const auto& cache_id : image_ids) {
+    for (const auto& cache_id : same_address) {
         auto& cache_image = slot_images[cache_id];
         if (cache_image.info.guest_address != info.guest_address) {
             continue;
@@ -725,6 +691,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     int view_mip{-1};
     int view_slice{-1};
     if (!image_id) {
+        SmallVector<ImageId, 8> image_ids;
+        ForEachImageInRegion(info.guest_address, info.guest_size,
+                             [&](ImageId id, Image&) { image_ids.push_back(id); });
         for (const auto& cache_id : image_ids) {
             const auto& merged_info = image_id ? slot_images[image_id].info : info;
             auto [overlap_image_id, overlap_view_mip, overlap_view_slice] =
@@ -739,21 +708,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             if (overlap_image_id != image_id || overlap_view_mip >= 0 || overlap_view_slice >= 0) {
                 view_mip = overlap_view_mip;
                 view_slice = overlap_view_slice;
-            } else if (view_mip > 0 || view_slice > 0) {
-                static std::atomic<u32> diag_kept_logs{0};
-                if (diag_kept_logs++ < 50) {
-                    LOG_WARNING(Render_Vulkan,
-                                "DIAG-021 kept mip {} slice {} of {:#x} for request {:#x} {}x{} "
-                                "after overlap with {:#x}",
-                                view_mip, view_slice, slot_images[image_id].info.guest_address,
-                                info.guest_address, info.size.width, info.size.height,
-                                slot_images[cache_id].info.guest_address);
-                }
             }
             image_id = overlap_image_id;
         }
     } else {
-        for (const auto& cache_id : image_ids) {
+        for (const auto& cache_id : same_address) {
             if (cache_id != image_id &&
                 slot_images[image_id].info.IsSubrectOf(slot_images[cache_id].info)) {
                 ResolveOverlap(slot_images[image_id].info, desc.type, cache_id, image_id);
@@ -783,8 +742,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // image, its pixels are the current guest contents of that rectangle, so merge them back
     // (oldest first) before the full image is used. GT Sport draws its car into a 1200-wide
     // crop of a 1920-wide target, then blends over it through the full-width descriptor.
+    // Overlap resolution may have freed or created images, so collect them again.
+    collect_same_address(same_address);
     SmallVector<ImageId, 4> newer_subrects;
-    for (const auto& cache_id : image_ids) {
+    for (const auto& cache_id : same_address) {
         if (cache_id == image_id || !slot_images[cache_id].info.IsSubrectOf(
                                         slot_images[image_id].info)) {
             continue;
@@ -934,26 +895,6 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
-        // DIAG-020: a clean CPU-sourced image whose guest bytes changed missed an invalidation.
-        if (image.diag_upload_hash != 0 && !image.diag_stale_logged &&
-            False(image.flags & ImageFlagBits::GpuModified)) {
-            const u64 now = DiagNowMs();
-            if (now - image.diag_last_check_ms >= 5000) {
-                image.diag_last_check_ms = now;
-                const auto [hash, ones] = DiagScanGuest(image.info);
-                if (hash != image.diag_upload_hash && diag_stale_logs++ < 64) {
-                    image.diag_stale_logged = true;
-                    LOG_WARNING(Render_Vulkan,
-                                "DIAG-020 stale image {:#x} size {:#x} {}x{} layers {} mips {} "
-                                "{}: guest bytes changed without invalidation, all-ones now "
-                                "{}/1000",
-                                image.info.guest_address, image.info.guest_size,
-                                image.info.size.width, image.info.size.height,
-                                image.info.resources.layers, image.info.resources.levels,
-                                vk::to_string(image.info.pixel_format), ones);
-                }
-            }
-        }
         return;
     }
 
@@ -1025,23 +966,6 @@ void TextureCache::RefreshImage(Image& image) {
 
     // Refresh covers every mip and layer from the canonical guest buffer footprint.
     runtime.UploadImage(&image, buffer, image_copies, true);
-
-    if (IsDiagFloatImage(image.info)) {
-        const bool from_gpu = is_gpu_modified || is_gpu_dirty;
-        const auto [hash, ones] = DiagScanGuest(image.info);
-        image.diag_upload_hash = from_gpu ? 0 : hash;
-        image.diag_last_check_ms = DiagNowMs();
-        image.diag_stale_logged = false;
-        if (ones > 0 ? diag_ones_logs++ < 2000 : diag_upload_logs++ < 400) {
-            LOG_WARNING(Render_Vulkan,
-                        "DIAG-020 upload {:#x} size {:#x} {}x{} layers {} mips {} {} tiling {} "
-                        "source {}: guest all-ones dwords {}/1000",
-                        image.info.guest_address, image.info.guest_size, image.info.size.width,
-                        image.info.size.height, image.info.resources.layers,
-                        image.info.resources.levels, vk::to_string(image.info.pixel_format),
-                        static_cast<u32>(image.info.tile_mode), from_gpu ? "gpu" : "cpu", ones);
-        }
-    }
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,

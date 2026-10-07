@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <map>
+#include <string>
+
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/debug.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
@@ -11,6 +16,33 @@
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
+
+// PERF-DIAG-001: where threads block on the GPU (scheduler Wait/Finish), reported every 2 s.
+static void RecordGpuWait(const std::source_location& loc, std::chrono::steady_clock::duration d) {
+    static std::mutex mutex;
+    static std::map<std::string, std::pair<u32, double>> sites;
+    static auto window_start = std::chrono::steady_clock::now();
+    std::scoped_lock lk{mutex};
+    std::string_view file = loc.file_name();
+    if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+        file.remove_prefix(slash + 1);
+    }
+    auto& site = sites[fmt::format("{}:{}", file, loc.line())];
+    ++site.first;
+    site.second += std::chrono::duration<double, std::milli>(d).count();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window_start < std::chrono::seconds{2}) {
+        return;
+    }
+    std::string summary;
+    for (const auto& [name, stat] : sites) {
+        summary += fmt::format(" {}={}/{:.1f}ms", name, stat.first, stat.second);
+    }
+    LOG_WARNING(Render_Vulkan, "GPU waits in {:.1f} s (count/total):{}",
+                std::chrono::duration<double>(now - window_start).count(), summary);
+    sites.clear();
+    window_start = now;
+}
 
 Scheduler::Scheduler(const Instance& instance)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
@@ -114,21 +146,26 @@ void Scheduler::Flush() {
     Flush(info);
 }
 
-void Scheduler::Finish() {
+void Scheduler::Finish(std::source_location loc) {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
-    Wait(presubmit_tick);
+    Wait(presubmit_tick, loc);
 }
 
-void Scheduler::Wait(u64 tick) {
+void Scheduler::Wait(u64 tick, std::source_location loc) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
         Flush(info);
     }
+    if (work_semaphore.IsFree(tick)) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
     work_semaphore.Wait(tick);
+    RecordGpuWait(loc, std::chrono::steady_clock::now() - start);
 }
 
 void Scheduler::PopPendingOperations() {

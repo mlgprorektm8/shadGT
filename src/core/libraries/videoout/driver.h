@@ -104,6 +104,7 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        std::chrono::steady_clock::time_point submitted{}; // PERF-DIAG-002
 
         operator bool() const noexcept {
             return frame != nullptr;

@@ -1088,6 +1088,31 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 }
 
 Frame* Presenter::GetRenderFrame() {
+    // PERF-DIAG-002: how long the GPU thread waits here for a free presentation frame.
+    const auto wait_start = std::chrono::steady_clock::now();
+    struct WaitStats {
+        std::chrono::steady_clock::time_point window{};
+        u32 count{};
+        double total_ms{}, max_ms{};
+    };
+    static WaitStats stats;
+    const auto record_wait = [&] {
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - wait_start).count();
+        if (stats.window == std::chrono::steady_clock::time_point{}) {
+            stats.window = now;
+        }
+        ++stats.count;
+        stats.total_ms += ms;
+        stats.max_ms = std::max(stats.max_ms, ms);
+        if (now - stats.window >= std::chrono::seconds{2}) {
+            LOG_WARNING(Render_Vulkan, "Render frame waits: {} in {:.1f} s, total {:.1f} ms, max {:.2f} ms",
+                        stats.count, std::chrono::duration<double>(now - stats.window).count(),
+                        stats.total_ms, stats.max_ms);
+            stats = {};
+            stats.window = now;
+        }
+    };
     // Wait for free presentation frames
     Frame* frame;
     {
@@ -1117,6 +1142,7 @@ Frame* Presenter::GetRenderFrame() {
             continue;
         }
     }
+    record_wait();
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {

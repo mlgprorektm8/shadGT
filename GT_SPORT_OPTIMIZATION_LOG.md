@@ -1029,3 +1029,29 @@ Findings from the October 5, 11:47 Release run (`Build/gt-sport-fixed/user/log/s
   - `vk_pipeline_serialization.cpp`: graphics pipelines found in the cache are built on up to 13 worker threads (inputs copied per pipeline); the window title shows "Compiling shaders N / M (P%)" and window events are pumped, so the window stays responsive.
   - `emulator.cpp`: fork builds use the title "<game> - Current Build" (revision still logged).
 - Measured on the player's PC (6,241 cached pipelines): first launch about 50 s, second launch 10 s with the saved driver cache; window responsive throughout (0 not-responding samples).
+
+## Performance work, October 7, 2026 (target: 60 FPS without losing accuracy)
+
+### Measurements
+
+- Profile (Time Trial, 30-40% CPU and GPU use): no thread saturated. The GPU command thread was about 74% of a core; the game waits on it.
+- Flip pacing (PERF-DIAG-002): submit-to-flip about 9 ms, Present under 0.5 ms, no waits for free presentation frames. Most vblanks simply had no new frame, so display pacing is not the limit.
+- Ceiling run with `-ReadbacksMode 0 -ReadbackLinearImages 0`: 55-60 FPS for long stretches (log frame counts near 120 per 2 s). Readbacks off but linear images on: 26-40. Normal settings: 30-45. The readback paths cost the frames.
+- GPU waits by source (PERF-DIAG-001): in races nearly all are `buffer_cache.cpp` downloads, about 250 per second. They come from 5 small regions the game CPU writes (4-8 byte stores) about 25 times per frame in total, in pages the GPU also writes. Each store forces the GPU thread to drain the GPU and download a 512 KB window. GT Sport runs 63 job threads; the emulator does not cause that (the game never queries a CPU count).
+
+### Kept (committed)
+
+- DIAG-020/021 removed (DIAG-020 copied and scanned large float images on every upload).
+- PERF-002 re-applied: guest USB `timeval` converted to the host layout (the Thrustmaster wheel thread no longer busy-polls a core). Earlier "lighting regression" attributed to it was later traced to readback timing.
+- PERF-006: `FindImage` checks images at the same base address first and walks the whole range (every 256 KB page of large targets) only when there is no perfect match. Exact: a perfect match and all of its crops share the base address. Its self time was about 10% of the GPU thread.
+- PERF-007: with linear-image readbacks on, chunked submits (every 128 draws) only happen while a readback or deferred fence is pending; otherwise they were pure overhead (submits were about 22% of the GPU thread). Menus and pre-race now hold 60 FPS; races about 30-40 (13-55).
+- PERF-DIAG-001/002 left in: GPU waits per call site, flip pacing and render-frame waits, each reported every 2 s at warning level.
+
+### Tried and reverted
+
+- PERF-005 (deferred compute-queue ReleaseMem fences): no gain; its test run also ran with readbacks 0 by accident (the earlier `-ReadbacksMode 0` run had not restored the profile), which removed the sparks.
+- PERF-008 (emulate small CPU stores into GPU-modified pages and update the GPU copy inline): about 550 stores per second took the path, each becoming a GPU `updateBuffer` that ended render passes; races dropped to 4 FPS. Removed.
+
+### Next (experimental branch)
+
+- Track GPU writes precisely enough that CPU stores into GPU-owned pages do not force a full drain.

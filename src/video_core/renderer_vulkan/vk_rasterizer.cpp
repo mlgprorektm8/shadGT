@@ -558,14 +558,21 @@ void Rasterizer::RecordDeferredFenceLatency(std::chrono::steady_clock::time_poin
 void Rasterizer::SubmitChunkIfNeeded() {
     // PERF-003: with readback on, the guest waits for GPU completion at fences. Submitting in
     // chunks lets the GPU run the frame while it is still being recorded.
+    // PERF-007: chunks only help while a fence will wait for GPU completion, that is while
+    // readbacks or deferred fences are pending. Otherwise each extra submit is pure overhead
+    // (about 14% of the GPU thread in GT Sport), so batch normally.
     static constexpr u32 DrawsPerSubmit = 128;
     if (!texture_cache.ReadbackLinearImages()) {
         return;
     }
-    if (++draws_since_submit >= DrawsPerSubmit) {
-        draws_since_submit = 0;
-        scheduler.Flush();
+    if (++draws_since_submit < DrawsPerSubmit) {
+        return;
     }
+    if (deferred_fences.load() == 0 && !texture_cache.HasPendingReadbacks()) {
+        return;
+    }
+    draws_since_submit = 0;
+    scheduler.Flush();
 }
 
 void Rasterizer::FlushForDeferredFences() {
@@ -1779,12 +1786,6 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         texture_cache.ClearMeta(address);
         const bool cpu_path = !buffer_cache.IsRegionGpuModified(address, num_bytes) &&
                               !buffer_cache.HasGpuImageAlias(address, num_bytes);
-        // DIAG-020: large DMA fills, to find what writes all-ones into lighting textures.
-        static std::atomic<u32> diag_fill_logs{0};
-        if (num_bytes >= 64_KB && diag_fill_logs++ < 500) {
-            LOG_WARNING(Render_Vulkan, "DIAG-020 fill {:#x} size {:#x} value {:#x} path {}",
-                        address, num_bytes, value, cpu_path ? "cpu" : "gpu");
-        }
         if (cpu_path) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);

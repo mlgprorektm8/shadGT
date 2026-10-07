@@ -233,12 +233,61 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
+
+// PERF-DIAG-002: flip pacing. Submit-to-flip latency, Present() time, and queued flips at each
+// vblank, reported every 2 s.
+namespace {
+struct FlipStats {
+    std::mutex mutex;
+    std::chrono::steady_clock::time_point window{};
+    u32 flips{}, vblanks{}, idle_vblanks{}, max_queue{};
+    double latency_ms{}, max_latency_ms{}, present_ms{}, max_present_ms{};
+};
+FlipStats g_flip_stats;
+
+void ReportFlipStats() {
+    auto& s = g_flip_stats;
+    const auto now = std::chrono::steady_clock::now();
+    if (s.window == std::chrono::steady_clock::time_point{}) {
+        s.window = now;
+        return;
+    }
+    if (now - s.window < std::chrono::seconds{2}) {
+        return;
+    }
+    LOG_WARNING(Lib_VideoOut,
+                "Flips in {:.1f} s: {} flips, {} vblanks ({} with no flip ready), max queued {}, "
+                "submit-to-flip avg {:.2f} ms max {:.2f} ms, Present avg {:.2f} ms max {:.2f} ms",
+                std::chrono::duration<double>(now - s.window).count(), s.flips, s.vblanks,
+                s.idle_vblanks, s.max_queue, s.flips ? s.latency_ms / s.flips : 0.0,
+                s.max_latency_ms, s.flips ? s.present_ms / s.flips : 0.0, s.max_present_ms);
+    s.flips = s.vblanks = s.idle_vblanks = s.max_queue = 0;
+    s.latency_ms = s.max_latency_ms = s.present_ms = s.max_present_ms = 0;
+    s.window = now;
+}
+} // namespace
+
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
     // Present the frame.
+    const auto present_start = std::chrono::steady_clock::now();
     presenter->Present(req.frame);
+    {
+        const auto now = std::chrono::steady_clock::now();
+        std::scoped_lock lk{g_flip_stats.mutex};
+        auto& st = g_flip_stats;
+        const double present_ms =
+            std::chrono::duration<double, std::milli>(now - present_start).count();
+        const double latency_ms =
+            std::chrono::duration<double, std::milli>(now - req.submitted).count();
+        ++st.flips;
+        st.present_ms += present_ms;
+        st.max_present_ms = std::max(st.max_present_ms, present_ms);
+        st.latency_ms += latency_ms;
+        st.max_latency_ms = std::max(st.max_latency_ms, latency_ms);
+    }
 
     // Update flip status.
     auto* port = req.port;
@@ -333,6 +382,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         .flip_arg = flip_arg,
         .index = index,
         .eop = is_eop,
+        .submitted = std::chrono::steady_clock::now(),
     });
 }
 
@@ -367,6 +417,16 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
         if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+            {
+                std::scoped_lock lk{mutex, g_flip_stats.mutex};
+                ++g_flip_stats.vblanks;
+                g_flip_stats.max_queue =
+                    std::max<u32>(g_flip_stats.max_queue, static_cast<u32>(requests.size()));
+                if (requests.empty()) {
+                    ++g_flip_stats.idle_vblanks;
+                }
+                ReportFlipStats();
+            }
             const auto request = receive_request();
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast

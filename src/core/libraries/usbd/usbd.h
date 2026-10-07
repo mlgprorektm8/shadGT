@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/types.h"
+#include "core/libraries/kernel/time.h"
 #include "emulated/dimensions.h"
 #include "emulated/infinity.h"
 #include "emulated/skylander.h"
@@ -147,11 +148,11 @@ s32 PS4_SYSV_ABI sceUsbdEventHandlingOk();
 s32 PS4_SYSV_ABI sceUsbdEventHandlerActive();
 void PS4_SYSV_ABI sceUsbdLockEventWaiters();
 void PS4_SYSV_ABI sceUsbdUnlockEventWaiters();
-s32 PS4_SYSV_ABI sceUsbdWaitForEvent(timeval* tv);
+s32 PS4_SYSV_ABI sceUsbdWaitForEvent(const Kernel::OrbisKernelTimeval* tv);
 
-s32 PS4_SYSV_ABI sceUsbdHandleEventsTimeout(timeval* tv);
+s32 PS4_SYSV_ABI sceUsbdHandleEventsTimeout(const Kernel::OrbisKernelTimeval* tv);
 s32 PS4_SYSV_ABI sceUsbdHandleEvents();
-s32 PS4_SYSV_ABI sceUsbdHandleEventsLocked(timeval* tv);
+s32 PS4_SYSV_ABI sceUsbdHandleEventsLocked(const Kernel::OrbisKernelTimeval* tv);
 
 s32 PS4_SYSV_ABI sceUsbdCheckConnected(SceUsbdDeviceHandle* dev_handle);
 

@@ -6,8 +6,15 @@
 #include "core/libraries/libs.h"
 #include "usbd.h"
 
+#include <algorithm>
+#include <limits>
 #include <fmt/format.h>
 #include <libusb.h>
+#ifdef _WIN32
+#include <winsock2.h> // struct timeval as libusb uses it on Windows
+#else
+#include <sys/time.h>
+#endif
 
 #include "core/emulator_settings.h"
 
@@ -406,16 +413,35 @@ void PS4_SYSV_ABI sceUsbdUnlockEventWaiters() {
     usb_backend->UnlockEventWaiters();
 }
 
-s32 PS4_SYSV_ABI sceUsbdWaitForEvent(timeval* tv) {
-    LOG_DEBUG(Lib_Usbd, "called");
-
-    return libusb_to_orbis_error(usb_backend->WaitForEvent(tv));
+// The guest timeval has 64-bit fields. Windows struct timeval uses 32-bit longs, so passing the
+// guest pointer through made libusb read the upper half of tv_sec as microseconds, usually
+// turning a requested wait into a zero-timeout poll.
+static timeval* ToHostTimeval(const Kernel::OrbisKernelTimeval* guest, timeval& host) {
+    if (!guest) {
+        return nullptr;
+    }
+    using Seconds = decltype(host.tv_sec);
+    using Microseconds = decltype(host.tv_usec);
+    host.tv_sec = static_cast<Seconds>(std::clamp<s64>(
+        guest->tv_sec, std::numeric_limits<Seconds>::min(), std::numeric_limits<Seconds>::max()));
+    host.tv_usec = static_cast<Microseconds>(
+        std::clamp<s64>(guest->tv_usec, std::numeric_limits<Microseconds>::min(),
+                        std::numeric_limits<Microseconds>::max()));
+    return &host;
 }
 
-s32 PS4_SYSV_ABI sceUsbdHandleEventsTimeout(timeval* tv) {
+s32 PS4_SYSV_ABI sceUsbdWaitForEvent(const Kernel::OrbisKernelTimeval* tv) {
     LOG_DEBUG(Lib_Usbd, "called");
 
-    return libusb_to_orbis_error(usb_backend->HandleEventsTimeout(tv));
+    timeval host_tv;
+    return libusb_to_orbis_error(usb_backend->WaitForEvent(ToHostTimeval(tv, host_tv)));
+}
+
+s32 PS4_SYSV_ABI sceUsbdHandleEventsTimeout(const Kernel::OrbisKernelTimeval* tv) {
+    LOG_DEBUG(Lib_Usbd, "called");
+
+    timeval host_tv;
+    return libusb_to_orbis_error(usb_backend->HandleEventsTimeout(ToHostTimeval(tv, host_tv)));
 }
 
 s32 PS4_SYSV_ABI sceUsbdHandleEvents() {
@@ -424,10 +450,11 @@ s32 PS4_SYSV_ABI sceUsbdHandleEvents() {
     return libusb_to_orbis_error(usb_backend->HandleEvents());
 }
 
-s32 PS4_SYSV_ABI sceUsbdHandleEventsLocked(timeval* tv) {
+s32 PS4_SYSV_ABI sceUsbdHandleEventsLocked(const Kernel::OrbisKernelTimeval* tv) {
     LOG_DEBUG(Lib_Usbd, "called");
 
-    return libusb_to_orbis_error(usb_backend->HandleEventsTimeout(tv));
+    timeval host_tv;
+    return libusb_to_orbis_error(usb_backend->HandleEventsTimeout(ToHostTimeval(tv, host_tv)));
 }
 
 s32 PS4_SYSV_ABI sceUsbdCheckConnected(SceUsbdDeviceHandle* dev_handle) {
