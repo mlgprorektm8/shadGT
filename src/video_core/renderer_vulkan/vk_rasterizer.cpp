@@ -3,6 +3,7 @@
 
 #include <fmt/ranges.h>
 #include "common/debug.h"
+#include "common/perf_monitor.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -188,6 +189,7 @@ void Rasterizer::EliminateFastClear() {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
+    ++Common::GetWorkCounters().draws;
 
     SubmitChunkIfNeeded();
     scheduler.PopPendingOperations();
@@ -244,6 +246,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+    ++Common::GetWorkCounters().draws;
 
     SubmitChunkIfNeeded();
     scheduler.PopPendingOperations();
@@ -322,6 +325,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
+    ++Common::GetWorkCounters().dispatches;
 
     SubmitChunkIfNeeded();
     scheduler.PopPendingOperations();
@@ -358,6 +362,7 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
+    ++Common::GetWorkCounters().dispatches;
 
     SubmitChunkIfNeeded();
     scheduler.PopPendingOperations();
@@ -1873,12 +1878,13 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
-bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
+bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks,
+                                  u64 exact_write_size) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.InvalidateMemory(addr, size, assume_locks);
+    buffer_cache.InvalidateMemory(addr, size, assume_locks, exact_write_size);
     texture_cache.InvalidateMemory(addr, size);
     return true;
 }

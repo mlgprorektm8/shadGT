@@ -127,4 +127,20 @@ std::string SampleThreadCpuUsage(size_t) {
 }
 #endif
 
+WorkCounters& GetWorkCounters() {
+    static WorkCounters counters;
+    return counters;
+}
+
+std::string TakeWorkCounters() {
+    auto& c = GetWorkCounters();
+    return fmt::format("{} PM4 packets, {} draws, {} dispatches, {} image lookups, {} buffer "
+                       "binds ({} streamed), {} uploads ({} KB), {} protection calls ({} KB)",
+                       c.pm4_packets.exchange(0), c.draws.exchange(0), c.dispatches.exchange(0),
+                       c.find_image.exchange(0), c.obtain_buffer.exchange(0),
+                       c.obtain_stream.exchange(0), c.uploads.exchange(0),
+                       c.upload_bytes.exchange(0) / 1024, c.protects.exchange(0),
+                       c.protect_bytes.exchange(0) / 1024);
+}
+
 } // namespace Common

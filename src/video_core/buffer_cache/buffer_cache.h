@@ -87,10 +87,12 @@ public:
     void TickFrame();
 
     /// Invalidates any buffer in the logical page range.
-    void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
+    void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false,
+                          u64 exact_write_size = 0);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
-    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
+    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false,
+                    u64 exact_write_size = 0);
 
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
@@ -126,7 +128,7 @@ public:
         return num_pending_async_readbacks.load() != 0;
     }
     /// Remembers pages the CPU read while they held GPU-written data (GPU thread).
-    void NoteCpuReadFault(VAddr address, u64 size);
+    void NoteCpuReadFault(VAddr address, u64 size, u64 exact_write_size = 0);
     /// Records readbacks of remembered pages that hold GPU-written data again (GPU thread).
     /// Returns true when any were recorded.
     bool RecordHotPageReadbacks();
@@ -149,7 +151,7 @@ private:
     /// PERF-011: handles a CPU write fault on a page with GPU-written bytes that the write does
     /// not touch, without waiting for the GPU. Returns false when the exact path is needed.
     bool TrySplitWriteFault(const Buffer* arena, VAddr address, u64 size, VAddr window_start,
-                            VAddr window_end);
+                            VAddr window_end, u64 exact_write_size);
     /// Removes ranges whose read-back value reached guest memory from gpu_modified_ranges
     /// (GPU thread).
     void ApplyCompletedReadbacks();

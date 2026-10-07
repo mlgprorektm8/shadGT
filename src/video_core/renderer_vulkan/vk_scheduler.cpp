@@ -315,6 +315,9 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
                     std::chrono::duration<double>(now - window_start).count(),
                     samples ? busy_samples * 100.0 / samples : 0.0, tick - window_tick,
                     Common::SampleThreadCpuUsage(10));
+        LOG_WARNING(Render_Vulkan, "Frontend work in {:.1f} s: {}",
+                    std::chrono::duration<double>(now - window_start).count(),
+                    Common::TakeWorkCounters());
         window_start = now;
         window_tick = tick;
         samples = 0;

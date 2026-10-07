@@ -6,6 +6,8 @@
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/decoder.h"
+#include "common/perf_monitor.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
@@ -424,11 +426,57 @@ struct SignalImpl : public PageManager::Impl {
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
         RENDERER_TRACE;
+        ++Common::GetWorkCounters().protects;
+        Common::GetWorkCounters().protect_bytes += size;
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
         impl.Protect(address, size, perms);
+    }
+
+    /// PERF-011b: bytes written by the faulting instruction when they are known exactly: one
+    /// explicit memory destination, no REP prefix or string operation, and starting at the fault
+    /// address (an access cannot have begun on the previous page). 0 when unknown.
+    static u64 ExactWriteSize(void* context, VAddr addr) {
+        ZydisDecodedInstruction instruction;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        const auto status = Common::Decoder::Instance()->decodeInstruction(
+            instruction, operands, Common::GetRip(context));
+        if (!ZYAN_SUCCESS(status) ||
+            (instruction.attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE |
+                                       ZYDIS_ATTRIB_HAS_REPNE)) != 0) {
+            return 0;
+        }
+        switch (instruction.mnemonic) {
+        case ZYDIS_MNEMONIC_MOVSB:
+        case ZYDIS_MNEMONIC_MOVSW:
+        case ZYDIS_MNEMONIC_MOVSD:
+        case ZYDIS_MNEMONIC_MOVSQ:
+        case ZYDIS_MNEMONIC_STOSB:
+        case ZYDIS_MNEMONIC_STOSW:
+        case ZYDIS_MNEMONIC_STOSD:
+        case ZYDIS_MNEMONIC_STOSQ:
+            return 0;
+        default:
+            break;
+        }
+        u64 size = 0;
+        for (u32 i = 0; i < instruction.operand_count_visible; ++i) {
+            const auto& operand = operands[i];
+            if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY ||
+                (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) == 0) {
+                continue;
+            }
+            if (size != 0 || operand.size == 0 || operand.size % 8 != 0) {
+                return 0;
+            }
+            size = operand.size / 8;
+        }
+        if (size == 0 || (addr & 0xFFFULL) < size) {
+            return 0;
+        }
+        return size;
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
@@ -437,7 +485,8 @@ struct SignalImpl : public PageManager::Impl {
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread,
+                                                ExactWriteSize(context, addr));
         } else {
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }

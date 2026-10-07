@@ -8,6 +8,7 @@
 #include <limits>
 #include <xxhash.h>
 
+#include "common/perf_monitor.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -639,6 +640,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+    ++Common::GetWorkCounters().find_image;
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 

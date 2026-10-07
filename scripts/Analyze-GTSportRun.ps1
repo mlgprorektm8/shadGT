@@ -26,6 +26,15 @@ foreach ($line in [System.IO.File]::ReadLines($LogPath)) {
         }
     } elseif ($line -match 'Readback pages in [\d.]+ s: (\d+) CPU faults') {
         $current.Faults = [int]$Matches[1]
+    } elseif ($line -match 'Frontend work in [\d.]+ s: (\d+) PM4 packets, (\d+) draws, (\d+) dispatches, (\d+) image lookups, (\d+) buffer binds \((\d+) streamed\), (\d+) uploads \((\d+) KB\), (\d+) protection calls') {
+        $current.Work = @{ Packets = [double]$Matches[1]; Draws = [double]$Matches[2]; Dispatches = [double]$Matches[3]
+            ImageLookups = [double]$Matches[4]; BufferBinds = [double]$Matches[5]; Uploads = [double]$Matches[7]
+            UploadKB = [double]$Matches[8]; Protects = [double]$Matches[9] }
+    } elseif ($line -match 'Command processor waits in [\d.]+ s \(count/total\):([^;]*);') {
+        $current.FrontendWaits = @{}
+        foreach ($m in [regex]::Matches($Matches[1], ' ([a-z]+ [A-Z_ ]+?|[a-z]+ VO label)=(\d+)/([\d.]+)ms')) {
+            $current.FrontendWaits[$m.Groups[1].Value] = [double]$m.Groups[3].Value
+        }
     }
 }
 
@@ -50,6 +59,18 @@ Write-Output ("  Process CPU %:    " + (Stat ($play | Where-Object { $null -ne $
 Write-Output ("  Submits / 2 s:    " + (Stat ($play | Where-Object { $null -ne $_.Submits } | ForEach-Object { $_.Submits })))
 Write-Output ("  GPU wait ms / 2 s:" + (Stat ($play | ForEach-Object { $_.WaitMs })))
 Write-Output ("  CPU faults / 2 s: " + (Stat ($play | ForEach-Object { $_.Faults })))
+
+# Frontend work per presented frame.
+$withWork = @($play | Where-Object { $_.Work -and $_.Fps -gt 0 })
+foreach ($key in 'Packets', 'Draws', 'Dispatches', 'ImageLookups', 'BufferBinds', 'Uploads', 'UploadKB', 'Protects') {
+    if ($withWork.Count -gt 0) {
+        Write-Output ('  {0,-17} per frame: {1}' -f $key, (Stat ($withWork | ForEach-Object { $_.Work[$key] / ($_.Fps * 2) })))
+    }
+}
+$waitKeys = @($play | Where-Object { $_.FrontendWaits } | ForEach-Object { $_.FrontendWaits.Keys } | Sort-Object -Unique)
+foreach ($key in $waitKeys) {
+    Write-Output ('  Waits {0,-18} ms / 2 s: {1}' -f $key, (Stat ($play | Where-Object { $_.FrontendWaits } | ForEach-Object { [double]$_.FrontendWaits[$key] })))
+}
 
 # Busiest threads, averaged over the windows they appeared in among the top 10.
 $totals = @{}

@@ -11,6 +11,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
+#include "common/perf_monitor.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -135,15 +136,18 @@ std::vector<std::shared_ptr<BufferCache::AsyncReadback>> BufferCache::TakePendin
     return readbacks;
 }
 
-void BufferCache::NoteCpuReadFault(VAddr address, u64 size) {
+void BufferCache::NoteCpuReadFault(VAddr address, u64 size, u64 exact_write_size) {
     // PERF-010: a CPU access that needed GPU-written data drains the GPU. Pages that saw such an
     // access are read back after each later GPU write, so the next access finds current data.
     ++hot_page_stats.faults;
     // PERF-DIAG-008: does the access itself touch GPU-written bytes, or only share their page?
     constexpr u64 LineSize = 64;
     const VAddr line = Common::AlignDown(address, LineSize);
-    const bool touches_gpu_bytes = gpu_modified_ranges.Intersects(
-        line, Common::AlignUp(address + std::max<u64>(size, 1), LineSize) - line);
+    const bool touches_gpu_bytes =
+        exact_write_size != 0
+            ? gpu_modified_ranges.Intersects(address, exact_write_size)
+            : gpu_modified_ranges.Intersects(
+                  line, Common::AlignUp(address + std::max<u64>(size, 1), LineSize) - line);
     if (!touches_gpu_bytes) {
         ++hot_page_stats.page_only_faults;
     }
@@ -156,7 +160,7 @@ void BufferCache::NoteCpuReadFault(VAddr address, u64 size) {
         });
     }
     page_stat.last_offset = address - fault_page;
-    page_stat.last_size = size;
+    page_stat.last_size = exact_write_size != 0 ? exact_write_size : size;
     page_stat.touches_gpu_bytes |= touches_gpu_bytes;
     constexpr u64 PageSize = 4_KB;
     const VAddr end = address + std::max<u64>(size, 1);
@@ -356,7 +360,7 @@ void BufferCache::ApplyCompletedReadbacks() {
 }
 
 bool BufferCache::TrySplitWriteFault(const Buffer* arena, VAddr address, u64 size,
-                                     VAddr window_start, VAddr window_end) {
+                                     VAddr window_start, VAddr window_end, u64 exact_write_size) {
     // PERF-011: the drain on a CPU write fault only protects GPU-written bytes of the page from
     // being overwritten by the later whole-page upload. When the write does not touch them, the
     // upload skips them instead (SynchronizeMemory) and their values reach guest memory
@@ -366,10 +370,12 @@ bool BufferCache::TrySplitWriteFault(const Buffer* arena, VAddr address, u64 siz
     if (!split_write_faults) {
         return false;
     }
+    // With the store's exact size its bytes are checked; otherwise its 64-byte line.
     constexpr u64 LineSize = 64;
     const VAddr line = Common::AlignDown(address, LineSize);
     const VAddr line_end = Common::AlignUp(address + std::max<u64>(size, 1), LineSize);
-    if (gpu_modified_ranges.Intersects(line, line_end - line)) {
+    if (exact_write_size != 0 ? gpu_modified_ranges.Intersects(address, exact_write_size)
+                              : gpu_modified_ranges.Intersects(line, line_end - line)) {
         return false;
     }
     if (HasGpuImageAlias(window_start, window_end - window_start)) {
@@ -412,14 +418,17 @@ bool BufferCache::TrySplitWriteFault(const Buffer* arena, VAddr address, u64 siz
     return true;
 }
 
-void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
-    memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
-        ReadMemory(device_addr, size, true, assume_locks);
-    });
+void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks,
+                                   u64 exact_write_size) {
+    memory_tracker->InvalidateRegion(
+        device_addr, size, [this, device_addr, size, assume_locks, exact_write_size] {
+            ReadMemory(device_addr, size, true, assume_locks, exact_write_size);
+        });
 }
 
-void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
-    const auto flush_request = [this, device_addr, size, is_write] {
+void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks,
+                             u64 exact_write_size) {
+    const auto flush_request = [this, device_addr, size, is_write, exact_write_size] {
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
@@ -433,8 +442,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
         ApplyCompletedReadbacks();
-        NoteCpuReadFault(device_addr, size);
-        if (is_write && TrySplitWriteFault(arena, device_addr, size, window_start, window_end)) {
+        NoteCpuReadFault(device_addr, size, exact_write_size);
+        if (is_write && TrySplitWriteFault(arena, device_addr, size, window_start, window_end,
+                                           exact_write_size)) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
             return;
         }
@@ -501,6 +511,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     // After the invalidation: a readback that completed before it must not later remove the
     // ranges this write adds.
     ApplyCompletedReadbacks();
+    ++Common::GetWorkCounters().obtain_buffer;
     SynchronizeMemoryFromImage(device_addr, size);
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
@@ -508,6 +519,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
+        ++Common::GetWorkCounters().obtain_stream;
         return {&stream_buffer, offset};
     }
     const u64 first_block = device_addr >> block_shift;
@@ -700,6 +712,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
     });
     if (!copies.empty()) {
+        Common::GetWorkCounters().uploads += copies.size();
+        Common::GetWorkCounters().upload_bytes += total_size_bytes;
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {
             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);

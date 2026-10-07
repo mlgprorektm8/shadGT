@@ -10,6 +10,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/perf_monitor.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -378,6 +379,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            ++Common::GetWorkCounters().pm4_packets;
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1148,6 +1150,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        ++Common::GetWorkCounters().pm4_packets;
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
