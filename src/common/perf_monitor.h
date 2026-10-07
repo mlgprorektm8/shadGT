@@ -26,6 +26,8 @@ struct WorkCounters {
     std::atomic<u64> upload_bytes{};
     std::atomic<u64> protects{};
     std::atomic<u64> protect_bytes{};
+    std::atomic<u64> shaders_compiled{};
+    std::atomic<u64> pipelines_compiled{};
 };
 WorkCounters& GetWorkCounters();
 std::string TakeWorkCounters();

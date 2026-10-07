@@ -4,6 +4,7 @@
 #include <cstring>
 #include <ranges>
 
+#include "common/perf_monitor.h"
 #include "common/elf_info.h"
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -462,6 +463,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
+        ++Common::GetWorkCounters().pipelines_compiled;
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
@@ -492,6 +494,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
         ComputePipeline::SerializationSupport sdata{};
+        ++Common::GetWorkCounters().pipelines_compiled;
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false);
@@ -847,6 +850,7 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    ++Common::GetWorkCounters().shaders_compiled;
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
@@ -917,7 +921,15 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         return std::make_tuple(&info, permutation.module, HashCombine(params.hash, perm_idx));
     }
 
-    const size_t perm_idx = program->modules.size();
+    // PERF-013: runtime permutations used to take the next free slot of this session, which
+    // depends on which stored permutations were preloaded. A slot already used in the stored
+    // cache then got a different specialization, overwriting the stored shader and leaving
+    // every pipeline that used it unloadable ("stale"; about 1,085 per GT Sport run, compiled
+    // again in every race). Start after the stored indices instead.
+    size_t perm_idx = program->modules.size();
+    if (const auto it = stored_perm_end.find(params.hash); it != stored_perm_end.end()) {
+        perm_idx = std::max(perm_idx, it->second);
+    }
     const u64 perm_hash = HashCombine(params.hash, perm_idx);
     if (!mismatch_reasons.empty()) {
         static u64 runaway_events = 0;
@@ -937,7 +949,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     auto spec = Shader::StageSpecialization(*info, runtime_info, profile, start);
     RegisterShaderMeta(*info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
     const auto* info_ptr = info.get();
-    program->AddPermut(module, std::move(spec), std::move(info));
+    program->InsertPermut(module, std::move(spec), std::move(info), perm_idx);
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
     }

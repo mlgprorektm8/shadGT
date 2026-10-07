@@ -111,6 +111,9 @@ private:
     Shader::Pools pools;
     DrawIndirectParams draw_indirect_params{};
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
+    /// PERF-013: per program, one past the highest permutation index in the stored cache, so a
+    /// permutation created at runtime never reuses (and overwrites) a stored index.
+    tsl::robin_map<size_t, size_t> stored_perm_end;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};

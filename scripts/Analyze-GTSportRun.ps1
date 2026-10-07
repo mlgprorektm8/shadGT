@@ -26,10 +26,11 @@ foreach ($line in [System.IO.File]::ReadLines($LogPath)) {
         }
     } elseif ($line -match 'Readback pages in [\d.]+ s: (\d+) CPU faults') {
         $current.Faults = [int]$Matches[1]
-    } elseif ($line -match 'Frontend work in [\d.]+ s: (\d+) PM4 packets, (\d+) draws, (\d+) dispatches, (\d+) image lookups, (\d+) buffer binds \((\d+) streamed\), (\d+) uploads \((\d+) KB\), (\d+) protection calls') {
+    } elseif ($line -match 'Frontend work in [\d.]+ s: (\d+) PM4 packets, (\d+) draws, (\d+) dispatches, (\d+) image lookups, (\d+) buffer binds \((\d+) streamed\), (\d+) uploads \((\d+) KB\), (\d+) protection calls(?: \(\d+ KB\), (\d+) shaders and (\d+) pipelines compiled)?') {
         $current.Work = @{ Packets = [double]$Matches[1]; Draws = [double]$Matches[2]; Dispatches = [double]$Matches[3]
             ImageLookups = [double]$Matches[4]; BufferBinds = [double]$Matches[5]; Uploads = [double]$Matches[7]
-            UploadKB = [double]$Matches[8]; Protects = [double]$Matches[9] }
+            UploadKB = [double]$Matches[8]; Protects = [double]$Matches[9]
+            ShadersCompiled = [double]$Matches[10]; PipelinesCompiled = [double]$Matches[11] }
     } elseif ($line -match 'Command processor waits in [\d.]+ s \(count/total\):([^;]*);') {
         $current.FrontendWaits = @{}
         foreach ($m in [regex]::Matches($Matches[1], ' ([a-z]+ [A-Z_ ]+?|[a-z]+ VO label)=(\d+)/([\d.]+)ms')) {
@@ -65,6 +66,11 @@ $withWork = @($play | Where-Object { $_.Work -and $_.Fps -gt 0 })
 foreach ($key in 'Packets', 'Draws', 'Dispatches', 'ImageLookups', 'BufferBinds', 'Uploads', 'UploadKB', 'Protects') {
     if ($withWork.Count -gt 0) {
         Write-Output ('  {0,-17} per frame: {1}' -f $key, (Stat ($withWork | ForEach-Object { $_.Work[$key] / ($_.Fps * 2) })))
+    }
+}
+foreach ($key in 'ShadersCompiled', 'PipelinesCompiled') {
+    if ($withWork.Count -gt 0) {
+        Write-Output ('  {0,-17} total in run: {1}' -f $key, (($withWork | ForEach-Object { $_.Work[$key] } | Measure-Object -Sum).Sum))
     }
 }
 $waitKeys = @($play | Where-Object { $_.FrontendWaits } | ForEach-Object { $_.FrontendWaits.Keys } | Sort-Object -Unique)

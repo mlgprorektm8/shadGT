@@ -359,6 +359,8 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     if (!LoadShaderMeta(ar, *info, spec, perm_idx)) {
         return false;
     }
+    auto& perm_end = stored_perm_end[info->pgm_hash];
+    perm_end = std::max(perm_end, perm_idx + 1);
 
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
