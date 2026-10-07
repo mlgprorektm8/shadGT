@@ -29,6 +29,7 @@ struct WorkCounters {
     std::atomic<u64> protect_bytes{};
     std::atomic<u64> shaders_compiled{};
     std::atomic<u64> pipelines_compiled{};
+    std::atomic<u64> upload_epochs{};
 };
 WorkCounters& GetWorkCounters();
 

@@ -40,6 +40,8 @@ public:
     /// Mark a fully synchronized region as authoritative in the buffer cache.
     void MarkRegionAsGpuModified(VAddr cpu_addr, u64 size) {
         IteratePages<true>(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            // PERF-012: the region was just synchronized, so hot pages can be clean again.
+            manager->UntrackHotPages(offset, size);
             manager->template ChangeRegionState<StateOp::None, StateOp::Set>(offset, size);
         });
     }
@@ -75,6 +77,7 @@ public:
             if (!modified) {
                 manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(offset,
                                                                                         size);
+                manager->NoteCpuWriteFault(offset, size);
             }
             should_flush |= modified;
             manager->Unlock(bounds);

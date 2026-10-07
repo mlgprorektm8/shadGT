@@ -1847,6 +1847,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         if (cpu_path) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
+            VideoCore::BumpUploadEpoch();
             return;
         }
     }
@@ -1872,6 +1873,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             !buffer_cache.HasGpuImageAlias(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
+            VideoCore::BumpUploadEpoch();
             return;
         }
     }

@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <array>
+#include <bit>
+#include <mutex>
 #include <utility>
 
 #include "common/adaptive_mutex.h"
@@ -117,9 +120,17 @@ public:
         if constexpr (locked) {
             mutex.lock();
         }
+        if constexpr (type == Type::CPU && cpu_op == StateOp::Clear) {
+            RefreshUploadEpoch();
+        }
         IterateWords(bounds, [&](u64 index, u64 mask) {
             const u64 base_page = index * PAGES_PER_WORD;
-            const u64 word = state[index] & mask;
+            u64 word = state[index] & mask;
+            if constexpr (type == Type::CPU && cpu_op == StateOp::Clear) {
+                // PERF-012: a hot page uploaded earlier in this epoch is still current.
+                word &= ~(hot[index] & uploaded[index]);
+                uploaded[index] |= hot[index] & word;
+            }
             UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
             IteratePages(word, [&](u64 pages_offset, u64 pages_size) {
                 if (end_page == base_page + pages_offset) {
@@ -170,6 +181,51 @@ public:
         }
     }
 
+    /// PERF-012: counts CPU write faults on pages that were just made writable (lock held);
+    /// a page that keeps faulting becomes hot and stays unprotected.
+    void NoteCpuWriteFault(u64 offset, u64 size) noexcept {
+        const auto [start_word, start_page, end_word, end_page] = GetBounds(offset, size);
+        for (u64 page = start_page; page <= end_page; ++page) {
+            if (write_faults[page] < HotPageFaults && ++write_faults[page] == HotPageFaults) {
+                hot[page / PAGES_PER_WORD] |= 1ULL << (page % PAGES_PER_WORD);
+            }
+        }
+    }
+
+    /// PERF-012: hot pages in the range go back to normal tracking: their CPU-modified state is
+    /// cleared and they are write-protected again. For GPU writes, which need CPU writes to the
+    /// page to fault.
+    void UntrackHotPages(u64 offset, u64 size) {
+        RegionBits write_prot;
+        RegionBits read_prot;
+        auto bounds = GetBounds(offset, size);
+        Bounds watcher_bounds;
+        std::scoped_lock lk{mutex};
+        bool any = false;
+        IterateWords(bounds, [&](u64 index, u64 mask) {
+            const u64 hot_bits = hot[index] & mask;
+            if (hot_bits == 0) {
+                return;
+            }
+            any = true;
+            hot[index] &= ~hot_bits;
+            const u64 prev = cpu[index];
+            cpu[index] &= ~hot_bits;
+            write_prot[index] = (cpu[index] ^ prev) & mask;
+        });
+        if (!any) {
+            return;
+        }
+        for (u64 page = bounds.start_page; page <= bounds.end_page; ++page) {
+            write_faults[page] = 0;
+        }
+        if (GetWatcherBounds<StateOp::Clear, StateOp::None>(bounds, write_prot, read_prot,
+                                                            watcher_bounds)) {
+            tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
+                                                 PageOp::Track, PageOp::None);
+        }
+    }
+
     void Lock(const Bounds& bounds) noexcept {
         mutex.lock();
     }
@@ -182,10 +238,20 @@ private:
     template <StateOp cpu_op, StateOp gpu_op>
     void UpdateStateAndProtection(RegionBits& write_prot, RegionBits& read_prot, u64 index,
                                   u64 mask) {
+        if constexpr (gpu_op == StateOp::Set) {
+            // PERF-012: a GPU write needs CPU writes to the page to fault again.
+            if (const u64 hot_bits = hot[index] & mask; hot_bits != 0) {
+                hot[index] &= ~hot_bits;
+                for (u64 bits = hot_bits; bits != 0; bits &= bits - 1) {
+                    write_faults[index * PAGES_PER_WORD + std::countr_zero(bits)] = 0;
+                }
+            }
+        }
         if constexpr (cpu_op != StateOp::None) {
             const u64 prev = cpu[index];
             if constexpr (cpu_op == StateOp::Clear) {
-                cpu[index] &= ~mask;
+                // PERF-012: hot pages stay CPU-modified and unprotected.
+                cpu[index] &= ~(mask & ~hot[index]);
             } else {
                 cpu[index] |= mask;
             }
@@ -272,6 +338,21 @@ private:
     RegionBits cpu;
     RegionBits gpu;
     LockType mutex;
+
+    // PERF-012: hot pages and their uploads in the current epoch.
+    static constexpr u8 HotPageFaults = 8;
+    RegionBits hot{};
+    RegionBits uploaded{};
+    u32 uploaded_epoch{};
+    std::array<u8, NUM_REGION_PAGES> write_faults{};
+
+    void RefreshUploadEpoch() {
+        const u32 epoch = g_upload_epoch.load(std::memory_order_acquire);
+        if (uploaded_epoch != epoch) {
+            uploaded_epoch = epoch;
+            uploaded.Fill(0ULL);
+        }
+    }
 };
 
 } // namespace VideoCore

@@ -24,6 +24,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/pm4_rewind.h"
 #include "video_core/amdgpu/pm4_type0.h"
+#include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -43,6 +44,8 @@ enum class FrontendWait : u32 { GfxWaitRegMem, GfxVoLabel, GfxMemSemaphore, GfxR
                                 AscWaitRegMem, AscMemSemaphore, AscRewind, Count };
 static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
                                std::chrono::steady_clock::time_point start) {
+    // PERF-012: whoever the queue waited for may have written memory later draws read.
+    VideoCore::BumpUploadEpoch();
     static constexpr std::array<const char*, size_t(FrontendWait::Count)> Names = {
         "gfx WAIT_REG_MEM", "gfx VO label", "gfx MEM_SEMAPHORE", "gfx REWIND",
         "asc WAIT_REG_MEM", "asc MEM_SEMAPHORE", "asc REWIND"};
@@ -890,6 +893,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxWriteData);
                         }
                         std::memcpy(address, write_data->data, data_size);
+                        VideoCore::BumpUploadEpoch();
                     }
                 } else {
                     UNREACHABLE();
@@ -1311,6 +1315,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::AscWriteData);
                 }
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                VideoCore::BumpUploadEpoch();
             } else {
                 UNREACHABLE();
             }
@@ -1466,6 +1471,8 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
 
+    // PERF-012: memory written before this submission must be uploaded again.
+    VideoCore::BumpUploadEpoch();
     auto task = ProcessGraphics(dcb, ccb, original_dcb);
     {
         std::scoped_lock lock{queue.m_access};
@@ -1482,6 +1489,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
+    VideoCore::BumpUploadEpoch();
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};

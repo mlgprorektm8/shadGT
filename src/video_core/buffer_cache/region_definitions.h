@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <atomic>
+#include "common/perf_monitor.h"
+
 #include <array>
 #include <utility>
 
@@ -19,6 +22,17 @@ constexpr u64 HIGHER_PAGE_SIZE = 1ULL << HIGHER_PAGE_BITS;
 constexpr u64 HIGHER_PAGE_MASK = HIGHER_PAGE_SIZE - 1ULL;
 
 constexpr u64 NUM_REGION_PAGES = HIGHER_PAGE_SIZE / BYTES_PER_PAGE;
+
+/// PERF-012: upload epoch. Pages the CPU rewrites all the time ("hot") stay unprotected and are
+/// uploaded at most once per epoch. A new epoch starts whenever guest memory may have changed in
+/// a way later GPU work must see: a new guest submission, the end of a GPU wait on memory the
+/// CPU or another queue writes, and command processor writes to guest memory. Within one epoch
+/// the memory a submitted command buffer reads is stable, as it must be for the real GPU.
+inline std::atomic<u32> g_upload_epoch{1};
+inline void BumpUploadEpoch() {
+    g_upload_epoch.fetch_add(1, std::memory_order_acq_rel);
+    Common::GetWorkCounters().upload_epochs.fetch_add(1, std::memory_order_relaxed);
+}
 constexpr u64 NUM_REGION_WORDS = HIGHER_PAGE_SIZE / BYTES_PER_WORD;
 
 enum class Type : u8 {
