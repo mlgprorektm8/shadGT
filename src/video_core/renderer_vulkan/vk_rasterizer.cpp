@@ -505,13 +505,12 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     // fences to other addresses are signaled immediately as before.
     // Pending GDS readbacks ride along with fences deferred for image readbacks; they do not
     // cause extra deferrals (each deferral adds a submit and a guest wait).
-    // PERF-010: GPU-written pages the CPU faulted on before are read back with this fence;
-    // the fence is deferred so the guest sees the data once the GPU has written it.
-    // Compute-queue fences are deferred only for these: deferring them for image readbacks too
-    // cost more than it saved (PERF-009 v1).
-    const bool hot_pages_recorded = buffer_cache.RecordHotPageReadbacks();
-    const bool readbacks_pending =
-        hot_pages_recorded || (!compute_queue && texture_cache.HasPendingReadbacks());
+    // PERF-010: GPU-written pages the CPU faulted on before are read back with this fence.
+    // They ride along like GDS readbacks: deferring fences for them made races slower
+    // (14-18 FPS vs 20-35), as did deferring compute-queue fences for image readbacks
+    // (PERF-009 v1). Compute-queue fences are only deferred to keep an address's order.
+    buffer_cache.RecordHotPageReadbacks();
+    const bool readbacks_pending = !compute_queue && texture_cache.HasPendingReadbacks();
     bool address_pending;
     {
         std::scoped_lock lk{deferred_fences_mutex};

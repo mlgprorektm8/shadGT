@@ -455,6 +455,8 @@ private:
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
+    void PerfMonitorThread(std::stop_token stoken);
+
 private:
     const Instance& instance;
     Semaphore work_semaphore;
@@ -481,6 +483,7 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+    std::jthread perf_monitor_thread;
 };
 
 } // namespace Vulkan

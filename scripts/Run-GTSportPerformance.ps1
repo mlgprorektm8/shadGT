@@ -128,3 +128,15 @@ try {
     }
     $config | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $configPath -Encoding UTF8
 }
+# Keep every run's log with the build's commit, and print its performance summary.
+if (Test-Path -LiteralPath $log) {
+    $runs = Join-Path $ProfileDirectory 'runs'
+    New-Item -ItemType Directory -Force -Path $runs | Out-Null
+    $commit = (git -C $PSScriptRoot rev-parse --short HEAD 2>$null)
+    if (-not $commit) { $commit = 'unknown' }
+    $runLog = Join-Path $runs "$stamp-$commit.log"
+    Copy-Item -LiteralPath $log -Destination $runLog
+    $summary = & (Join-Path $PSScriptRoot 'Analyze-GTSportRun.ps1') -LogPath $runLog
+    $summary | Set-Content -LiteralPath "$runLog.summary.txt" -Encoding UTF8
+    $summary
+}

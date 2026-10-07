@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/debug.h"
+#include "common/perf_monitor.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -52,6 +53,7 @@ Scheduler::Scheduler(const Instance& instance)
     BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
+    perf_monitor_thread = std::jthread(std::bind_front(&Scheduler::PerfMonitorThread, this));
 }
 
 Scheduler::~Scheduler() {
@@ -284,6 +286,37 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // Apply pending operations
     PopPendingOperations();
+}
+
+void Scheduler::PerfMonitorThread(std::stop_token stoken) {
+    // PERF-DIAG-007: every 2 s, how busy the GPU was (sampled: submitted work not yet complete)
+    // and which threads used the CPU, to tell GPU-bound, CPU-bound and serialized frames apart.
+    Common::SetCurrentThreadName("shadPS4:PerfMonitor");
+    Common::SampleThreadCpuUsage(0);
+    auto window_start = std::chrono::steady_clock::now();
+    u64 samples = 0;
+    u64 busy_samples = 0;
+    u64 window_tick = CurrentTick();
+    while (!stoken.stop_requested()) {
+        std::this_thread::sleep_for(std::chrono::microseconds{500});
+        work_semaphore.Refresh();
+        const u64 submitted = work_semaphore.CurrentTick() - 1;
+        ++samples;
+        busy_samples += work_semaphore.KnownGpuTick() < submitted ? 1 : 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window_start < std::chrono::seconds{2}) {
+            continue;
+        }
+        const u64 tick = work_semaphore.CurrentTick();
+        LOG_WARNING(Render_Vulkan, "Perf monitor {:.1f} s: GPU busy {:.0f}%, {} submits; CPU {}",
+                    std::chrono::duration<double>(now - window_start).count(),
+                    samples ? busy_samples * 100.0 / samples : 0.0, tick - window_tick,
+                    Common::SampleThreadCpuUsage(10));
+        window_start = now;
+        window_tick = tick;
+        samples = 0;
+        busy_samples = 0;
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
