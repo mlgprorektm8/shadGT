@@ -31,8 +31,10 @@ static constexpr u32 ShaderBinaryVersion = 15u;
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
 // Version 13: stored SRT walker code also records flattened source addresses.
 // Version 14: stored specializations no longer include compile-time runtime-info changes.
-static constexpr u32 ShaderMetaVersion = 14u;
-static constexpr u32 PipelineKeyVersion = 8u;
+// 15: shader attribute loads/stores are stored (FIX-012).
+static constexpr u32 ShaderMetaVersion = 15u;
+// 9: rect/quad-list helper shaders built from complete attribute info (FIX-012).
+static constexpr u32 PipelineKeyVersion = 9u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -574,6 +576,10 @@ void Info::Serialize(Serialization::Archive& ar) const {
 
     info.Write(this, sizeof(InfoPersistent));
     info.Write(flattened_ud_buf);
+    // FIX-012: rect/quad-list helper shaders forward the vertex outputs the fragment shader
+    // reads; a preloaded shader without these flags made them forward nothing.
+    info.Write(loads.flags.data(), loads.flags.size());
+    info.Write(stores.flags.data(), stores.flags.size());
     srt_info.Serialize(ar);
 }
 
@@ -582,6 +588,8 @@ bool Info::Deserialize(Serialization::Archive& ar, u64 walker_key) {
 
     info.Read(this, sizeof(Shader::InfoPersistent));
     info.Read(flattened_ud_buf);
+    info.Read(loads.flags.data(), loads.flags.size());
+    info.Read(stores.flags.data(), stores.flags.size());
 
     return srt_info.Deserialize(ar, walker_key);
 }
