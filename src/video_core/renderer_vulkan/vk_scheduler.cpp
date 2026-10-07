@@ -53,6 +53,9 @@ Scheduler::Scheduler(const Instance& instance)
     BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
+}
+
+void Scheduler::StartPerfMonitor() {
     perf_monitor_thread = std::jthread(std::bind_front(&Scheduler::PerfMonitorThread, this));
 }
 
@@ -298,7 +301,7 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
     u64 busy_samples = 0;
     u64 window_tick = CurrentTick();
     while (!stoken.stop_requested()) {
-        std::this_thread::sleep_for(std::chrono::microseconds{500});
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
         work_semaphore.Refresh();
         const u64 submitted = work_semaphore.CurrentTick() - 1;
         ++samples;

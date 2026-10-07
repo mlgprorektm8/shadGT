@@ -437,6 +437,9 @@ public:
     }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
+    /// PERF-DIAG-007: logs GPU busy % and per-thread CPU use every 2 s (one scheduler only).
+    void StartPerfMonitor();
+
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
         {

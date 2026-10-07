@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -49,6 +50,8 @@ std::string ThreadName(HANDLE handle, DWORD tid) {
 } // namespace
 
 std::string SampleThreadCpuUsage(size_t max_threads) {
+    static std::mutex mutex;
+    std::scoped_lock lk{mutex};
     static std::unordered_map<DWORD, ThreadSample> threads;
     static auto last_time = std::chrono::steady_clock::now();
 
@@ -93,7 +96,7 @@ std::string SampleThreadCpuUsage(size_t max_threads) {
         }
         sample.seen = true;
         const u64 cpu = FileTimeTo100ns(kernel) + FileTimeTo100ns(user);
-        if (!inserted && elapsed_100ns > 0.0) {
+        if (!inserted && elapsed_100ns > 0.0 && cpu >= sample.cpu_100ns) {
             const double percent = double(cpu - sample.cpu_100ns) * 100.0 / elapsed_100ns;
             total_percent += percent;
             usages.push_back({percent, entry.th32ThreadID, sample.handle});
