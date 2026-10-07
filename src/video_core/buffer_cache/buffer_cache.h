@@ -117,6 +117,9 @@ public:
         u32 size;
         Vulkan::StagingBufferRef download;
         bool valid = true;
+        /// PERF-011: guest bytes when recorded; a mismatch at completion means the CPU wrote the
+        /// range meanwhile, and its value is kept.
+        std::vector<u8> snapshot;
     };
     void RecordGdsReadback(VAddr address, u32 gds_offset, u32 size);
     [[nodiscard]] bool HasPendingAsyncReadbacks() const {
@@ -143,6 +146,13 @@ public:
 
 private:
     void InvalidateAsyncReadbacks(VAddr address, u64 size);
+    /// PERF-011: handles a CPU write fault on a page with GPU-written bytes that the write does
+    /// not touch, without waiting for the GPU. Returns false when the exact path is needed.
+    bool TrySplitWriteFault(const Buffer* arena, VAddr address, u64 size, VAddr window_start,
+                            VAddr window_end);
+    /// Removes ranges whose read-back value reached guest memory from gpu_modified_ranges
+    /// (GPU thread).
+    void ApplyCompletedReadbacks();
     void LogHotPageStats();
 
     std::mutex async_readbacks_mutex;
@@ -150,6 +160,9 @@ private:
     std::vector<std::shared_ptr<AsyncReadback>> inflight_async_readbacks;
     std::vector<Vulkan::StagingBufferRef> finished_async_downloads;
     std::atomic<u32> num_pending_async_readbacks{};
+    std::vector<std::pair<VAddr, u64>> completed_readback_ranges;
+    std::atomic<u32> num_completed_readback_ranges{};
+    const bool split_write_faults;
 
     static constexpr size_t MaxHotPages = 1024;
     std::unordered_set<VAddr> hot_pages;
@@ -158,6 +171,8 @@ private:
         std::chrono::steady_clock::time_point window_start{};
         u32 faults{};
         u32 page_only_faults{};
+        u32 split_faults{};
+        std::atomic<u32> cpu_overwrote{};
         struct PageFaults {
             u32 faults{};
             u64 last_offset{};
