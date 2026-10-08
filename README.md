@@ -4,7 +4,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
 <h1 align="center">
-  <img src="assets/GranTurismoSportBanner2.webp" width="800" alt="Gran Turismo Sport banner">
+  <img src="assets/GranTurismoSportBanner.png" width="800" alt="Gran Turismo Sport banner">
   <br>
   <b>shadGT</b>
   <br>
