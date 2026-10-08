@@ -12,7 +12,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 </h1>
 
 <h1 align="center">
- <a href="https://discord.gg/bFJxfftGW6">
+ <a href="[https://discord.gg/bFJxfftGW6](https://discord.gg/De94trHtj5)">
         <img src="https://img.shields.io/discord/1080089157554155590?color=5865F2&label=shadGT%20Discord&logo=Discord&logoColor=white" width="275">
  <a href="https://github.com/shadGT-emu/shadGT/releases/latest">
         <img src="https://img.shields.io/github/downloads/shadGT-emu/shadGT/total.svg" width="140">
