@@ -159,6 +159,20 @@ std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(I
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return std::nullopt;
     }
+    // FIX-023: the CPU wrote the image's memory after the GPU drew into it (GT Sport frees these
+    // small render targets back to its heap); the GPU copy is older than guest memory now, and
+    // reading it back overwrote the heap's free-list links. -DisablePerf 33 reads back anyway.
+    static const bool skip_cpu_written = Common::PerfFeatureEnabled(33);
+    if (skip_cpu_written && True(image.flags & ImageFlagBits::Dirty)) {
+        static std::atomic<u32> skipped{};
+        if (const u32 n = ++skipped; n <= 20 || n % 500 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-023: readback {} of image at {:#x}+{:#x} skipped: the CPU wrote that "
+                        "memory after the GPU drew into it",
+                        n, image.info.guest_address, image.info.guest_size);
+        }
+        return std::nullopt;
+    }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     if (download_size == 0 || download_size > image.info.guest_size) {
