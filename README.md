@@ -11,12 +11,6 @@ SPDX-License-Identifier: GPL-2.0-or-later
   <sub>Gran Turismo Sport on PC, built on the shadPS4 emulator</sub>
 </h1>
 
-<p align="center">
-  <a href="https://discord.gg/De94trHtj5">
-    <img src="https://img.shields.io/badge/Discord-shadGT-5865F2?logo=discord&logoColor=white" width="160">
-  </a>
-</p>
-
 # About
 
 shadGT is a fork of the [shadPS4](https://github.com/shadps4-emu/shadPS4) PlayStation 4 emulator
