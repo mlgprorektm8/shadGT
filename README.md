@@ -4,6 +4,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
 <h1 align="center">
+  <img src=".github/shadgt.svg" width="220" alt="shadGT logo">
+  <br>
   <b>shadGT</b>
   <br>
   <sub>Gran Turismo Sport on PC, built on the shadPS4 emulator</sub>

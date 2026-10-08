@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- shadGT logo: original art (an abstract racing helmet in motion), not derived from any
+       Gran Turismo artwork. -->
+  <defs>
+    <radialGradient id="bg" cx="38%" cy="32%" r="78%">
+      <stop offset="0" stop-color="#b3121b"/>
+      <stop offset="0.55" stop-color="#5c070c"/>
+      <stop offset="1" stop-color="#120203"/>
+    </radialGradient>
+    <linearGradient id="shell" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff5a4f"/>
+      <stop offset="0.45" stop-color="#d4141c"/>
+      <stop offset="1" stop-color="#4a0408"/>
+    </linearGradient>
+    <linearGradient id="visor" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#1a1012"/>
+      <stop offset="0.6" stop-color="#050304"/>
+      <stop offset="1" stop-color="#2a0d10"/>
+    </linearGradient>
+    <linearGradient id="glare" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffb199" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#ffd9cc" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#ffb199" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="round">
+      <rect width="512" height="512" rx="96"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#round)">
+    <rect width="512" height="512" fill="url(#bg)"/>
+
+    <!-- faint track lines -->
+    <g stroke="#ff4d4d" stroke-opacity="0.18" stroke-width="2" fill="none">
+      <path d="M-20 140 L540 40"/>
+      <path d="M-20 420 L540 250"/>
+      <path d="M120 -20 L330 540"/>
+    </g>
+
+    <!-- speed streaks -->
+    <g fill="#ff2a2a" transform="translate(0 -40)">
+      <path d="M0 300 L150 282 L150 292 L0 316 Z" opacity="0.55"/>
+      <path d="M0 336 L120 322 L120 330 L0 348 Z" opacity="0.4"/>
+      <path d="M0 266 L170 250 L170 258 L0 278 Z" opacity="0.3"/>
+    </g>
+
+    <g transform="translate(18 -52) scale(0.92)">
+    <!-- helmet shell, leaning forward -->
+    <path d="M150 300
+             C150 190 230 118 330 118
+             C410 118 462 178 462 262
+             C462 318 440 360 404 386
+             L300 392
+             C262 392 228 386 200 372
+             C168 356 150 332 150 300 Z"
+          fill="url(#shell)"/>
+    <!-- chin bar -->
+    <path d="M300 392 L404 386 C392 412 366 428 332 430 L282 430 C270 418 276 400 300 392 Z"
+          fill="#2b0306"/>
+    <!-- visor -->
+    <path d="M236 226
+             C276 196 360 190 452 214
+             C458 240 456 266 448 286
+             C368 272 292 276 226 292
+             C218 268 220 244 236 226 Z"
+          fill="url(#visor)"/>
+    <!-- visor glare -->
+    <path d="M262 232 C318 214 384 212 440 224 L438 236 C380 226 318 228 266 244 Z"
+          fill="url(#glare)"/>
+    <!-- helmet stripe -->
+    <path d="M168 262 C190 176 262 132 336 128 L344 146 C276 152 214 194 192 270 Z"
+          fill="#ffffff" opacity="0.9"/>
+    <path d="M186 284 C204 210 264 166 330 158 L334 170 C276 180 224 220 208 290 Z"
+          fill="#111" opacity="0.65"/>
+    <!-- vent -->
+    <g fill="#1a0204" opacity="0.8">
+      <rect x="380" y="146" width="40" height="7" rx="3.5" transform="rotate(18 400 150)"/>
+      <rect x="388" y="162" width="36" height="7" rx="3.5" transform="rotate(18 406 166)"/>
+    </g>
+    </g>
+    <!-- wordmark -->
+    <text x="256" y="470" text-anchor="middle" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="74" font-weight="800" font-style="italic" letter-spacing="-2" fill="#ffffff">shad<tspan fill="#ff3b30">GT</tspan></text>
+  </g>
+</svg>
