@@ -299,12 +299,14 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(arg_address + offset, stride * max_count, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
+    bound_buffers.emplace_back(buffer, base, stride * max_count, false); // FIX-016
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
     if (count_address != 0) {
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
+        bound_buffers.emplace_back(count_buffer, count_offset, 4, false); // FIX-016
     }
 
     if (!BindResources(pipeline)) {
@@ -402,6 +404,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+    bound_buffers.emplace_back(buffer, base, size, false); // FIX-016
 
     if (!BindResources(pipeline)) {
         return;
@@ -798,6 +801,11 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+        // FIX-016: record the vertex fetch as a read of the range, so a later upload into it
+        // (GT Sport rewrites grass vertex buffers between draws) waits for this draw. Without
+        // it the copy can overwrite the vertices while this draw still reads them, mixing
+        // old and new data (the suspected cause of stretched Nürburgring grass and terrain).
+        bound_buffers.emplace_back(range.buffer, range.offset, size, false);
     }
 
     // Bind vertex buffers
@@ -853,6 +861,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+    bound_buffers.emplace_back(buffer, offset, index_buffer_size, false); // FIX-016
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
 }
