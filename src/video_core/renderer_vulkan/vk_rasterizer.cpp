@@ -1229,7 +1229,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     static std::atomic<u32> grass_dispatches{};
     static const u32 dump_at = [] {
         const char* env = std::getenv("SHADGT_DUMP_GRASS_AT");
-        return env && *env ? u32(std::stoul(env)) : 600u;
+        return env && *env ? u32(std::stoul(env)) : 0u;
     }();
     if (stage.pgm_hash == 0xab6a2d10 && ++grass_dispatches == dump_at) {
         const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "grass-dump";
