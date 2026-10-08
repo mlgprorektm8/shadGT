@@ -195,10 +195,6 @@ struct QuadRectListEmitter : public Sirit::Module {
     /// Emits a passthrough quad tessellation control shader that outputs 4 control points.
     void EmitQuadListTCS() {
         DefineEntry(spv::ExecutionModel::TessellationControl);
-        const Id array_type{TypeArray(int_id, Int(4))};
-        const Id values{ConstantComposite(array_type, Int(1), Int(2), Int(0), Int(3))};
-        const Id indices{AddLocalVariable(TypePointer(spv::StorageClass::Function, array_type),
-                                          spv::StorageClass::Function, values)};
 
         // Set passthrough tessellation factors
         const Id output_float{TypePointer(spv::StorageClass::Output, float_id)};
@@ -213,9 +209,14 @@ struct QuadRectListEmitter : public Sirit::Module {
 
         const Id input_vec4{TypePointer(spv::StorageClass::Input, vec4_id)};
         const Id output_vec4{TypePointer(spv::StorageClass::Output, vec4_id)};
-        const Id func_int{TypePointer(spv::StorageClass::Function, int_id)};
         const Id invocation_id{OpLoad(int_id, gl_invocation_id)};
-        const Id index{OpLoad(int_id, OpAccessChain(func_int, indices, invocation_id))};
+        // Control point i takes input vertex {1, 2, 0, 3}[i]. FIX-013: computed instead of read
+        // from an initialized function-local array. In GT Sport captures (NVIDIA) some patches
+        // got a first control point matching no vertex shader output, stretching grass and
+        // terrain quads across the screen; the array lookup is the suspected cause.
+        const Id rotated{OpSMod(int_id, OpIAdd(int_id, invocation_id, Int(1)), Int(3))};
+        const Id index{
+            OpSelect(int_id, OpIEqual(bool_id, invocation_id, Int(3)), Int(3), rotated)};
 
         // gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
         const Id in_position{OpLoad(vec4_id, OpAccessChain(input_vec4, gl_in, index, Int(0)))};

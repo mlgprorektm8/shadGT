@@ -39,8 +39,11 @@ static constexpr u32 ShaderMetaVersionWithoutAttributeFlags = 14u;
 // 9: rect/quad-list helper shaders built from complete attribute info (FIX-012). Version 8
 // entries still load unless they carry such helper shaders, which may have been built from a
 // shader without flags.
-static constexpr u32 PipelineKeyVersion = 9u;
+// 10: quad-list helper control shaders without the local index array (FIX-013). Entries of
+// versions 8 and 9 still load unless they carry rect/quad-list helper shaders.
+static constexpr u32 PipelineKeyVersion = 10u;
 static constexpr u32 PipelineKeyVersionWithoutAttributeFlags = 8u;
+static constexpr u32 PipelineKeyVersionOldQuadHelpers = 9u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -537,6 +540,7 @@ void PipelineCache::WarmUp() {
             u32 version{};
             pldata.Read(version);
             if (version != Serialization::PipelineKeyVersion &&
+                version != Serialization::PipelineKeyVersionOldQuadHelpers &&
                 version != Serialization::PipelineKeyVersionWithoutAttributeFlags) {
                 ++num_direct;
                 return;
