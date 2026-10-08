@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <string>
 #include <unordered_set>
+#include <fmt/format.h>
+#include <magic_enum/magic_enum.hpp>
 #include "common/logging/classes.h"
 #include "common/perf_monitor.h"
 #include "shader_recompiler/info.h"
@@ -43,6 +46,17 @@ static bool IsDivergentCondition(const IR::U1& condition) {
 // (lane and invocation ids, shuffles, atomics, the bits of a ballot of a per-lane condition) make
 // the loop divergent. Wave-wide reductions (lane reads, ballots) end the search: their result is
 // the same everywhere.
+// Offline inspection (tests/tools): when set, records why conditions are divergent.
+std::string* g_wave64_trace = nullptr;
+
+static bool TraceDivergence(const IR::Inst* inst) {
+    if (g_wave64_trace) {
+        *g_wave64_trace +=
+            fmt::format(" [divergent at {}]", magic_enum::enum_name(inst->GetOpcode()));
+    }
+    return true;
+}
+
 static bool IsDivergentLoopCondition(const IR::U1& condition) {
     if (condition.IsImmediate()) {
         return false;
@@ -70,21 +84,25 @@ static bool IsDivergentLoopCondition(const IR::U1& condition) {
         case IR::Opcode::QuadBroadcast:
         case IR::Opcode::DataAppend:
         case IR::Opcode::DataConsume:
-            return true;
+            return TraceDivergence(inst);
         case IR::Opcode::GetAttributeU32: {
             const auto attribute = inst->Arg(0).Attribute();
             if (attribute == IR::Attribute::LocalInvocationId ||
                 attribute == IR::Attribute::LocalInvocationIndex) {
-                return true;
+                return TraceDivergence(inst);
             }
             break;
         }
         case IR::Opcode::GetExec:
             // EXEC by itself is a per-invocation condition (an EXEC scope).
-            return true;
+            return TraceDivergence(inst);
         case IR::Opcode::ReadLane:
         case IR::Opcode::ReadFirstLane:
         case IR::Opcode::BallotFindLsb:
+            continue;
+        case IR::Opcode::ConditionRef:
+            // Holds a branch condition so passes keep it; the value is its argument.
+            push_args(inst);
             continue;
         case IR::Opcode::InverseBallot:
             // The invocation's bit of a mask: the same in every active invocation only when the
@@ -96,14 +114,14 @@ static bool IsDivergentLoopCondition(const IR::U1& condition) {
             const bool exec_ballot =
                 !arg.IsImmediate() && arg.Inst()->GetOpcode() == IR::Opcode::GetExec;
             if (in_inverse_ballot && !exec_ballot) {
-                return true;
+                return TraceDivergence(inst);
             }
             continue;
         }
         default:
             if (inst->MayHaveSideEffects()) {
                 // Atomics and other memory operations return per-invocation values.
-                return true;
+                return TraceDivergence(inst);
             }
             break;
         }
@@ -122,13 +140,20 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
     // subgroup and produced wrong offsets.
     std::unordered_set<const IR::Block*> divergent_loops;
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
-        if (node.type == Type::Repeat &&
-            (!uniform_loops_enabled || IsDivergentLoopCondition(node.data.repeat.cond))) {
-            divergent_loops.insert(node.data.repeat.merge);
-        } else if (node.type == Type::Break &&
-                   (!uniform_loops_enabled ||
-                    IsDivergentLoopCondition(node.data.break_node.cond))) {
-            divergent_loops.insert(node.data.break_node.merge);
+        if (node.type != Type::Repeat && node.type != Type::Break) {
+            continue;
+        }
+        const bool repeat = node.type == Type::Repeat;
+        if (g_wave64_trace) {
+            *g_wave64_trace += repeat ? "Repeat:" : "Break:";
+        }
+        const IR::U1 cond = repeat ? node.data.repeat.cond : node.data.break_node.cond;
+        const bool divergent = !uniform_loops_enabled || IsDivergentLoopCondition(cond);
+        if (g_wave64_trace) {
+            *g_wave64_trace += divergent ? " divergent;" : " uniform;";
+        }
+        if (divergent) {
+            divergent_loops.insert(repeat ? node.data.repeat.merge : node.data.break_node.merge);
         }
     }
 
@@ -147,9 +172,15 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
         case Type::If: {
             // FIX-020: an if on wave-wide values (lane reads, SCC) is uniform too; the older
             // search followed a lane read's per-lane input and called it divergent.
+            if (g_wave64_trace) {
+                *g_wave64_trace += "If:";
+            }
             const bool divergent = uniform_loops_enabled
                                        ? IsDivergentLoopCondition(node.data.if_node.cond)
                                        : IsDivergentCondition(node.data.if_node.cond);
+            if (g_wave64_trace) {
+                *g_wave64_trace += divergent ? " divergent;" : " uniform;";
+            }
             conditionals.push_back({node.data.if_node.merge, divergent});
             divergence_depth += static_cast<u32>(divergent);
             break;
@@ -224,6 +255,10 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
             } else {
                 LOG_WARNING(Render_Recompiler, "{} instruction in non uniform control flow",
                             inst.GetOpcode());
+                if (g_wave64_trace) {
+                    *g_wave64_trace +=
+                        fmt::format(" NOT LOWERED: {};", magic_enum::enum_name(inst.GetOpcode()));
+                }
             }
         };
         for (IR::Inst& inst : block->Instructions()) {
