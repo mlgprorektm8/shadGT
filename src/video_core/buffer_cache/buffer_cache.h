@@ -162,7 +162,11 @@ public:
 
     /// FIX-017: before a quad-list draw's uploads, compares its vertex pages with the guest
     /// bytes they were last uploaded from and uploads again the ones that changed unnoticed.
-    void RefreshQuadVertexPages(VAddr address, u64 size, u64 vs_hash);
+    void RefreshReadPages(VAddr address, u64 size, u64 shader_hash, bool quad_vertices);
+
+    /// DIAG-030: page states of a range (GPU-written, CPU-modified, hot, changed since its
+    /// upload) and the recorded GPU writers overlapping it.
+    std::string DescribeRange(VAddr address, u64 size);
 
 private:
     void InvalidateAsyncReadbacks(VAddr address, u64 size);
@@ -253,6 +257,8 @@ private:
     void SynchronizeMemoryFromImage(VAddr device_addr, u32 size);
     /// DIAG-028: records the guest bytes of watched pages as they are uploaded.
     void RecordWatchedUploads(VAddr start, VAddr end);
+    /// DIAG-029: the recorded GPU writes overlapping a range.
+    std::string DescribeGpuWriters(VAddr address, u64 size);
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;

@@ -1025,7 +1025,58 @@ void BufferCache::RecordWatchedUploads(VAddr start, VAddr end) {
     }
 }
 
-void BufferCache::RefreshQuadVertexPages(VAddr address, u64 size, u64 vs_hash) {
+std::string BufferCache::DescribeGpuWriters(VAddr address, u64 size) {
+    std::string writers;
+    auto it = large_gpu_writers.upper_bound(address + size);
+    for (u32 n = 0; it != large_gpu_writers.begin() && n < 64; ++n) {
+        --it;
+        const auto& w = it->second;
+        if (w.address + w.size > address && writers.size() < 600) {
+            writers += fmt::format(" [{} {:#x} at {:#x}+{:#x}]", w.kind, w.tag, w.address, w.size);
+        }
+    }
+    for (VAddr page = Common::AlignDown(address, 4_KB);
+         page < address + std::min<u64>(size, 64_MB) && writers.size() < 600; page += 4_KB) {
+        const auto small = small_gpu_writers.find(page);
+        if (small != small_gpu_writers.end()) {
+            const auto& w = small->second;
+            writers += fmt::format(" [{} {:#x} at {:#x}+{:#x}]", w.kind, w.tag, w.address, w.size);
+        }
+    }
+    return writers.empty() ? std::string(" none recorded") : writers;
+}
+
+std::string BufferCache::DescribeRange(VAddr address, u64 size) {
+    constexpr u64 Limit = 256_MB;
+    std::scoped_lock lk{vertex_pages_mutex};
+    u64 pages = 0, gpu = 0, cpu = 0, hot = 0, changed = 0, unwatched = 0, unmapped = 0;
+    for (VAddr page = Common::AlignDown(address, WatchedPageSize);
+         page < address + std::min(size, Limit); page += WatchedPageSize) {
+        ++pages;
+        if (memory->ClampRangeSize(page, WatchedPageSize) < WatchedPageSize) {
+            ++unmapped;
+            continue;
+        }
+        if (memory_tracker->IsRegionGpuModified(page, WatchedPageSize)) {
+            ++gpu;
+            continue;
+        }
+        cpu += memory_tracker->IsRegionCpuModified(page, WatchedPageSize);
+        hot += memory_tracker->IsRegionHot(page, WatchedPageSize);
+        const auto it = vertex_page_hashes.find(page >> WatchedPageBits);
+        if (it == vertex_page_hashes.end()) {
+            ++unwatched;
+        } else if (XXH3_64bits(std::bit_cast<const void*>(page), WatchedPageSize) != it->second) {
+            ++changed;
+        }
+    }
+    return fmt::format("{} pages{}: {} GPU-written, {} CPU-modified, {} hot, {} changed since "
+                       "upload, {} unwatched, {} unmapped; writers:{}",
+                       pages, size > Limit ? " (first 256 MB)" : "", gpu, cpu, hot, changed,
+                       unwatched, unmapped, DescribeGpuWriters(address, size));
+}
+
+void BufferCache::RefreshReadPages(VAddr address, u64 size, u64 shader_hash, bool quad_vertices) {
     // FIX-017: the Nurburgring grass is drawn as quad lists and stretched across the screen.
     // In a capture its vertex pages were never uploaded during the frame, so the GPU drew an
     // older copy. Before the draw's uploads, each vertex page is compared with the guest bytes
@@ -1036,7 +1087,7 @@ void BufferCache::RefreshQuadVertexPages(VAddr address, u64 size, u64 vs_hash) {
     constexpr u64 BigRange = 16_KB;
     std::scoped_lock lk{vertex_pages_mutex};
     auto& stats = vertex_page_stats;
-    if (size >= BigRange) {
+    if (quad_vertices && size >= BigRange) {
         // DIAG-029: where the vertices of large quad-list draws (the grass) come from.
         const u64 count = ++big_quad_draws_logged;
         if (count <= 60 || count % 1000 == 0) {
@@ -1047,30 +1098,11 @@ void BufferCache::RefreshQuadVertexPages(VAddr address, u64 size, u64 vs_hash) {
                 ++pages;
                 gpu_pages += memory_tracker->IsRegionGpuModified(page, WatchedPageSize);
             }
-            std::string writers;
-            auto it = large_gpu_writers.upper_bound(address + size);
-            for (u32 n = 0; it != large_gpu_writers.begin() && n < 64; ++n) {
-                --it;
-                const auto& w = it->second;
-                if (w.address + w.size > address && writers.size() < 600) {
-                    writers +=
-                        fmt::format(" [{} {:#x} at {:#x}+{:#x}]", w.kind, w.tag, w.address, w.size);
-                }
-            }
-            for (VAddr page = Common::AlignDown(address, 4_KB); page < address + size;
-                 page += 4_KB) {
-                const auto small = small_gpu_writers.find(page);
-                if (small != small_gpu_writers.end() && writers.size() < 600) {
-                    const auto& w = small->second;
-                    writers +=
-                        fmt::format(" [{} {:#x} at {:#x}+{:#x}]", w.kind, w.tag, w.address, w.size);
-                }
-            }
             LOG_WARNING(Render_Vulkan,
                         "DIAG-029: quad-list draw {} (vs {:#x}) vertices {:#x}+{:#x}: {} of {} "
                         "pages GPU-written; writers:{}",
-                        count, vs_hash, address, size, gpu_pages, pages,
-                        writers.empty() ? " none recorded" : writers);
+                        count, shader_hash, address, size, gpu_pages, pages,
+                        DescribeGpuWriters(address, size));
         }
     }
     for (VAddr page = Common::AlignDown(address, WatchedPageSize); page < address + size;
@@ -1099,12 +1131,13 @@ void BufferCache::RefreshQuadVertexPages(VAddr address, u64 size, u64 vs_hash) {
             continue;
         }
         ++(hot ? stats.stale_hot : stats.stale_untracked);
-        if (size >= BigRange && stats.big_stale_logged < 60) {
+        if ((!quad_vertices || size >= BigRange) && stats.big_stale_logged < 60) {
             ++stats.big_stale_logged;
             LOG_WARNING(Render_Vulkan,
-                        "FIX-017: quad-list vertex page {:#x} changed since its upload ({}) in "
-                        "vertex range {:#x}+{:#x}",
-                        page, hot ? "hot page" : "untracked", address, size);
+                        "FIX-017: {} page {:#x} of shader {:#x} changed since its upload ({}) in "
+                        "range {:#x}+{:#x}",
+                        quad_vertices ? "quad-list vertex" : "watched input", page, shader_hash,
+                        hot ? "hot page" : "untracked", address, size);
         }
         if (refresh) {
             memory_tracker->ForceUpload(page, WatchedPageSize);
@@ -1114,7 +1147,8 @@ void BufferCache::RefreshQuadVertexPages(VAddr address, u64 size, u64 vs_hash) {
     if (now - vertex_stats_time >= std::chrono::seconds{2}) {
         if (stats.stale_hot + stats.stale_untracked != 0) {
             LOG_WARNING(Render_Vulkan,
-                        "FIX-017: quad-list vertex pages in 2.0 s: {} checked, {} first seen, "
+                        "FIX-017: quad-list vertex and watched input pages in 2.0 s: {} checked, "
+                        "{} first seen, "
                         "{} changed on hot pages, {} changed untracked{}",
                         stats.checked, stats.first_seen, stats.stale_hot, stats.stale_untracked,
                         refresh ? "; uploaded again" : "");

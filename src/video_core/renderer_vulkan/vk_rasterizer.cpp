@@ -861,8 +861,9 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
         if (quad_list) {
-            buffer_cache.RefreshQuadVertexPages(
-                range.base_address, size, pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
+            buffer_cache.RefreshReadPages(range.base_address, size,
+                                          pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
+                                          true);
         }
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
@@ -1188,10 +1189,36 @@ static bool ShouldTraceCrashPage(VAddr address) {
     return n <= 64 || n % 1000 == 0;
 }
 
+// DIAG-030: shaders whose buffer inputs are logged and checked against guest memory. GT Sport's
+// grass compute shader (0xab6a2d10) writes the Nurburgring grass vertices; SHADGT_WATCH_SHADERS
+// (comma separated hashes) replaces the list.
+static bool IsWatchedShader(u64 hash) {
+    static const std::vector<u64> watched = [] {
+        std::vector<u64> hashes{0xab6a2d10};
+        if (const char* env = std::getenv("SHADGT_WATCH_SHADERS"); env && *env) {
+            hashes.clear();
+            std::string list{env};
+            for (size_t start = 0; start < list.size();) {
+                const size_t end = std::min(list.find(',', start), list.size());
+                hashes.push_back(std::stoull(list.substr(start, end - start), nullptr, 16));
+                start = end + 1;
+            }
+        }
+        return hashes;
+    }();
+    return std::ranges::find(watched, hash) != watched.end();
+}
+
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
+    const bool watched = IsWatchedShader(stage.pgm_hash);
+    static std::atomic<u64> watched_binds{};
+    const u64 watched_bind = watched ? ++watched_binds : 0;
+    const bool log_watched = watched && (watched_bind <= 12 || watched_bind % 300 == 0);
+    u32 buffer_index = 0;
     for (const auto& desc : stage.buffers) {
+        ++buffer_index;
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
@@ -1346,6 +1373,18 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                 stage.hw_stage, stage.pgm_hash, u64(vsharp.base_address), size,
                                 vsharp.GetStride(), vsharp.num_records, desc.is_written,
                                 desc.is_formatted);
+                }
+                if (log_watched) {
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-030: shader {:#x} use {} buffer {} {} {:#x}+{:#x} stride {} "
+                                "records {:#x}: {}",
+                                stage.pgm_hash, watched_bind, buffer_index - 1,
+                                desc.is_written ? "write" : "read", u64(vsharp.base_address), size,
+                                vsharp.GetStride(), vsharp.num_records,
+                                buffer_cache.DescribeRange(vsharp.base_address, size));
+                }
+                if (watched && !desc.is_written && size <= 32_MB) {
+                    buffer_cache.RefreshReadPages(vsharp.base_address, size, stage.pgm_hash, false);
                 }
                 VideoCore::g_gpu_write_kind = "shader";
                 VideoCore::g_gpu_write_tag = stage.pgm_hash;
