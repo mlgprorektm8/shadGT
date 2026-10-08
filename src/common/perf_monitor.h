@@ -34,7 +34,6 @@ struct WorkCounters {
     std::atomic<u64> pipelines_compiled{};
     std::atomic<u64> upload_epochs{};
     std::atomic<u64> waits_skipped{};
-    std::atomic<u64> hot_pages_unchanged{};
 };
 WorkCounters& GetWorkCounters();
 

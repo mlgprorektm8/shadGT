@@ -4,14 +4,19 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <immintrin.h>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
 #include "common/perf_monitor.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -32,6 +37,97 @@
 #endif
 
 namespace VideoCore {
+
+namespace {
+// PERF-027: copies guest memory into upload buffers on several cores at once. The command
+// thread hands out 64 KB pieces, copies pieces itself, and returns only when every piece is
+// copied, so the copy finishes at the same point in the command stream as before.
+class ParallelUploadCopier {
+public:
+    struct Piece {
+        VAddr source;
+        u8* destination;
+        u64 size;
+    };
+
+    static ParallelUploadCopier& Instance() {
+        static ParallelUploadCopier copier;
+        return copier;
+    }
+
+    /// The pieces of the next batch, to fill before Run.
+    std::vector<Piece>& BeginBatch() {
+        // A helper that woke up late for the previous batch must be out before it is replaced.
+        while (active.load(std::memory_order_acquire) != 0) {
+            _mm_pause();
+        }
+        pieces.clear();
+        return pieces;
+    }
+
+    void Run(Core::MemoryManager* memory) {
+        memory_manager = memory;
+        next.store(0, std::memory_order_relaxed);
+        done.store(0, std::memory_order_relaxed);
+        {
+            std::scoped_lock lk{mutex};
+            ++generation;
+        }
+        cv.notify_all();
+        CopyPieces();
+        while (done.load(std::memory_order_acquire) != pieces.size()) {
+            _mm_pause();
+        }
+    }
+
+private:
+    ParallelUploadCopier() {
+        const u32 cores = std::max(std::thread::hardware_concurrency(), 4u);
+        const u32 helpers = std::clamp(cores / 4, 1u, 3u);
+        for (u32 i = 0; i < helpers; ++i) {
+            threads.emplace_back([this](std::stop_token stop) { Work(stop); });
+        }
+    }
+
+    void Work(std::stop_token stop) {
+        Common::SetCurrentThreadName("shadGT:UploadCopy");
+        u64 seen = 0;
+        while (true) {
+            {
+                std::unique_lock lk{mutex};
+                cv.wait(lk, stop, [&] { return generation != seen; });
+                if (stop.stop_requested()) {
+                    return;
+                }
+                seen = generation;
+                active.fetch_add(1, std::memory_order_acq_rel);
+            }
+            CopyPieces();
+            active.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
+
+    void CopyPieces() {
+        const size_t count = pieces.size();
+        for (size_t i = next.fetch_add(1, std::memory_order_relaxed); i < count;
+             i = next.fetch_add(1, std::memory_order_relaxed)) {
+            const auto& piece = pieces[i];
+            memory_manager->CopySparseMemory(piece.source, piece.destination, piece.size);
+            done.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+
+    std::vector<Piece> pieces;
+    Core::MemoryManager* memory_manager{};
+    std::atomic<size_t> next{};
+    std::atomic<size_t> done{};
+    std::atomic<u32> active{};
+    u64 generation{};
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::vector<std::jthread> threads;
+};
+} // namespace
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
@@ -865,10 +961,36 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         Common::GetWorkCounters().uploads += copies.size();
         Common::GetWorkCounters().upload_bytes += total_size_bytes;
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
-        for (auto& copy : copies) {
-            memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
-            copy.srcOffset += staging.offset;
-            copy.dstOffset -= arena->cpu_addr;
+        // PERF-027: large uploads are copied on several cores; -DisablePerf 27 copies them on
+        // this thread only.
+        static const bool parallel_copies = Common::PerfFeatureEnabled(27);
+        constexpr u64 ParallelThreshold = 192_KB;
+        constexpr u64 PieceSize = 64_KB;
+        // The copier serves one caller at a time; any other copies on its own thread.
+        static std::mutex copier_mutex;
+        std::unique_lock copier_lock{copier_mutex, std::defer_lock};
+        if (parallel_copies && total_size_bytes >= ParallelThreshold && copier_lock.try_lock()) {
+            auto& copier = ParallelUploadCopier::Instance();
+            auto& pieces = copier.BeginBatch();
+            for (const auto& copy : copies) {
+                for (u64 done_bytes = 0; done_bytes < copy.size; done_bytes += PieceSize) {
+                    pieces.push_back({copy.dstOffset + done_bytes,
+                                      staging.mapped + copy.srcOffset + done_bytes,
+                                      std::min(PieceSize, copy.size - done_bytes)});
+                }
+            }
+            copier.Run(memory);
+            for (auto& copy : copies) {
+                copy.srcOffset += staging.offset;
+                copy.dstOffset -= arena->cpu_addr;
+            }
+        } else {
+            for (auto& copy : copies) {
+                memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset,
+                                         copy.size);
+                copy.srcOffset += staging.offset;
+                copy.dstOffset -= arena->cpu_addr;
+            }
         }
         staging.Flush();
         runtime.CopyBuffer(staging.buffer, arena, copies);
