@@ -41,6 +41,9 @@ public:
 
     void InlineData(VideoCore::Buffer* dst, u64 offset, u32 value);
 
+    /// FIX-019: writes up to 64 KB of dword-aligned data into a buffer in command order.
+    void InlineData(const VideoCore::Buffer* dst, u64 offset, std::span<const u8> data);
+
     bool Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                  std::optional<VideoCore::SubresourceRange> subres_range = {});

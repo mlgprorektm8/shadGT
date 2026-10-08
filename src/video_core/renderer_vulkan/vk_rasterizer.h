@@ -112,6 +112,9 @@ public:
     /// value: the bytes the fence will write, when known when it is processed (PERF-014).
     bool DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& signal,
                           bool compute_queue = false, std::span<const u8> value = {});
+    /// FIX-019: a WRITE_DATA packet whose guest write was deferred also writes the GPU copy of
+    /// the memory now, in command order, as hardware does.
+    void InlineDeferredWrite(VAddr address, std::span<const u8> data);
     /// PERF-014: the dword at address once all deferred fence writes that cover it land.
     std::optional<u32> PendingFenceDword(VAddr address);
     [[nodiscard]] bool HasReadbackFences() const {

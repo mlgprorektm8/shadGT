@@ -661,6 +661,32 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     return true;
 }
 
+void Rasterizer::InlineDeferredWrite(VAddr address, std::span<const u8> data) {
+    // FIX-019: hardware performs WRITE_DATA in command order, so work after it reads the new
+    // value. A deferred write reaches guest memory only after the GPU completes, through the
+    // backing (no write fault, so nothing uploads it), and the GPU copy kept the old value for
+    // every later draw and dispatch: counters and tables reset that way stayed stale.
+    // -DisablePerf 30 restores the old behavior.
+    static const bool enabled = Common::PerfFeatureEnabled(30);
+    constexpr u64 TrackedAddressLimit = 1ULL << VideoCore::MemoryTracker::MAX_CPU_PAGE_BITS;
+    if (!enabled || data.empty() || address % 4 != 0 || data.size() % 4 != 0 ||
+        data.size() > 65536 || address + data.size() > TrackedAddressLimit ||
+        !IsMapped(address, data.size())) {
+        return;
+    }
+    static std::atomic<u64> count{};
+    if (const u64 n = ++count; n <= 40 || n % 1000 == 0) {
+        u32 first = 0;
+        std::memcpy(&first, data.data(), sizeof(first));
+        LOG_INFO(Render_Vulkan,
+                 "FIX-019: deferred WRITE_DATA {} at {:#x}+{:#x} (first dword {:#x}) written to "
+                 "the GPU copy in order; GPU-modified={}",
+                 n, address, data.size(), first,
+                 buffer_cache.IsRegionGpuModified(address, data.size()));
+    }
+    buffer_cache.InlineGuestWrite(address, data);
+}
+
 std::optional<u32> Rasterizer::PendingFenceDword(VAddr address) {
     // PERF-014: GPU work that waits on a fence the command thread has already processed runs
     // after the fenced work in the one Vulkan queue, so a GPU-side wait that the fence's value

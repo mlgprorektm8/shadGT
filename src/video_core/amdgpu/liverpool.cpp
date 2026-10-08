@@ -977,6 +977,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         }
                         std::memcpy(address, write_data->data, data_size);
                         VideoCore::BumpUploadEpoch();
+                    } else {
+                        rasterizer->InlineDeferredWrite(reinterpret_cast<VAddr>(address), value);
                     }
                 } else {
                     UNREACHABLE();

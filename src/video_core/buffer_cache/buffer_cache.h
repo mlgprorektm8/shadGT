@@ -164,6 +164,10 @@ public:
     /// bytes they were last uploaded from and uploads again the ones that changed unnoticed.
     void RefreshReadPages(VAddr address, u64 size, u64 shader_hash, bool quad_vertices);
 
+    /// FIX-019: writes guest bytes into the GPU copy of their memory in command order, without
+    /// changing how the memory is tracked (guest memory receives the same bytes later).
+    void InlineGuestWrite(VAddr address, std::span<const u8> data);
+
     /// DIAG-030: page states of a range (GPU-written, CPU-modified, hot, changed since its
     /// upload) and the recorded GPU writers overlapping it.
     std::string DescribeRange(VAddr address, u64 size);

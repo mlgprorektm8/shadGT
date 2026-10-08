@@ -1025,6 +1025,17 @@ void BufferCache::RecordWatchedUploads(VAddr start, VAddr end) {
     }
 }
 
+void BufferCache::InlineGuestWrite(VAddr address, std::span<const u8> data) {
+    const u64 size = data.size();
+    const u64 first_block = address >> block_shift;
+    const u64 last_block = (address + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    EnsureResident(arena, first_block, last_block);
+    // Pending CPU writes around the bytes first, so they do not later land over them.
+    SynchronizeMemory(arena, address, u32(size), false, false);
+    runtime.InlineData(arena, arena->Offset(address), data);
+}
+
 std::string BufferCache::DescribeGpuWriters(VAddr address, u64 size) {
     std::string writers;
     auto it = large_gpu_writers.upper_bound(address + size);
