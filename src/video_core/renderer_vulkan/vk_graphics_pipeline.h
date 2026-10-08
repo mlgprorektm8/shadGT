@@ -114,6 +114,10 @@ private:
     void BuildDescSetLayout(bool preloading);
 
 public:
+    /// PERF-021: optimized relinks wait until no new pipeline has been needed for a while, so
+    /// they never take cores from pipelines a draw is waiting for.
+    static void NotePipelineMiss();
+
     /// PERF-019: a pipeline built on a worker from copies of the shader infos points at the
     /// cached infos once it is used.
     void SetStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos) {

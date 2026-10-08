@@ -37,7 +37,8 @@ class PipelineCache::PipelineBuildWorkers {
 public:
     PipelineBuildWorkers() {
         const u32 cores = std::max(std::thread::hardware_concurrency(), 4u);
-        const u32 count = std::clamp(cores - 4, 2u, 12u);
+        // PERF-021: all but two cores (the command thread and the game's own main thread).
+        const u32 count = std::clamp(cores - 2, 2u, 14u);
         for (u32 i = 0; i < count; ++i) {
             threads.emplace_back([this](std::stop_token stop) { Work(stop); });
         }
@@ -588,8 +589,31 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
     const auto start = std::chrono::steady_clock::now();
     u32 draws = 0;
     u32 started = 0;
+    u32 evaluated = 0;
+    const bool dedupe = Common::PerfFeatureEnabled(21);
     liverpool->ScanAheadForPipelines([&](const AmdGpu::Regs& regs) {
         ++draws;
+        if (dedupe) {
+            // Everything the pipeline key is built from that the commands can change: graphics
+            // shader registers (programs and user data), context registers (targets, blending,
+            // depth, rasterizer state) and the primitive type.
+            const auto& r = regs.reg_array;
+            constexpr u32 ShGfxRegs = 0x200;
+            constexpr u32 NumContextRegs = 0x400;
+            constexpr u32 PrimitiveRegs = 0x100;
+            u64 hash = XXH3_64bits(&r[AmdGpu::Regs::ShRegWordOffset], ShGfxRegs * sizeof(u32));
+            hash = XXH3_64bits_withSeed(&r[AmdGpu::Regs::ContextRegWordOffset],
+                                        NumContextRegs * sizeof(u32), hash);
+            hash = XXH3_64bits_withSeed(&r[AmdGpu::Regs::UconfigRegWordOffset + 0x200],
+                                        PrimitiveRegs * sizeof(u32), hash);
+            if (!read_ahead_states.insert(hash).second) {
+                return false;
+            }
+            if (read_ahead_states.size() > 1u << 16) {
+                read_ahead_states.clear();
+            }
+        }
+        ++evaluated;
         regs_override = &regs;
         draw_indirect_params = {};
         const bool valid = RefreshGraphicsKey();
@@ -607,17 +631,29 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
         draws_since_scan = 0;
         // Back to the draw being processed.
         draw_indirect_params = params;
-        if (restore) {
+        if (restore && evaluated > 0) {
             RefreshGraphicsKey();
         }
-        LOG_WARNING(Render_Vulkan,
-                    "Pipeline read-ahead: {} draws read in {:.1f} ms, {} builds started, {} "
-                    "pending",
-                    draws,
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                              start)
-                        .count(),
-                    started, pending_builds.size());
+    }
+    // One summary every 2 s instead of a line per read.
+    auto& stats = read_ahead_stats;
+    const auto now = std::chrono::steady_clock::now();
+    ++stats.scans;
+    stats.draws += draws;
+    stats.evaluated += evaluated;
+    stats.started += started;
+    stats.ms += std::chrono::duration<double, std::milli>(now - start).count();
+    if (now - stats.since >= std::chrono::seconds{2}) {
+        if (stats.draws > 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "Pipeline read-ahead in {:.1f} s: {} reads, {} draws read, {} evaluated, "
+                        "{} builds started, {:.1f} ms, {} pending",
+                        std::chrono::duration<double>(now - stats.since).count(), stats.scans,
+                        stats.draws, stats.evaluated, stats.started, stats.ms,
+                        pending_builds.size());
+        }
+        stats = {};
+        stats.since = now;
     }
 }
 
@@ -657,6 +693,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         std::shared_ptr<PipelineBuild> build;
         bool predicted = false;
         last_pipeline_miss = std::chrono::steady_clock::now();
+        GraphicsPipeline::NotePipelineMiss();
         if (const auto pending = pending_builds.find(graphics_key);
             pending != pending_builds.end()) {
             build = pending->second;

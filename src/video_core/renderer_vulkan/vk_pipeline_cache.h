@@ -165,6 +165,17 @@ private:
     const AmdGpu::Regs* regs_override{};
     u32 draws_since_scan{};
     std::chrono::steady_clock::time_point last_pipeline_miss{};
+    /// PERF-021: register states already evaluated by the read-ahead, so reading the same
+    /// commands again (every command buffer start re-reads what follows) costs only a hash.
+    std::unordered_set<u64> read_ahead_states;
+    struct ReadAheadStats {
+        u32 scans{};
+        u32 draws{};
+        u32 evaluated{};
+        u32 started{};
+        double ms{};
+        std::chrono::steady_clock::time_point since{};
+    } read_ahead_stats;
     u32 last_scan_draws{};
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
     // Last member, so the workers stop before anything they use is destroyed.

@@ -38,6 +38,19 @@ static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eCompute,
 };
 
+// PERF-021: time of the last pipeline a draw needed that did not exist yet.
+static std::atomic<s64> last_pipeline_miss_ms{};
+
+static s64 SteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void GraphicsPipeline::NotePipelineMiss() {
+    last_pipeline_miss_ms.store(SteadyMs(), std::memory_order_relaxed);
+}
+
 // PERF-017: workers that link fully optimized pipelines from stage libraries, so the command
 // thread only waits for the fast link.
 class PipelineLinkWorkers {
@@ -708,6 +721,14 @@ GraphicsPipeline::GraphicsPipeline(
         const auto layout = *pipeline_layout;
         PipelineLinkWorkers::Instance().Push(
             [this, device, layout, library_handles, promise, cache = pipeline_cache] {
+                // PERF-021: the fast-linked pipeline renders the same, so the optimized one can
+                // wait until new pipelines stop appearing (the worker only sleeps meanwhile).
+                if (Common::PerfFeatureEnabled(21)) {
+                    while (SteadyMs() - last_pipeline_miss_ms.load(std::memory_order_relaxed) <
+                           3000) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                    }
+                }
                 const vk::PipelineLibraryCreateInfoKHR libraries_info = {
                     .libraryCount = static_cast<u32>(library_handles.size()),
                     .pLibraries = library_handles.data(),
