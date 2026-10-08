@@ -190,9 +190,11 @@ void CFG::SplitDivergenceScopes() {
             const auto& inst = inst_list[index];
             const bool is_close = is_close_scope(inst);
             if ((is_close || index == blk->end_index) && curr_begin != -1) {
-                // If there are no instructions inside scope don't do anything.
+                // If there are no instructions inside scope don't do anything. The closing
+                // instruction can open the next scope (an else after an empty if); keep it.
+                // FIX-018, from upstream shadPS4 c34ca21f.
                 if (index - curr_begin == 1 && is_close) {
-                    curr_begin = -1;
+                    curr_begin = is_open_scope(inst) ? static_cast<s32>(index) : -1;
                     continue;
                 }
                 // If all instructions in the scope ignore exec masking, we shouldn't insert a

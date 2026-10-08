@@ -27,6 +27,11 @@ struct Pools {
     }
 };
 
+/// FIX-018: true when the code has an EXEC scope opened right before an instruction that closes
+/// it and opens the next one (an else after an empty if). Translations made before FIX-018 ran
+/// that next scope with every invocation active.
+[[nodiscard]] bool HasEmptyScopeBeforeElse(std::span<const u32> code);
+
 [[nodiscard]] IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools,
                                            Info& info, RuntimeInfo& runtime_info,
                                            const Profile& profile);

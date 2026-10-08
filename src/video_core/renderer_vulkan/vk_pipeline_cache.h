@@ -6,6 +6,7 @@
 #include <chrono>
 #include <filesystem>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <tsl/robin_map.h>
@@ -144,6 +145,14 @@ private:
     /// PERF-013: per program, one past the highest permutation index in the stored cache, so a
     /// permutation created at runtime never reuses (and overwrites) a stored index.
     tsl::robin_map<size_t, size_t> stored_perm_end;
+    /// FIX-018: programs translated again with the else-scope fix, and the first permutation
+    /// index made with it; stored permutations below it are not preloaded.
+    std::unordered_map<u64, size_t> else_scope_fixed;
+    std::unordered_set<u64> else_scope_checked;
+    std::vector<std::unique_ptr<Program>> retired_programs;
+    std::filesystem::path else_scope_fixed_path;
+    void LoadElseScopeFixed();
+    void SaveElseScopeFixed() const;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};

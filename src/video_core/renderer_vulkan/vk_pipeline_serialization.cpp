@@ -390,6 +390,11 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     }
     auto& perm_end = stored_perm_end[info->pgm_hash];
     perm_end = std::max(perm_end, perm_idx + 1);
+    // FIX-018: translated before the else-scope fix.
+    if (const auto fixed = else_scope_fixed.find(info->pgm_hash);
+        fixed != else_scope_fixed.end() && perm_idx < fixed->second) {
+        return false;
+    }
 
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,

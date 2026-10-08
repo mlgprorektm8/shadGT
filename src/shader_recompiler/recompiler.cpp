@@ -60,6 +60,33 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
     program.post_order_blocks = Shader::IR::PostOrder(program.blocks.front());
 }
 
+bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    const auto writes_exec = [](const GcnInst& inst) {
+        return inst.dst[0].field == OperandField::ExecLo;
+    };
+    // The open and close conditions of CFG::SplitDivergenceScopes.
+    const auto is_open = [&](const GcnInst& inst) {
+        return inst.opcode == Opcode::S_AND_SAVEEXEC_B64 ||
+               (inst.opcode == Opcode::S_ANDN2_B64 && writes_exec(inst)) || inst.IsCmpx();
+    };
+    bool previous_open = false;
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        const bool close_and_open = inst.opcode == Opcode::S_ANDN2_B64 && writes_exec(inst);
+        if (previous_open && close_and_open) {
+            return true;
+        }
+        previous_open = is_open(inst);
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return false;
+}
+
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
                              RuntimeInfo& runtime_info, const Profile& profile) {
     // Ensure first instruction is expected.

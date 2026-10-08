@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -444,6 +445,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     };
     // The driver cache must exist before WarmUp so preloaded pipelines can use it.
     CreateDriverCache();
+    LoadElseScopeFixed();
     WarmUp();
     SaveDriverCache(false);
 }
@@ -1266,6 +1268,32 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+void PipelineCache::LoadElseScopeFixed() {
+    const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+    else_scope_fixed_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                            fmt::format("{}.else-scope-fix", serial);
+    std::ifstream file{else_scope_fixed_path};
+    u64 hash{};
+    size_t boundary{};
+    while (file >> std::hex >> hash >> std::dec >> boundary) {
+        else_scope_fixed[hash] = boundary;
+    }
+    if (!else_scope_fixed.empty()) {
+        LOG_INFO(Render_Vulkan, "FIX-018: {} programs already translated with the else-scope fix",
+                 else_scope_fixed.size());
+    }
+}
+
+void PipelineCache::SaveElseScopeFixed() const {
+    if (else_scope_fixed_path.empty()) {
+        return;
+    }
+    std::ofstream file{else_scope_fixed_path, std::ios::trunc};
+    for (const auto& [hash, boundary] : else_scope_fixed) {
+        file << std::hex << hash << ' ' << std::dec << boundary << '\n';
+    }
+}
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
@@ -1273,6 +1301,27 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>();
+    }
+    // FIX-018: stored permutations of a program with an else after an empty if were translated
+    // with the else running for every invocation. Translate those programs again, once; the new
+    // permutations start after the stored ones, so their pipelines are new as well.
+    if (else_scope_checked.insert(params.hash).second && !else_scope_fixed.contains(params.hash) &&
+        Shader::HasEmptyScopeBeforeElse(params.code)) {
+        auto& boundary = stored_perm_end[params.hash];
+        boundary = std::max(boundary, it_pgm.value()->modules.size());
+        if (boundary != 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-018: translating {}_{:#x} again with the else-scope fix ({} stored "
+                        "permutations)",
+                        hw_stage, params.hash, boundary);
+            else_scope_fixed[params.hash] = boundary;
+            SaveElseScopeFixed();
+            if (!it_pgm.value()->modules.empty()) {
+                // Pipelines already built keep the old modules alive.
+                retired_programs.push_back(std::move(it_pgm.value()));
+                it_pgm.value() = std::make_unique<Program>();
+            }
+        }
     }
 
     auto& program = it_pgm.value();
