@@ -236,6 +236,56 @@ static int Inspect(ICaptureFile* file, const std::filesystem::path& out, int arg
         return 0;
     }
 
+    if (argc > 7 && std::string(argv[3]) == "range-hash") {
+        // Content hash of a buffer range after each listed event (or every action between two
+        // events with "a-b"): range-hash <resource> <offset> <bytes> <event|a-b>...
+        const ResourceId resource = Resource(std::stoull(argv[4]));
+        const uint64_t offset = std::stoull(argv[5]);
+        const uint64_t bytes = std::stoull(argv[6]);
+        std::vector<uint32_t> events;
+        std::vector<const ActionDescription*> all;
+        Flatten(replay->GetRootActions(), all);
+        for (int i = 7; i < argc; ++i) {
+            const std::string arg = argv[i];
+            const auto dash = arg.find('-');
+            if (dash == std::string::npos) {
+                events.push_back(std::stoul(arg));
+                continue;
+            }
+            const uint32_t first = std::stoul(arg.substr(0, dash));
+            const uint32_t last = std::stoul(arg.substr(dash + 1));
+            for (const auto* action : all) {
+                if (action->eventId >= first && action->eventId <= last) {
+                    events.push_back(action->eventId);
+                }
+            }
+        }
+        std::ofstream report(out / "range-hash.txt");
+        uint64_t previous = 0;
+        for (const uint32_t event : events) {
+            replay->SetFrameEvent(event, false);
+            const bytebuf data = replay->GetBufferData(resource, offset, bytes);
+            uint64_t hash = 1469598103934665603ULL;
+            for (const auto byte : data) {
+                hash = (hash ^ byte) * 1099511628211ULL;
+            }
+            const char* name = "";
+            uint32_t flags = 0;
+            for (const auto* action : all) {
+                if (action->eventId == event) {
+                    name = action->customName.c_str();
+                    flags = static_cast<uint32_t>(action->flags);
+                }
+            }
+            report << event << ' ' << std::hex << hash << std::dec << (hash != previous ? " CHANGED" : "")
+                   << " flags=" << std::hex << flags << std::dec << ' ' << name << '\n';
+            report.flush();
+            previous = hash;
+        }
+        replay->Shutdown();
+        return 0;
+    }
+
     if (argc > 7 && std::string(argv[3]) == "buffer-dump") {
         // Raw dwords of a buffer at an event: buffer-dump <event> <resource> <offset> <bytes>.
         replay->SetFrameEvent(std::stoul(argv[4]), false);
