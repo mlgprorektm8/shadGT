@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <string>
+
 #include "common/object_pool.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/program.h"
@@ -31,6 +33,9 @@ struct Pools {
 /// it and opens the next one (an else after an empty if). Translations made before FIX-018 ran
 /// that next scope with every invocation active.
 [[nodiscard]] bool HasEmptyScopeBeforeElse(std::span<const u32> code);
+
+/// DIAG-031: a readable listing of GCN code (pc, opcode, operands, memory offsets).
+[[nodiscard]] std::string ListGcnCode(std::span<const u32> code);
 
 [[nodiscard]] IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools,
                                            Info& info, RuntimeInfo& runtime_info,

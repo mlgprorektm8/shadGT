@@ -45,6 +45,10 @@ class Instance;
 class Scheduler;
 class ShaderCache;
 
+/// DIAG-030: shaders whose inputs are logged (GT Sport's grass compute shaders by default, or
+/// the comma-separated hashes in SHADGT_WATCH_SHADERS).
+bool IsWatchedShader(u64 hash);
+
 struct DrawIndirectParams {
     u16 vertex_sgpr_offset;
     u32 instance_sgpr_offset;

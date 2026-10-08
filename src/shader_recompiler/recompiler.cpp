@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <fmt/format.h>
+#include <magic_enum/magic_enum.hpp>
 #include "common/logging/classes.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -58,6 +60,49 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
         }
     }
     program.post_order_blocks = Shader::IR::PostOrder(program.blocks.front());
+}
+
+std::string ListGcnCode(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    std::string out;
+    u32 pc = 0;
+    const auto operand = [](const InstOperand& op) {
+        return fmt::format("{}:{:#x}", magic_enum::enum_name(op.field), op.code);
+    };
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        out += fmt::format("{:5x}: {}", pc, magic_enum::enum_name(inst.opcode));
+        for (u32 i = 0; i < inst.dst_count; ++i) {
+            out += (i == 0 ? " " : ", ") + operand(inst.dst[i]);
+        }
+        out += " <-";
+        for (u32 i = 0; i < inst.src_count; ++i) {
+            out += (i == 0 ? " " : ", ") + operand(inst.src[i]);
+        }
+        switch (inst.category) {
+        case InstCategory::ScalarMemory:
+            out += fmt::format(" [offset {:#x} imm {} count {}]", inst.control.smrd.offset,
+                               inst.control.smrd.imm, inst.control.smrd.count);
+            break;
+        case InstCategory::VectorMemory:
+            out += fmt::format(" [offset {:#x} offen {} idxen {}]", inst.control.mubuf.offset,
+                               inst.control.mubuf.offen, inst.control.mubuf.idxen);
+            break;
+        case InstCategory::FlowControl:
+            out += fmt::format(" [simm {}]", inst.control.sopp.simm);
+            break;
+        default:
+            break;
+        }
+        out += '\n';
+        pc += inst.length;
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return out;
 }
 
 bool HasEmptyScopeBeforeElse(std::span<const u32> code) {

@@ -1268,6 +1268,24 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+bool IsWatchedShader(u64 hash) {
+    static const std::vector<u64> watched = [] {
+        // The Nurburgring grass: vertex generator, blade generator, and the pass before them.
+        std::vector<u64> hashes{0xab6a2d10, 0xaa3822a3, 0x766d0f18};
+        if (const char* env = std::getenv("SHADGT_WATCH_SHADERS"); env && *env) {
+            hashes.clear();
+            const std::string list{env};
+            for (size_t start = 0; start < list.size();) {
+                const size_t end = std::min(list.find(',', start), list.size());
+                hashes.push_back(std::stoull(list.substr(start, end - start), nullptr, 16));
+                start = end + 1;
+            }
+        }
+        return hashes;
+    }();
+    return std::ranges::find(watched, hash) != watched.end();
+}
+
 void PipelineCache::LoadElseScopeFixed() {
     const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
     else_scope_fixed_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
@@ -1305,7 +1323,18 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     // FIX-018: stored permutations of a program with an else after an empty if were translated
     // with the else running for every invocation. Translate those programs again, once; the new
     // permutations start after the stored ones, so their pipelines are new as well.
-    if (else_scope_checked.insert(params.hash).second && !else_scope_fixed.contains(params.hash) &&
+    const bool first_use = else_scope_checked.insert(params.hash).second;
+    if (first_use && IsWatchedShader(params.hash)) {
+        // DIAG-031: the guest code of watched shaders, raw and as a listing, in the log folder.
+        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+        const auto name = fmt::format("gcn_{:#x}", params.hash);
+        Common::FS::IOFile{dir / (name + ".bin"), Common::FS::FileAccessMode::Create}.WriteSpan(
+            params.code);
+        std::ofstream{dir / (name + ".txt")} << Shader::ListGcnCode(params.code);
+        LOG_WARNING(Render_Vulkan, "DIAG-031: wrote the code of {}_{:#x} ({} dwords) to {}",
+                    hw_stage, params.hash, params.code.size(), (dir / (name + ".txt")).string());
+    }
+    if (first_use && !else_scope_fixed.contains(params.hash) &&
         Shader::HasEmptyScopeBeforeElse(params.code)) {
         auto& boundary = stored_perm_end[params.hash];
         boundary = std::max(boundary, it_pgm.value()->modules.size());

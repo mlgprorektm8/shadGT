@@ -678,11 +678,11 @@ void Rasterizer::InlineDeferredWrite(VAddr address, std::span<const u8> data) {
     if (const u64 n = ++count; n <= 40 || n % 1000 == 0) {
         u32 first = 0;
         std::memcpy(&first, data.data(), sizeof(first));
-        LOG_INFO(Render_Vulkan,
-                 "FIX-019: deferred WRITE_DATA {} at {:#x}+{:#x} (first dword {:#x}) written to "
-                 "the GPU copy in order; GPU-modified={}",
-                 n, address, data.size(), first,
-                 buffer_cache.IsRegionGpuModified(address, data.size()));
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-019: deferred WRITE_DATA {} at {:#x}+{:#x} (first dword {:#x}) written to "
+                    "the GPU copy in order; GPU-modified={}",
+                    n, address, data.size(), first,
+                    buffer_cache.IsRegionGpuModified(address, data.size()));
     }
     buffer_cache.InlineGuestWrite(address, data);
 }
@@ -1215,26 +1215,6 @@ static bool ShouldTraceCrashPage(VAddr address) {
     return n <= 64 || n % 1000 == 0;
 }
 
-// DIAG-030: shaders whose buffer inputs are logged and checked against guest memory. GT Sport's
-// grass compute shader (0xab6a2d10) writes the Nurburgring grass vertices; SHADGT_WATCH_SHADERS
-// (comma separated hashes) replaces the list.
-static bool IsWatchedShader(u64 hash) {
-    static const std::vector<u64> watched = [] {
-        std::vector<u64> hashes{0xab6a2d10};
-        if (const char* env = std::getenv("SHADGT_WATCH_SHADERS"); env && *env) {
-            hashes.clear();
-            std::string list{env};
-            for (size_t start = 0; start < list.size();) {
-                const size_t end = std::min(list.find(',', start), list.size());
-                hashes.push_back(std::stoull(list.substr(start, end - start), nullptr, 16));
-                start = end + 1;
-            }
-        }
-        return hashes;
-    }();
-    return std::ranges::find(watched, hash) != watched.end();
-}
-
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
@@ -1536,6 +1516,36 @@ void Rasterizer::LogInvalidTextureContext(const Shader::Info& stage, u32 sharp_o
     }
 }
 
+// DIAG-031: where each dword of a rejected T# came from: its flat buffer slot, the guest address
+// the SRT walker read it from, that address's value now, and whether the GPU has written it.
+template <typename Fetch>
+static void LogRejectedSharpSource(const Shader::Info& stage, const Fetch& fetch, u32 image,
+                                   VideoCore::BufferCache& buffer_cache) {
+    static std::atomic<u32> logged{};
+    if (++logged > 30) {
+        return;
+    }
+    std::string dwords;
+    for (u32 i = 0; i < fetch.offsets.size(); ++i) {
+        const bool single = fetch.summary == Fetch::Summary::SingleLoad;
+        if (!single && !((fetch.load_mask >> i) & 1)) {
+            dwords += fmt::format(" imm={:08x}", fetch.immediates[i]);
+            continue;
+        }
+        const u32 off = single ? u32(fetch.offsets[0]) + i : u32(fetch.offsets[i]);
+        const u64 src = off < stage.flattened_ud_src.size() ? stage.flattened_ud_src[off] : 0;
+        dwords += fmt::format(" [{}]={:08x}{}", off,
+                              off < stage.flattened_ud_buf.size() ? stage.flattened_ud_buf[off] : 0,
+                              src ? fmt::format("@{:#x} now {:08x} gpu={}", src,
+                                                *reinterpret_cast<const u32*>(src),
+                                                buffer_cache.IsRegionGpuModified(src, 4))
+                                  : std::string(" (user data)"));
+    }
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-031: rejected T# {} of {}_{:#x}: fetch summary {} mask {:#x}:{}", image,
+                stage.hw_stage, stage.pgm_hash, u32(fetch.summary), fetch.load_mask, dwords);
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -1573,6 +1583,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         static_cast<u32>(num_fmt), stage.hw_stage, stage.pgm_hash,
                         image_desc.sharp_fetch.offsets[0]);
             LogInvalidTextureContext(stage, image_desc.sharp_fetch.offsets[0]);
+            LogRejectedSharpSource(stage, image_desc.sharp_fetch, num_images, buffer_cache);
             bind_null_image();
             continue;
         }
