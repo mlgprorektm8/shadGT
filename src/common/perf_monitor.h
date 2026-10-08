@@ -6,6 +6,9 @@
 #include <array>
 #include <atomic>
 #include <string>
+#if defined(_WIN32) || defined(__x86_64__)
+#include <intrin.h>
+#endif
 #include "common/types.h"
 
 namespace Common {
@@ -31,6 +34,7 @@ struct WorkCounters {
     std::atomic<u64> pipelines_compiled{};
     std::atomic<u64> upload_epochs{};
     std::atomic<u64> waits_skipped{};
+    std::atomic<u64> hot_pages_unchanged{};
 };
 WorkCounters& GetWorkCounters();
 
@@ -58,13 +62,24 @@ enum class Phase : u32 {
 };
 std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();
 
+// PERF-026: the draw-step timers run about 14 times per draw, so the counter read and the
+// tick array are inline instead of function calls.
+inline std::array<std::atomic<u64>, size_t(Phase::Count)> g_phase_ticks{};
+
 class PhaseTimer {
 public:
     explicit PhaseTimer(Phase phase_) : phase{phase_}, start{ReadTsc()} {}
     ~PhaseTimer() {
-        GetPhaseTicks()[size_t(phase)].fetch_add(ReadTsc() - start, std::memory_order_relaxed);
+        g_phase_ticks[size_t(phase)].fetch_add(ReadTsc() - start, std::memory_order_relaxed);
     }
-    static u64 ReadTsc();
+    static u64 ReadTsc() {
+#if defined(_WIN32) || defined(__x86_64__)
+        return __rdtsc();
+#else
+        return ReadTscFallback();
+#endif
+    }
+    static u64 ReadTscFallback();
 
 private:
     Phase phase;

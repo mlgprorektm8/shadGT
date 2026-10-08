@@ -129,17 +129,12 @@ std::string SampleThreadCpuUsage(size_t) {
 }
 #endif
 
-u64 PhaseTimer::ReadTsc() {
-#if defined(_WIN32) || defined(__x86_64__)
-    return __rdtsc();
-#else
+u64 PhaseTimer::ReadTscFallback() {
     return std::chrono::steady_clock::now().time_since_epoch().count();
-#endif
 }
 
 std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks() {
-    static std::array<std::atomic<u64>, size_t(Phase::Count)> ticks{};
-    return ticks;
+    return g_phase_ticks;
 }
 
 static std::string TakePhaseTimes() {
@@ -193,13 +188,14 @@ std::string TakeWorkCounters() {
     return fmt::format("{} PM4 packets, {} draws, {} dispatches, {} image lookups, {} buffer "
                        "binds ({} streamed), {} uploads ({} KB), {} protection calls ({} KB), "
                        "{} shaders and {} pipelines compiled, {} upload epochs, {} GPU-side waits "
-                       "ordered behind pending fences",
+                       "ordered behind pending fences, {} unchanged hot pages not uploaded",
                        c.pm4_packets.exchange(0), c.draws.exchange(0), c.dispatches.exchange(0),
                        c.find_image.exchange(0), c.obtain_buffer.exchange(0),
                        c.obtain_stream.exchange(0), c.uploads.exchange(0),
                        c.upload_bytes.exchange(0) / 1024, c.protects.exchange(0),
                        c.protect_bytes.exchange(0) / 1024, c.shaders_compiled.exchange(0),
-                       c.pipelines_compiled.exchange(0), c.upload_epochs.exchange(0), c.waits_skipped.exchange(0)) +
+                       c.pipelines_compiled.exchange(0), c.upload_epochs.exchange(0),
+                       c.waits_skipped.exchange(0), c.hot_pages_unchanged.exchange(0)) +
            ";" + TakePhaseTimes();
 }
 

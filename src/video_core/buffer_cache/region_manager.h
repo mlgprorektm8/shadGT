@@ -5,7 +5,10 @@
 
 #include <array>
 #include <bit>
+#include <cstring>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 
 #include "common/adaptive_mutex.h"
@@ -38,6 +41,7 @@ public:
 
     void SetCpuAddress(VAddr new_cpu_addr) {
         cpu_addr = new_cpu_addr;
+        hot_shadows.clear();
     }
 
     static constexpr Bounds GetBounds(u64 offset, u64 size) {
@@ -129,7 +133,11 @@ public:
             if constexpr (type == Type::CPU && cpu_op == StateOp::Clear) {
                 // PERF-012: a hot page uploaded earlier in this epoch is still current.
                 word &= ~(hot[index] & uploaded[index]);
-                uploaded[index] |= hot[index] & word;
+                const u64 hot_uploads = hot[index] & word;
+                uploaded[index] |= hot_uploads;
+                if (hot_shadows_enabled && hot_uploads != 0) {
+                    word &= ~UnchangedHotPages(base_page, hot_uploads);
+                }
             }
             UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
             IteratePages(word, [&](u64 pages_offset, u64 pages_size) {
@@ -210,6 +218,7 @@ public:
             }
             any = true;
             hot[index] &= ~hot_bits;
+            DropHotShadows(index * PAGES_PER_WORD, hot_bits);
             const u64 prev = cpu[index];
             cpu[index] &= ~hot_bits;
             write_prot[index] = (cpu[index] ^ prev) & mask;
@@ -246,6 +255,7 @@ private:
                 for (u64 bits = hot_bits; bits != 0; bits &= bits - 1) {
                     write_faults[index * PAGES_PER_WORD + std::countr_zero(bits)] = 0;
                 }
+                DropHotShadows(index * PAGES_PER_WORD, hot_bits);
             }
         }
         if constexpr (cpu_op != StateOp::None) {
@@ -347,6 +357,45 @@ private:
     RegionBits uploaded{};
     u32 uploaded_epoch{};
     std::array<u8, NUM_REGION_PAGES> write_faults{};
+
+    // PERF-025: the bytes of each hot page as last uploaded. A hot page the CPU has not changed
+    // since then is current in the buffer (GPU writes end hot tracking, so nothing else changes
+    // it there) and is not uploaded again. The copy is taken before the upload reads the page,
+    // so a CPU write in between only causes one more upload.
+    inline static const bool hot_shadows_enabled = Common::PerfFeatureEnabled(25);
+    std::unordered_map<u64, std::unique_ptr<std::array<u8, BYTES_PER_PAGE>>> hot_shadows;
+
+    u64 UnchangedHotPages(u64 base_page, u64 pages) {
+        u64 unchanged{};
+        for (u64 bits = pages; bits != 0; bits &= bits - 1) {
+            const u64 bit = std::countr_zero(bits);
+            const u64 page = base_page + bit;
+            const auto* guest = reinterpret_cast<const u8*>(cpu_addr + page * BYTES_PER_PAGE);
+            auto& shadow = hot_shadows[page];
+            if (shadow && std::memcmp(shadow->data(), guest, BYTES_PER_PAGE) == 0) {
+                unchanged |= 1ULL << bit;
+                continue;
+            }
+            if (!shadow) {
+                shadow = std::make_unique<std::array<u8, BYTES_PER_PAGE>>();
+            }
+            std::memcpy(shadow->data(), guest, BYTES_PER_PAGE);
+        }
+        if (unchanged != 0) {
+            Common::GetWorkCounters().hot_pages_unchanged.fetch_add(
+                std::popcount(unchanged), std::memory_order_relaxed);
+        }
+        return unchanged;
+    }
+
+    void DropHotShadows(u64 base_page, u64 pages) {
+        if (hot_shadows.empty()) {
+            return;
+        }
+        for (u64 bits = pages; bits != 0; bits &= bits - 1) {
+            hot_shadows.erase(base_page + std::countr_zero(bits));
+        }
+    }
 
     void RefreshUploadEpoch() {
         const u32 epoch = g_upload_epoch.load(std::memory_order_acquire);
