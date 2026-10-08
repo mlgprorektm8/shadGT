@@ -62,19 +62,41 @@ public:
         cv.notify_one();
     }
 
+    /// PERF-024: jobs run only when no other job waits, at low thread priority.
+    void PushBackground(std::function<void()>&& job) {
+        {
+            std::scoped_lock lk{mutex};
+            background.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+
 private:
     void Work(std::stop_token stop) {
         Common::SetCurrentThreadName("shadGT:PipelineBuild");
+        bool low_priority = false;
         while (true) {
             std::function<void()> job;
+            bool is_background = false;
             {
                 std::unique_lock lk{mutex};
-                cv.wait(lk, stop, [this] { return !jobs.empty(); });
+                cv.wait(lk, stop, [this] { return !jobs.empty() || !background.empty(); });
                 if (stop.stop_requested()) {
                     return;
                 }
-                job = std::move(jobs.front());
-                jobs.pop_front();
+                if (!jobs.empty()) {
+                    job = std::move(jobs.front());
+                    jobs.pop_front();
+                } else {
+                    job = std::move(background.front());
+                    background.pop_front();
+                    is_background = true;
+                }
+            }
+            if (is_background != low_priority) {
+                low_priority = is_background;
+                Common::SetCurrentThreadPriority(low_priority ? Common::ThreadPriority::Low
+                                                              : Common::ThreadPriority::Normal);
             }
             job();
         }
@@ -83,6 +105,7 @@ private:
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<std::function<void()>> jobs;
+    std::deque<std::function<void()>> background;
     std::vector<std::jthread> threads;
 };
 
@@ -102,6 +125,14 @@ struct PipelineCache::PipelineBuild {
     std::shared_future<void> done;
     std::chrono::steady_clock::time_point queued;
     bool urgent{};
+    // PERF-024: built from the stored cache (no runtime shader state needed).
+    bool preloading{};
+    // Whoever sets this first builds the pipeline: a worker, or the command thread when a
+    // draw needs it before a worker got to it.
+    std::atomic<bool> started{};
+    bool promoted{};
+    // The cached infos the copies were made from; the pipeline points at them once built.
+    std::array<const Shader::Info*, MaxShaderStages> canonical{};
 };
 
 
@@ -539,10 +570,8 @@ bool PipelineCache::HasSupportedColorTargets() const {
     return true;
 }
 
-std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(bool urgent) {
-    if (!build_workers) {
-        build_workers = std::make_unique<PipelineBuildWorkers>();
-    }
+std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::MakePipelineBuild(
+    bool preloading, const GraphicsPipeline::SerializationSupport& sdata) {
     auto build = std::make_shared<PipelineBuild>();
     build->key = graphics_key;
     for (size_t stage = 0; stage < MaxShaderStages; ++stage) {
@@ -554,24 +583,56 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(
         build->user_data[stage].assign(copy.user_data.begin(), copy.user_data.end());
         copy.user_data = build->user_data[stage];
         build->infos[stage] = &copy;
+        build->canonical[stage] = infos[stage];
     }
     build->runtime_infos = runtime_infos;
     if (fetch_shader) {
         build->fetch = *fetch_shader;
     }
     build->modules = modules;
+    build->sdata = sdata;
+    build->preloading = preloading;
     build->done = build->promise.get_future().share();
     build->queued = std::chrono::steady_clock::now();
+    return build;
+}
+
+void PipelineCache::FinishBuild(PipelineBuild& build) {
+    if (!build.started.exchange(true)) {
+        build.pipeline = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
+            build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules,
+            build.sdata, build.preloading);
+        // The copies were only needed while building; draws use the cached infos.
+        build.pipeline->SetStageInfos(build.canonical);
+        build.info_copies = {};
+        build.user_data = {};
+        build.promise.set_value();
+    }
+    build.done.wait();
+}
+
+void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build,
+                               BuildPriority priority) {
+    if (!build_workers) {
+        build_workers = std::make_unique<PipelineBuildWorkers>();
+    }
+    auto job = [this, build] {
+        if (!build->started.load()) {
+            FinishBuild(*build);
+        }
+    };
+    if (priority == BuildPriority::Background) {
+        build_workers->PushBackground(std::move(job));
+    } else {
+        build_workers->Push(std::move(job), priority == BuildPriority::Urgent);
+    }
+}
+
+std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(bool urgent) {
+    auto build = MakePipelineBuild(false, {});
     build->urgent = urgent;
-    build_workers->Push(
-        [this, build] {
-            build->pipeline = std::make_unique<GraphicsPipeline>(
-                instance, scheduler, desc_heap, profile, build->key, *pipeline_cache,
-                build->infos, build->runtime_infos, build->fetch ? &*build->fetch : nullptr,
-                build->modules, build->sdata, false);
-            build->promise.set_value();
-        },
-        urgent);
+    QueueBuild(build, urgent ? BuildPriority::Urgent : BuildPriority::Normal);
     return build;
 }
 
@@ -628,8 +689,19 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
         draw_indirect_params = {};
         const bool valid = RefreshGraphicsKey();
         regs_override = nullptr;
-        if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(graphics_key) ||
-            pending_builds.contains(graphics_key)) {
+        if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(graphics_key)) {
+            return false;
+        }
+        if (const auto pending = pending_builds.find(graphics_key);
+            pending != pending_builds.end()) {
+            // PERF-024: a stored pipeline not built yet is needed soon; build it next.
+            auto& waiting = pending->second;
+            if (waiting->preloading && !waiting->promoted && !waiting->started.load()) {
+                waiting->promoted = true;
+                QueueBuild(waiting, BuildPriority::Normal);
+                ++started;
+                return true;
+            }
             return false;
         }
         pending_builds.emplace(graphics_key, StartPipelineBuild(false));
@@ -696,16 +768,25 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
-        ++Common::GetWorkCounters().pipelines_compiled;
         // PERF-019: the pipeline may already be building from an earlier read-ahead. If not,
         // it starts building now, and the draws after it are read for more new pipelines to
         // build at the same time on other cores.
         std::shared_ptr<PipelineBuild> build;
         bool predicted = false;
-        last_pipeline_miss = std::chrono::steady_clock::now();
-        GraphicsPipeline::NotePipelineMiss();
-        if (const auto pending = pending_builds.find(graphics_key);
-            pending != pending_builds.end()) {
+        const auto pending = pending_builds.find(graphics_key);
+        // PERF-024: a stored pipeline the background preload already built is no miss.
+        const bool preloaded_ready = pending != pending_builds.end() &&
+                                     pending->second->preloading &&
+                                     pending->second->done.wait_for(std::chrono::seconds{0}) ==
+                                         std::future_status::ready;
+        if (pending == pending_builds.end() || !pending->second->preloading) {
+            ++Common::GetWorkCounters().pipelines_compiled;
+        }
+        if (!preloaded_ready) {
+            last_pipeline_miss = std::chrono::steady_clock::now();
+            GraphicsPipeline::NotePipelineMiss();
+        }
+        if (pending != pending_builds.end()) {
             build = pending->second;
             pending_builds.erase(pending);
             predicted = true;
@@ -723,17 +804,25 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         if (build) {
             const auto wait_start = std::chrono::steady_clock::now();
-            build->done.wait();
+            FinishBuild(*build);
             const auto now = std::chrono::steady_clock::now();
-            LOG_WARNING(Render_Vulkan,
-                        "Pipeline {:#x} {}: built {:.1f} ms after it was queued, draw waited "
-                        "{:.1f} ms",
-                        pipeline_hash, predicted ? "read ahead" : "on demand",
-                        std::chrono::duration<double, std::milli>(now - build->queued).count(),
-                        std::chrono::duration<double, std::milli>(now - wait_start).count());
+            if (!preloaded_ready) {
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Pipeline {:#x} {}: built {:.1f} ms after it was queued, draw waited "
+                    "{:.1f} ms",
+                    pipeline_hash,
+                    build->preloading ? "stored" : (predicted ? "read ahead" : "on demand"),
+                    std::chrono::duration<double, std::milli>(now - build->queued).count(),
+                    std::chrono::duration<double, std::milli>(now - wait_start).count());
+            }
             build->pipeline->SetStageInfos(infos);
             sdata = build->sdata;
             it.value() = std::move(build->pipeline);
+            if (build->preloading) {
+                // Already in the stored cache.
+                return it->second.get();
+            }
         } else {
             it.value() = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,

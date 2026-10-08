@@ -90,6 +90,13 @@ private:
     class PipelineBuildWorkers;
     /// PERF-019: builds the pipeline for the current key on a worker thread.
     std::shared_ptr<PipelineBuild> StartPipelineBuild(bool urgent);
+    /// PERF-024: a build of the current key, infos and modules, queued at a priority.
+    enum class BuildPriority { Urgent, Normal, Background };
+    std::shared_ptr<PipelineBuild> MakePipelineBuild(bool preloading,
+                                                     const GraphicsPipeline::SerializationSupport& sdata);
+    void QueueBuild(const std::shared_ptr<PipelineBuild>& build, BuildPriority priority);
+    /// Builds the pipeline unless a worker already started; returns when it is built.
+    void FinishBuild(PipelineBuild& build);
     /// PERF-019: starts builds for the new pipelines of the draws after the current one.
     void ReadAhead(const DrawIndirectParams params, bool restore = true);
     /// PERF-020: while new pipelines keep appearing, reads each command buffer ahead as soon as
@@ -178,6 +185,8 @@ private:
     } read_ahead_stats;
     u32 last_scan_draws{};
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
+    /// PERF-024: cached pipelines are built by workers after the game has started.
+    bool background_preload{};
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
 };

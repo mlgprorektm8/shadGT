@@ -14,6 +14,7 @@
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3/SDL_video.h>
 
+#include "common/perf_monitor.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -335,6 +336,19 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar, bool has_at
         }
     }
 
+    if (background_preload) {
+        // PERF-024: built by workers while the game runs; a draw that needs it first builds it
+        // itself or waits for the worker already building it.
+        const auto build = MakePipelineBuild(true, sdata);
+        if (pending_builds.try_emplace(graphics_key, build).second) {
+            QueueBuild(build, BuildPriority::Background);
+        }
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        fetch_shader = nullptr;
+        return true;
+    }
+
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
@@ -500,7 +514,10 @@ void PipelineCache::WarmUp() {
 
     const u32 num_workers = std::clamp(std::thread::hardware_concurrency(), 2u, 14u) - 1;
     std::optional<PreloadQueue> queue;
-    if (num_cached > 0) {
+    // PERF-024: only the shader modules are created before the game starts; the pipelines
+    // build in the background. -DisablePerf 24 builds them all first, as before.
+    background_preload = Common::PerfFeatureEnabled(24);
+    if (num_cached > 0 && !background_preload) {
         LOG_INFO(Render, "Precompiling {} cached pipelines on {} threads", num_cached,
                  num_workers);
         queue.emplace(num_workers);
@@ -512,7 +529,7 @@ void PipelineCache::WarmUp() {
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
-            report_progress(num_direct + queue->NumDone(), false);
+            report_progress(queue ? num_direct + queue->NumDone() : num_total_pipelines, false);
 
             Serialization::Archive ar{std::move(data)};
             Serialization::Reader pldata{ar};
@@ -529,14 +546,14 @@ void PipelineCache::WarmUp() {
             pldata.Read(is_compute);
 
             bool result{};
-            const u32 queued_before = queue->NumQueued();
+            const u32 queued_before = queue ? queue->NumQueued() : 0;
             if (is_compute) {
                 result = LoadComputePipeline(ar);
             } else {
                 result = LoadGraphicsPipeline(
                     ar, version == Serialization::PipelineKeyVersion);
             }
-            if (queue->NumQueued() == queued_before) {
+            if (!queue || queue->NumQueued() == queued_before) {
                 ++num_direct;
             }
 
@@ -564,9 +581,15 @@ void PipelineCache::WarmUp() {
         preload_queue = nullptr;
     }
 
+    if (background_preload) {
+        LOG_WARNING(Render, "Building {} stored pipelines in the background ({} queued)",
+                    num_pipelines, pending_builds.size());
+        background_preload = false;
+    }
     if (window) {
         SDL_SetWindowTitle(window, window_title.c_str());
-    }    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    }
+    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
