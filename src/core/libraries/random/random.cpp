@@ -5,6 +5,7 @@
 #include "random_error.h"
 
 #include "common/logging/log.h"
+#include "common/random_bytes.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 
@@ -16,9 +17,7 @@ s32 PS4_SYSV_ABI sceRandomGetRandomNumber(u8* buf, std::size_t size) {
         return SCE_RANDOM_ERROR_INVALID;
     }
 
-    for (auto i = 0; i < size; ++i) {
-        buf[i] = std::rand() & 0xFF;
-    }
+    Common::FillRandomBytes(buf, size);
     return ORBIS_OK;
 }
 

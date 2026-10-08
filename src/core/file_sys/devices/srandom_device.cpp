@@ -5,6 +5,7 @@
 #include <cstring>
 #include <ctime>
 #include "common/logging/log.h"
+#include "common/random_bytes.h"
 #include "core/file_sys/devices/srandom_device.h"
 
 namespace Core::Devices {
@@ -45,10 +46,7 @@ s64 SRandomDevice::lseek(s64 offset, s32 whence) {
 }
 
 s64 SRandomDevice::read(void* buf, u64 nbytes) {
-    auto rbuf = static_cast<s8*>(buf);
-    for (u64 i = 0; i < nbytes; i++) {
-        rbuf[i] = std::rand();
-    }
+    Common::FillRandomBytes(buf, nbytes);
     return nbytes;
 }
 
