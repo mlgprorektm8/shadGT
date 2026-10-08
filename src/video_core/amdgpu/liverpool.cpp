@@ -388,7 +388,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     if (lookahead_outer.empty()) {
         scanned_packets.clear();
     }
-    if (on_command_buffer_start && !dcb.empty()) {
+    // PERF-023: a nested command buffer an earlier read-ahead already read needs no new one.
+    if (on_command_buffer_start && !dcb.empty() &&
+        !(Common::PerfFeatureEnabled(23) && scanned_packets.contains(dcb.data()))) {
         lookahead_dcb = dcb;
         on_command_buffer_start();
     }
@@ -1314,8 +1316,21 @@ void Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on
     } else {
         if (!scan_regs) {
             scan_regs = std::make_unique<Regs>();
+            *scan_regs = regs;
+        } else if (Common::PerfFeatureEnabled(23)) {
+            // PERF-023: copy only the register blocks pipeline state comes from (config,
+            // graphics shader, context and uconfig), about 40 KB instead of all 208 KB.
+            const auto copy = [&](u32 first, u32 num) {
+                std::memcpy(&scan_regs->reg_array[first], &regs.reg_array[first],
+                            num * sizeof(u32));
+            };
+            copy(Regs::ConfigRegWordOffset, Regs::ShRegWordOffset - Regs::ConfigRegWordOffset);
+            copy(Regs::ShRegWordOffset, 0x200);
+            copy(Regs::ContextRegWordOffset, 0x400);
+            copy(Regs::UconfigRegWordOffset, Regs::NumRegs - Regs::UconfigRegWordOffset);
+        } else {
+            *scan_regs = regs;
         }
-        *scan_regs = regs;
         scan_buffer_end = buffer_end;
     }
     // Enough to keep every build worker busy, without reading a whole frame ahead each time.
