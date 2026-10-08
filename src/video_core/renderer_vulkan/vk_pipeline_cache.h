@@ -153,7 +153,7 @@ private:
     /// index made with it; stored permutations below it are not preloaded.
     struct RetranslatedProgram {
         size_t boundary;
-        u32 fixes; ///< 1: FIX-018 else scope, 2: FIX-020 wave64 lane reads in loops
+        u32 fixes; ///< 1: FIX-018 else scope, 2/4: FIX-020 wave64 lane reads (v1/v2)
     };
     std::unordered_map<u64, RetranslatedProgram> else_scope_fixed;
     std::unordered_set<u64> else_scope_checked;

@@ -1350,7 +1350,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
             wg[0] * wg[1] * wg[2] > 32 && Common::PerfFeatureEnabled(31) &&
             Shader::HasLaneReadsAndLoop(params.code)) {
-            needed_fixes |= 2u;
+            needed_fixes |= 4u; // FIX-020 v2 (ifs on lane reads); v1 was 2
         }
     }
     const auto known = else_scope_fixed.find(params.hash);

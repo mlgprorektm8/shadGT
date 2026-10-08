@@ -145,7 +145,11 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case Type::If: {
-            const bool divergent = IsDivergentCondition(node.data.if_node.cond);
+            // FIX-020: an if on wave-wide values (lane reads, SCC) is uniform too; the older
+            // search followed a lane read's per-lane input and called it divergent.
+            const bool divergent = uniform_loops_enabled
+                                       ? IsDivergentLoopCondition(node.data.if_node.cond)
+                                       : IsDivergentCondition(node.data.if_node.cond);
             conditionals.push_back({node.data.if_node.merge, divergent});
             divergence_depth += static_cast<u32>(divergent);
             break;
