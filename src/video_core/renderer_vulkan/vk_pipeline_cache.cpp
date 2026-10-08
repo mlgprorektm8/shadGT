@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <future>
+#include <mutex>
 #include <ranges>
 
 #include "common/perf_monitor.h"
@@ -10,6 +15,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -25,6 +31,78 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
+
+// PERF-019: worker threads that build graphics pipelines ahead of the draws that need them.
+class PipelineCache::PipelineBuildWorkers {
+public:
+    PipelineBuildWorkers() {
+        const u32 cores = std::max(std::thread::hardware_concurrency(), 4u);
+        const u32 count = std::clamp(cores - 4, 2u, 12u);
+        for (u32 i = 0; i < count; ++i) {
+            threads.emplace_back([this](std::stop_token stop) { Work(stop); });
+        }
+    }
+    ~PipelineBuildWorkers() {
+        for (auto& thread : threads) {
+            thread.request_stop();
+        }
+        cv.notify_all();
+    }
+
+    void Push(std::function<void()>&& job, bool urgent) {
+        {
+            std::scoped_lock lk{mutex};
+            if (urgent) {
+                jobs.push_front(std::move(job));
+            } else {
+                jobs.push_back(std::move(job));
+            }
+        }
+        cv.notify_one();
+    }
+
+private:
+    void Work(std::stop_token stop) {
+        Common::SetCurrentThreadName("shadPS4:PipelineBuild");
+        while (true) {
+            std::function<void()> job;
+            {
+                std::unique_lock lk{mutex};
+                cv.wait(lk, stop, [this] { return !jobs.empty(); });
+                if (stop.stop_requested()) {
+                    return;
+                }
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            job();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::deque<std::function<void()>> jobs;
+    std::vector<std::jthread> threads;
+};
+
+// PERF-019: what a worker needs to build one graphics pipeline. The shader infos are copied
+// (with their user data) because the command thread keeps changing the cached ones.
+struct PipelineCache::PipelineBuild {
+    GraphicsPipelineKey key{};
+    std::array<Shader::Info, MaxShaderStages> info_copies{};
+    std::array<std::vector<u32>, MaxShaderStages> user_data{};
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::optional<Shader::Gcn::FetchShaderData> fetch;
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    GraphicsPipeline::SerializationSupport sdata{};
+    std::unique_ptr<GraphicsPipeline> pipeline;
+    std::promise<void> promise;
+    std::shared_future<void> done;
+    std::chrono::steady_clock::time_point queued;
+    bool urgent{};
+};
+
 
 using Shader::HwStage;
 using Shader::Output;
@@ -93,7 +171,7 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
 
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = runtime_infos[u32(l_stage)];
-    const auto& regs = liverpool->regs;
+    const auto& regs = Regs();
     const auto BuildCommon = [&](const auto& program) {
         info.props.num_user_data = program.settings.num_user_regs;
         info.props.num_input_vgprs = program.settings.vgpr_comp_cnt;
@@ -435,8 +513,99 @@ void PipelineCache::MaybeSaveDriverCache() {
     }
 }
 
+const AmdGpu::Regs& PipelineCache::Regs() const {
+    return regs_override ? *regs_override : liverpool->regs;
+}
+
+bool PipelineCache::HasSupportedColorTargets() const {
+    if (graphics_key.num_color_attachments > AmdGpu::NUM_COLOR_BUFFERS) {
+        return false;
+    }
+    for (u32 cb = 0; cb < graphics_key.num_color_attachments; ++cb) {
+        const auto& color_buffer = graphics_key.color_buffers[cb];
+        if (color_buffer.data_format != AmdGpu::DataFormat::FormatInvalid &&
+            Vulkan::LiverpoolToVK::TrySurfaceFormat(
+                color_buffer.data_format, color_buffer.num_format) == vk::Format::eUndefined) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(bool urgent) {
+    if (!build_workers) {
+        build_workers = std::make_unique<PipelineBuildWorkers>();
+    }
+    auto build = std::make_shared<PipelineBuild>();
+    build->key = graphics_key;
+    for (size_t stage = 0; stage < MaxShaderStages; ++stage) {
+        if (!infos[stage]) {
+            continue;
+        }
+        auto& copy = build->info_copies[stage];
+        copy = *infos[stage];
+        build->user_data[stage].assign(copy.user_data.begin(), copy.user_data.end());
+        copy.user_data = build->user_data[stage];
+        build->infos[stage] = &copy;
+    }
+    build->runtime_infos = runtime_infos;
+    if (fetch_shader) {
+        build->fetch = *fetch_shader;
+    }
+    build->modules = modules;
+    build->done = build->promise.get_future().share();
+    build->queued = std::chrono::steady_clock::now();
+    build->urgent = urgent;
+    build_workers->Push(
+        [this, build] {
+            build->pipeline = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, build->key, *pipeline_cache,
+                build->infos, build->runtime_infos, build->fetch ? &*build->fetch : nullptr,
+                build->modules, build->sdata, false);
+            build->promise.set_value();
+        },
+        urgent);
+    return build;
+}
+
+void PipelineCache::ReadAhead(const DrawIndirectParams params) {
+    const auto start = std::chrono::steady_clock::now();
+    u32 draws = 0;
+    u32 started = 0;
+    liverpool->ScanAheadForPipelines([&](const AmdGpu::Regs& regs) {
+        ++draws;
+        regs_override = &regs;
+        draw_indirect_params = {};
+        const bool valid = RefreshGraphicsKey();
+        regs_override = nullptr;
+        if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(graphics_key) ||
+            pending_builds.contains(graphics_key)) {
+            return false;
+        }
+        pending_builds.emplace(graphics_key, StartPipelineBuild(false));
+        ++started;
+        return true;
+    });
+    if (draws > 0) {
+        last_scan_draws = draws;
+        draws_since_scan = 0;
+        // Back to the draw being processed.
+        draw_indirect_params = params;
+        RefreshGraphicsKey();
+        LOG_WARNING(Render_Vulkan,
+                    "Pipeline read-ahead: {} draws read in {:.1f} ms, {} builds started, {} "
+                    "pending",
+                    draws,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                              start)
+                        .count(),
+                    started, pending_builds.size());
+    }
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
+    ++draws_since_scan;
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
@@ -464,9 +633,46 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 
         GraphicsPipeline::SerializationSupport sdata{};
         ++Common::GetWorkCounters().pipelines_compiled;
-        it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+        // PERF-019: the pipeline may already be building from an earlier read-ahead. If not,
+        // it starts building now, and the draws after it are read for more new pipelines to
+        // build at the same time on other cores.
+        std::shared_ptr<PipelineBuild> build;
+        bool predicted = false;
+        if (const auto pending = pending_builds.find(graphics_key);
+            pending != pending_builds.end()) {
+            build = pending->second;
+            pending_builds.erase(pending);
+            predicted = true;
+            if (Common::PerfFeatureEnabled(19) && draws_since_scan >= last_scan_draws) {
+                // Past the last read-ahead: keep reading from where it stopped.
+                const auto key = graphics_key;
+                ReadAhead(params);
+                ASSERT_MSG(graphics_key == key, "Read-ahead changed the current pipeline key");
+            }
+        } else if (Common::PerfFeatureEnabled(19)) {
+            const auto key = graphics_key;
+            build = StartPipelineBuild(true);
+            ReadAhead(params);
+            ASSERT_MSG(graphics_key == key, "Read-ahead changed the current pipeline key");
+        }
+        if (build) {
+            const auto wait_start = std::chrono::steady_clock::now();
+            build->done.wait();
+            const auto now = std::chrono::steady_clock::now();
+            LOG_WARNING(Render_Vulkan,
+                        "Pipeline {:#x} {}: built {:.1f} ms after it was queued, draw waited "
+                        "{:.1f} ms",
+                        pipeline_hash, predicted ? "read ahead" : "on demand",
+                        std::chrono::duration<double, std::milli>(now - build->queued).count(),
+                        std::chrono::duration<double, std::milli>(now - wait_start).count());
+            build->pipeline->SetStageInfos(infos);
+            sdata = build->sdata;
+            it.value() = std::move(build->pipeline);
+        } else {
+            it.value() = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+                runtime_infos, fetch_shader, modules, sdata, false);
+        }
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -512,7 +718,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 
 void PipelineCache::RefreshSwizzledBlend(u32 cb, Shader::PsColorBuffer& color_buffer,
                                          const AmdGpu::BlendControl& bc) {
-    const auto& regs = liverpool->regs;
+    const auto& regs = Regs();
     // Dual-source blending needs attachment 0 as the only written color target. Hardware writes
     // another MRT only when it is bound, unmasked, and has a shader export format.
     const auto writes_other_mrt = [&] {
@@ -592,7 +798,7 @@ void PipelineCache::RefreshSwizzledBlend(u32 cb, Shader::PsColorBuffer& color_bu
 
 bool PipelineCache::RefreshGraphicsKey() {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
-    const auto& regs = liverpool->regs;
+    const auto& regs = Regs();
     auto& key = graphics_key;
 
     const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
@@ -706,7 +912,7 @@ bool PipelineCache::RefreshGraphicsKey() {
 }
 
 bool PipelineCache::RefreshGraphicsStages() {
-    const auto& regs = liverpool->regs;
+    const auto& regs = Regs();
     auto& key = graphics_key;
     fetch_shader = nullptr;
 
@@ -979,7 +1185,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 }
 
 bool PipelineCache::IsTessEmulatedDraw() const {
-    const auto prim = liverpool->regs.primitive_type;
+    const auto prim = Regs().primitive_type;
     return prim == AmdGpu::PrimitiveType::RectList || prim == AmdGpu::PrimitiveType::QuadList;
 }
 

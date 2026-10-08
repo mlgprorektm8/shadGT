@@ -8,6 +8,8 @@
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -185,6 +187,12 @@ public:
         return mapped_queues[curr_qid].cs_state;
     }
 
+    /// PERF-019: reads the graphics commands after the current packet without executing them,
+    /// tracking register writes in a copy of the registers, and calls on_draw with that copy at
+    /// each draw. on_draw returns true when it started a pipeline build. A later call for the
+    /// same command buffer continues where the previous one stopped.
+    void ScanAheadForPipelines(const std::function<bool(const Regs&)>& on_draw);
+
     struct AscQueueInfo {
         static constexpr size_t Pm4BufferSize = 1024;
         VAddr map_addr;
@@ -238,6 +246,17 @@ private:
         using Handle = std::coroutine_handle<promise_type>;
         Handle handle;
     };
+
+    // PERF-019 read-ahead state: the commands after the packet being processed (and those of
+    // the command buffers that called into it), and the scan position with its registers.
+    std::span<const u32> lookahead_dcb{};
+    std::vector<std::span<const u32>> lookahead_outer;
+    std::unique_ptr<Regs> scan_regs;
+    const u32* scan_buffer_end{};
+    const u32* scan_resume{};
+    bool scan_finished{};
+    bool ScanPackets(std::span<const u32> dcb, const std::function<bool(const Regs&)>& on_draw,
+                     u32 depth, u32& draws_left, u32& builds_left, const u32** stopped_at);
 
     std::array<ConstDumpRecord, 256> recent_const_dumps{};
     u64 const_dump_sequence{};

@@ -26,7 +26,8 @@ struct std::hash<vk::ShaderModule> {
 };
 
 namespace AmdGpu {
-class Liverpool;
+struct Liverpool;
+union Regs;
 }
 
 namespace Serialization {
@@ -81,6 +82,16 @@ public:
 
 private:
     bool RefreshGraphicsKey();
+    /// Registers the pipeline keys are built from: the current ones, or during read-ahead the
+    /// registers at an upcoming draw (PERF-019).
+    const AmdGpu::Regs& Regs() const;
+    bool HasSupportedColorTargets() const;
+    struct PipelineBuild;
+    class PipelineBuildWorkers;
+    /// PERF-019: builds the pipeline for the current key on a worker thread.
+    std::shared_ptr<PipelineBuild> StartPipelineBuild(bool urgent);
+    /// PERF-019: starts builds for the new pipelines of the draws after the current one.
+    void ReadAhead(const DrawIndirectParams params);
     /// Selects swizzled-alpha blend emulation for a lane-dependent blend, or reports it once.
     void RefreshSwizzledBlend(u32 cb, Shader::PsColorBuffer& color_buffer,
                               const AmdGpu::BlendControl& bc);
@@ -146,6 +157,14 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    // PERF-019: pipelines being built ahead of their draws.
+    const AmdGpu::Regs* regs_override{};
+    u32 draws_since_scan{};
+    u32 last_scan_draws{};
+    tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
+    // Last member, so the workers stop before anything they use is destroyed.
+    std::unique_ptr<PipelineBuildWorkers> build_workers;
 };
 
 } // namespace Vulkan

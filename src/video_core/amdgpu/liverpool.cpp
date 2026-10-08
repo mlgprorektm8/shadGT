@@ -382,6 +382,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     cblock.Reset();
+    // PERF-019: a command buffer can be reused with other contents; never continue an earlier
+    // read-ahead into this one.
+    scan_buffer_end = nullptr;
 
     // TODO: potentially, ASCs also can depend on CE and in this case the
     // CE task should be moved into more global scope
@@ -445,6 +448,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
             ++Common::GetWorkCounters().pm4_packets;
+            lookahead_dcb = dcb.size() > count + 1 ? dcb.subspan(count + 1) : std::span<const u32>{};
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1096,6 +1100,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 RecordCmdBuffer(indirect_buffer->Address<const u32>(),
                                 u64(indirect_buffer->ib_size) * sizeof(u32), true);
+                lookahead_outer.push_back(lookahead_dcb);
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
                 RESUME_GFX(task);
@@ -1104,6 +1109,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                lookahead_outer.pop_back();
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -1170,6 +1176,149 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     FIBER_EXIT;
+}
+
+bool Liverpool::ScanPackets(std::span<const u32> dcb,
+                            const std::function<bool(const Regs&)>& on_draw, u32 depth,
+                            u32& draws_left, u32& builds_left, const u32** stopped_at) {
+    auto& shadow = *scan_regs;
+    const auto set_regs = [&](u32 first, const u32* values, u32 num) {
+        if (first + num <= shadow.reg_array.size()) {
+            std::memcpy(&shadow.reg_array[first], values, num * sizeof(u32));
+        }
+    };
+    while (!dcb.empty()) {
+        if (draws_left == 0 || builds_left == 0) {
+            if (stopped_at) {
+                *stopped_at = dcb.data();
+            }
+            return false;
+        }
+        const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
+        const u32 type = header->type;
+        if (type == 0) {
+            const auto write = DecodeType0RegisterWrite(dcb, shadow.reg_array.size());
+            if (!write) {
+                return true;
+            }
+            set_regs(write->first_register, write->values.data(),
+                     static_cast<u32>(write->values.size()));
+            dcb = dcb.subspan(std::min<size_t>(dcb.size(), write->values.size() + 1));
+            continue;
+        }
+        if (type == 2) {
+            dcb = dcb.subspan(1);
+            continue;
+        }
+        if (type != 3) {
+            // Not a command stream (or past its end); stop reading ahead.
+            return true;
+        }
+        const u32 count = header->type3.NumWords();
+        if (count + 1 > dcb.size()) {
+            return true;
+        }
+        const auto* payload = reinterpret_cast<const u32*>(header + 2);
+        const u32 num_values = count > 0 ? count - 1 : 0;
+        switch (header->type3.opcode) {
+        case PM4ItOpcode::ClearState:
+            shadow.SetDefaults();
+            break;
+        case PM4ItOpcode::SetConfigReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            set_regs(Regs::ConfigRegWordOffset + set_data->reg_offset, payload, num_values);
+            break;
+        }
+        case PM4ItOpcode::SetContextReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            set_regs(Regs::ContextRegWordOffset + set_data->reg_offset, payload, num_values);
+            break;
+        }
+        case PM4ItOpcode::SetShReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            // Compute shader registers are kept apart from the graphics state.
+            if (set_data->reg_offset < 0x200 ||
+                set_data->reg_offset > 0x200 + sizeof(ComputeProgram) / 4) {
+                set_regs(Regs::ShRegWordOffset + set_data->reg_offset, payload, num_values);
+            }
+            break;
+        }
+        case PM4ItOpcode::SetUconfigReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            set_regs(Regs::UconfigRegWordOffset + set_data->reg_offset, payload, num_values);
+            break;
+        }
+        case PM4ItOpcode::IndexType:
+            shadow.index_buffer_type.raw =
+                reinterpret_cast<const PM4CmdDrawIndexType*>(header)->raw;
+            break;
+        case PM4ItOpcode::NumInstances:
+            shadow.num_instances.num_instances =
+                reinterpret_cast<const PM4CmdDrawNumInstances*>(header)->num_instances;
+            break;
+        case PM4ItOpcode::DrawIndex2:
+        case PM4ItOpcode::DrawIndexOffset2:
+        case PM4ItOpcode::DrawIndexAuto:
+        case PM4ItOpcode::DrawIndirect:
+        case PM4ItOpcode::DrawIndirectMulti:
+        case PM4ItOpcode::DrawIndexIndirect:
+        case PM4ItOpcode::DrawIndexIndirectMulti:
+        case PM4ItOpcode::DrawIndexIndirectCountMulti:
+            --draws_left;
+            if (on_draw(shadow)) {
+                --builds_left;
+            }
+            break;
+        case PM4ItOpcode::IndirectBuffer: {
+            const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            const auto* ib = indirect_buffer->Address<const u32>();
+            const u32 ib_size = indirect_buffer->ib_size;
+            if (depth < 4 && ib && ib_size > 0 && ib_size < (1u << 22)) {
+                ScanPackets({ib, ib_size}, on_draw, depth + 1, draws_left, builds_left, nullptr);
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        dcb = dcb.subspan(count + 1);
+    }
+    return true;
+}
+
+void Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on_draw) {
+    if (lookahead_dcb.empty()) {
+        return;
+    }
+    const u32* buffer_end = lookahead_dcb.data() + lookahead_dcb.size();
+    std::span<const u32> start = lookahead_dcb;
+    if (scan_regs && scan_buffer_end == buffer_end && scan_resume &&
+        scan_resume >= lookahead_dcb.data() && scan_resume <= buffer_end) {
+        // An earlier scan of this command buffer got past this point; continue it with the
+        // registers it had there.
+        if (scan_finished) {
+            return;
+        }
+        start = {scan_resume, buffer_end};
+    } else {
+        if (!scan_regs) {
+            scan_regs = std::make_unique<Regs>();
+        }
+        *scan_regs = regs;
+        scan_buffer_end = buffer_end;
+    }
+    // Enough to keep every build worker busy, without reading a whole frame ahead each time.
+    u32 draws_left = 2048;
+    u32 builds_left = 48;
+    const u32* stopped_at = nullptr;
+    scan_finished = ScanPackets(start, on_draw, 0, draws_left, builds_left, &stopped_at);
+    // The command buffers this one was called from continue after it.
+    for (auto it = lookahead_outer.rbegin(); scan_finished && it != lookahead_outer.rend(); ++it) {
+        if (!it->empty()) {
+            ScanPackets(*it, on_draw, 0, draws_left, builds_left, nullptr);
+        }
+    }
+    scan_resume = scan_finished ? buffer_end : stopped_at;
 }
 
 template <bool is_indirect>

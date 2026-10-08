@@ -113,6 +113,13 @@ public:
 private:
     void BuildDescSetLayout(bool preloading);
 
+public:
+    /// PERF-019: a pipeline built on a worker from copies of the shader infos points at the
+    /// cached infos once it is used.
+    void SetStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos) {
+        std::ranges::copy(infos, stages.begin());
+    }
+
 private:
     /// PERF-017: stage libraries of a runtime pipeline and the optimized link built from them.
     struct LibraryLink {
