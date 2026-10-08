@@ -14,7 +14,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 # About
 
 shadGT is a fork of the [shadPS4](https://github.com/shadps4-emu/shadPS4) PlayStation 4 emulator
-focused on one game: **Gran Turismo Sport** (CUSA03220, update 1.69), on **Windows**. The goal is
+specifically for **Gran Turismo Sport** (CUSA03220, update 1.69), on **Windows**. The goal is
 for the game to run its normal code paths, render correctly and play smoothly, without graphical
 hacks.
 
@@ -31,8 +31,7 @@ What shadGT adds on top of shadPS4:
 Test results and the current baseline are in [GT_SPORT_BASELINE.md](GT_SPORT_BASELINE.md); every
 change and its measurements are in [GT_SPORT_OPTIMIZATION_LOG.md](GT_SPORT_OPTIMIZATION_LOG.md).
 
-> [!IMPORTANT]
-> shadGT is tested with GT Sport only. Other games may run as they do on shadPS4, or not at all.
+
 
 # Getting started
 

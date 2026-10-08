@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <cstdint>
 #include <string>
 #include <discord_rpc.h>
 
@@ -15,7 +14,6 @@ enum class RPCStatus {
 };
 
 class RPC {
-    std::uint64_t startTimestamp;
     bool rpcEnabled = false;
     RPCStatus status;
 

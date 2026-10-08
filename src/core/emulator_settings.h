@@ -195,7 +195,7 @@ struct GeneralSettings {
     Setting<std::string> trophy_notification_side{"right"};
     Setting<bool> show_splash{false};
     Setting<bool> connected_to_network{false};
-    Setting<bool> discord_rpc_enabled{false};
+    Setting<bool> discord_rpc_enabled{true};
     Setting<bool> show_fps_counter{false};
     Setting<int> console_language{1};
     Setting<int> big_picture_scale{1000};

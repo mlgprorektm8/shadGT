@@ -1,43 +1,30 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstring>
-#include <ctime>
 #include "discord_rpc_handler.h"
 
 namespace DiscordRPCHandler {
 
 void RPC::init() {
     DiscordEventHandlers handlers{};
-
-    Discord_Initialize("1139939140494971051", &handlers, 1, nullptr);
-    startTimestamp = time(nullptr);
+    Discord_Initialize("1557422166931275906", &handlers, 1, nullptr);
     rpcEnabled = true;
 }
 
 void RPC::setStatusIdling() {
     DiscordRichPresence rpc{};
-    rpc.largeImageKey = "https://cdn.jsdelivr.net/gh/shadps4-emu/shadPS4@main/.github/shadps4.png";
-    rpc.largeImageText = "shadGT: Gran Turismo Sport on shadPS4";
-    rpc.startTimestamp = startTimestamp;
-    rpc.details = "Idle";
-
+    rpc.details = "running on shadGT";
+    rpc.largeImageKey = "https://raw.githubusercontent.com/mlgprorektm8/shadPS4/main/assets/GranTurismoSportIcon.jpg";
+    rpc.largeImageText = "Gran Turismo Sport";
     status = RPCStatus::Idling;
     Discord_UpdatePresence(&rpc);
 }
 
-void RPC::setStatusPlaying(const std::string& game_name, const std::string& game_id) {
+void RPC::setStatusPlaying(const std::string&, const std::string&) {
     DiscordRichPresence rpc{};
-
-    rpc.details = "Playing";
-    rpc.state = game_name.c_str();
-    std::string largeImageUrl =
-        "https://store.playstation.com/store/api/chihiro/00_09_000/titlecontainer/US/en/999/" +
-        game_id + "_00/image";
-    rpc.largeImageKey = largeImageUrl.c_str();
-    rpc.largeImageText = game_name.c_str();
-    rpc.startTimestamp = startTimestamp;
-
+    rpc.details = "running on shadGT";
+    rpc.largeImageKey = "https://raw.githubusercontent.com/mlgprorektm8/shadPS4/main/assets/GranTurismoSportIcon.jpg";
+    rpc.largeImageText = "Gran Turismo Sport";
     status = RPCStatus::Playing;
     Discord_UpdatePresence(&rpc);
 }
