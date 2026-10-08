@@ -385,6 +385,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     // PERF-019: a command buffer can be reused with other contents; never continue an earlier
     // read-ahead into this one.
     scan_buffer_end = nullptr;
+    if (on_command_buffer_start && !dcb.empty()) {
+        lookahead_dcb = dcb;
+        on_command_buffer_start();
+    }
 
     // TODO: potentially, ASCs also can depend on CE and in this case the
     // CE task should be moved into more global scope

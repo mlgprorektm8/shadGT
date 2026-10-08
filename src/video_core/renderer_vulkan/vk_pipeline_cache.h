@@ -91,7 +91,10 @@ private:
     /// PERF-019: builds the pipeline for the current key on a worker thread.
     std::shared_ptr<PipelineBuild> StartPipelineBuild(bool urgent);
     /// PERF-019: starts builds for the new pipelines of the draws after the current one.
-    void ReadAhead(const DrawIndirectParams params);
+    void ReadAhead(const DrawIndirectParams params, bool restore = true);
+    /// PERF-020: while new pipelines keep appearing, reads each command buffer ahead as soon as
+    /// it starts, so its first new pipelines are built before their draws.
+    void ReadAheadAtBufferStart();
     /// Selects swizzled-alpha blend emulation for a lane-dependent blend, or reports it once.
     void RefreshSwizzledBlend(u32 cb, Shader::PsColorBuffer& color_buffer,
                               const AmdGpu::BlendControl& bc);
@@ -161,6 +164,7 @@ private:
     // PERF-019: pipelines being built ahead of their draws.
     const AmdGpu::Regs* regs_override{};
     u32 draws_since_scan{};
+    std::chrono::steady_clock::time_point last_pipeline_miss{};
     u32 last_scan_draws{};
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
     // Last member, so the workers stop before anything they use is destroyed.

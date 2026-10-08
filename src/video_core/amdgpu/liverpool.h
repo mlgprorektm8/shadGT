@@ -192,6 +192,9 @@ public:
     /// each draw. on_draw returns true when it started a pipeline build. A later call for the
     /// same command buffer continues where the previous one stopped.
     void ScanAheadForPipelines(const std::function<bool(const Regs&)>& on_draw);
+    /// PERF-020: called on the command thread when a graphics command buffer starts, with the
+    /// read-ahead positioned at its first packet.
+    std::function<void()> on_command_buffer_start;
 
     struct AscQueueInfo {
         static constexpr size_t Pm4BufferSize = 1024;

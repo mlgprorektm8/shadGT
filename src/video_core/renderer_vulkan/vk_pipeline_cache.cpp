@@ -353,6 +353,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes} {
+    if (liverpool) {
+        liverpool->on_command_buffer_start = [this] { ReadAheadAtBufferStart(); };
+    }
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -415,6 +418,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 }
 
 PipelineCache::~PipelineCache() {
+    if (liverpool) {
+        liverpool->on_command_buffer_start = nullptr;
+    }
     SaveDriverCache(true);
 }
 
@@ -568,7 +574,17 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(
     return build;
 }
 
-void PipelineCache::ReadAhead(const DrawIndirectParams params) {
+void PipelineCache::ReadAheadAtBufferStart() {
+    using namespace std::chrono_literals;
+    if (!build_workers || !Common::PerfFeatureEnabled(20) || !Common::PerfFeatureEnabled(19) ||
+        std::chrono::steady_clock::now() - last_pipeline_miss > 2s) {
+        return;
+    }
+    // No draw is being processed, so nothing needs restoring afterwards.
+    ReadAhead(draw_indirect_params, false);
+}
+
+void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
     const auto start = std::chrono::steady_clock::now();
     u32 draws = 0;
     u32 started = 0;
@@ -591,7 +607,9 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params) {
         draws_since_scan = 0;
         // Back to the draw being processed.
         draw_indirect_params = params;
-        RefreshGraphicsKey();
+        if (restore) {
+            RefreshGraphicsKey();
+        }
         LOG_WARNING(Render_Vulkan,
                     "Pipeline read-ahead: {} draws read in {:.1f} ms, {} builds started, {} "
                     "pending",
@@ -638,6 +656,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         // build at the same time on other cores.
         std::shared_ptr<PipelineBuild> build;
         bool predicted = false;
+        last_pipeline_miss = std::chrono::steady_clock::now();
         if (const auto pending = pending_builds.find(graphics_key);
             pending != pending_builds.end()) {
             build = pending->second;
