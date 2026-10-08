@@ -1,27 +1,27 @@
 <!--
-SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
+SPDX-FileCopyrightText: 2026 shadGT Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
 <h1 align="center">
   <br>
-  <a href="https://shadps4.net/"><img src="https://github.com/shadps4-emu/shadPS4/blob/main/.github/shadps4.png" width="220"></a>
+  <a href="https://shadGT.net/"><img src="https://github.com/shadGT-emu/shadGT/blob/main/.github/shadGT.png" width="220"></a>
   <br>
-  <b>shadPS4</b>
+  <b>shadGT</b>
   <br>
 </h1>
 
 <h1 align="center">
  <a href="https://discord.gg/bFJxfftGW6">
-        <img src="https://img.shields.io/discord/1080089157554155590?color=5865F2&label=shadPS4%20Discord&logo=Discord&logoColor=white" width="275">
- <a href="https://github.com/shadps4-emu/shadPS4/releases/latest">
-        <img src="https://img.shields.io/github/downloads/shadps4-emu/shadPS4/total.svg" width="140">
- <a href="https://shadps4.net/">
-        <img src="https://img.shields.io/badge/shadPS4-website-8A2BE2" width="150">
- <a href="https://x.com/shadps4">
+        <img src="https://img.shields.io/discord/1080089157554155590?color=5865F2&label=shadGT%20Discord&logo=Discord&logoColor=white" width="275">
+ <a href="https://github.com/shadGT-emu/shadGT/releases/latest">
+        <img src="https://img.shields.io/github/downloads/shadGT-emu/shadGT/total.svg" width="140">
+ <a href="https://shadGT.net/">
+        <img src="https://img.shields.io/badge/shadGT-website-8A2BE2" width="150">
+ <a href="https://x.com/shadGT">
         <img src="https://img.shields.io/badge/-Join%20us-black?logo=X&logoColor=white" width="100">
- <a href="https://github.com/shadps4-emu/shadPS4/stargazers">
-        <img src="https://img.shields.io/github/stars/shadps4-emu/shadPS4" width="120">
+ <a href="https://github.com/shadGT-emu/shadGT/stargazers">
+        <img src="https://img.shields.io/github/stars/shadGT-emu/shadGT" width="120">
 </h1>
 
 |               Bloodborne by From Software                   |                     Hatsune Miku Project DIVA Future Tone by SEGA                         |
@@ -34,69 +34,69 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # General information
 
-**shadPS4** is an early **PlayStation 4** emulator for **Windows**, **Linux** and **macOS** written in C++.
+**shadGT** is an early **PlayStation 4** emulator for **Windows**, **Linux** and **macOS** written in C++.
 
 > [!IMPORTANT]
-> This is the emulator core, which does not include a GUI. If you just want to use the emulator as an end user, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases) instead.
+> This is the emulator core, which does not include a GUI. If you just want to use the emulator as an end user, download the [**QtLauncher**](https://github.com/shadGT-emu/shadGT-qtlauncher/releases) instead.
 
-If you encounter problems or have doubts, do not hesitate to look at the [**Quickstart**](https://github.com/shadps4-emu/shadPS4/wiki/I.-Quick-start-%5BUsers%5D).\
-To verify that a game works, you can look at [**shadPS4 Game Compatibility**](https://github.com/shadps4-compatibility/shadps4-game-compatibility).\
-To discuss shadPS4 development, suggest ideas or to ask for help, join our [**Discord server**](https://discord.gg/bFJxfftGW6).\
-To get the latest news, go to our [**X (Twitter)**](https://x.com/shadps4) or our [**website**](https://shadps4.net/).\
-You can donate to the project via our [**Kofi page**](https://ko-fi.com/shadps4).
+If you encounter problems or have doubts, do not hesitate to look at the [**Quickstart**](https://github.com/shadGT-emu/shadGT/wiki/I.-Quick-start-%5BUsers%5D).\
+To verify that a game works, you can look at [**shadGT Game Compatibility**](https://github.com/shadGT-compatibility/shadGT-game-compatibility).\
+To discuss shadGT development, suggest ideas or to ask for help, join our [**Discord server**](https://discord.gg/bFJxfftGW6).\
+To get the latest news, go to our [**X (Twitter)**](https://x.com/shadGT) or our [**website**](https://shadGT.net/).\
+You can donate to the project via our [**Kofi page**](https://ko-fi.com/shadGT).
 
 # Status
 
 > [!IMPORTANT]
-> shadPS4 is early in development, don't expect a flawless experience.
+> shadGT is early in development, don't expect a flawless experience.
 
 Currently, the emulator can successfully run games like [**Bloodborne**](https://www.youtube.com/watch?v=5sZgWyVflFM), [**Dark Souls Remastered**](https://www.youtube.com/watch?v=-3PA-Xwszts), [**Red Dead Redemption**](https://www.youtube.com/watch?v=Al7yz_5nLag), and many other games.
 
 # Why
 
-This project began for fun. Given our limited free time, it may take some time before shadPS4 can run more complex games, but we're committed to making small, regular updates.
+This project began for fun. Given our limited free time, it may take some time before shadGT can run more complex games, but we're committed to making small, regular updates.
 
 # Building
 
 ## Docker
 
-For building shadPS4 in a containerized environment using Docker and VSCode, check the instructions here:  
-[**Docker Build Instructions**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-docker.md)
+For building shadGT in a containerized environment using Docker and VSCode, check the instructions here:  
+[**Docker Build Instructions**](https://github.com/shadGT-emu/shadGT/blob/main/documents/building-docker.md)
 
 ## Windows
 
-Check the build instructions for [**Windows**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-windows.md).
+Check the build instructions for [**Windows**](https://github.com/shadGT-emu/shadGT/blob/main/documents/building-windows.md).
 
 ## Linux
 
-Check the build instructions for [**Linux**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-linux.md).
+Check the build instructions for [**Linux**](https://github.com/shadGT-emu/shadGT/blob/main/documents/building-linux.md).
 
 ## macOS
 
-Check the build instructions for [**macOS**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-macos.md).
+Check the build instructions for [**macOS**](https://github.com/shadGT-emu/shadGT/blob/main/documents/building-macos.md).
 
 > [!IMPORTANT]
-> macOS users need at least macOS 26.0 to run shadPS4. Intel Macs are not supported.
+> macOS users need at least macOS 26.0 to run shadGT. Intel Macs are not supported.
 
 # Usage examples
 
 > [!IMPORTANT]
-> For a user-friendly GUI, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases).
+> For a user-friendly GUI, download the [**QtLauncher**](https://github.com/shadGT-emu/shadGT-qtlauncher/releases).
 
 To get the list of all available commands and also a more detailed description of what each command does, please refer to the `--help` flag's output.
 
 Below is a list of commonly used command patterns:
 ```sh
-shadPS4 CUSA00001 # Searches for a game folder called CUSA00001 in the list of game install folders, and boots it.
-shadPS4 --fullscreen true --config-clean CUSA00001    # the game argument is always the last one,
-shadPS4 -g CUSA00001 --fullscreen true --config-clean # ...unless manually specified otherwise.
-shadPS4 /path/to/game.elf # Boots a PS4 ELF file directly. Useful if you want to boot an executable that is not named eboot.bin.
-shadPS4 CUSA00001 -- -flag1 -flag2 # Passes '-flag1' and '-flag2' to the game executable in argv.
+shadGT CUSA00001 # Searches for a game folder called CUSA00001 in the list of game install folders, and boots it.
+shadGT --fullscreen true --config-clean CUSA00001    # the game argument is always the last one,
+shadGT -g CUSA00001 --fullscreen true --config-clean # ...unless manually specified otherwise.
+shadGT /path/to/game.elf # Boots a PS4 ELF file directly. Useful if you want to boot an executable that is not named eboot.bin.
+shadGT CUSA00001 -- -flag1 -flag2 # Passes '-flag1' and '-flag2' to the game executable in argv.
 ```
 
 # Debugging and reporting issues
 
-For more information on how to test, debug and report issues with the emulator or games, read the [**Debugging documentation**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/Debugging/Debugging.md).
+For more information on how to test, debug and report issues with the emulator or games, read the [**Debugging documentation**](https://github.com/shadGT-emu/shadGT/blob/main/documents/Debugging/Debugging.md).
 
 # Keyboard and Mouse Mappings
 
@@ -146,8 +146,8 @@ Keyboard and mouse inputs can be customized in the settings menu by clicking the
 
 # Firmware files
 
-shadPS4 can load some PlayStation 4 firmware files.
-The following firmware modules are supported and must be placed in shadPS4's `sys_modules` folder.
+shadGT can load some PlayStation 4 firmware files.
+The following firmware modules are supported and must be placed in shadGT's `sys_modules` folder.
 
 <div align="center">
 
@@ -182,13 +182,13 @@ The following firmware modules are supported and must be placed in shadPS4's `sy
 
 Logo is done by [**Xphalnos**](https://github.com/Xphalnos)
 
-<a href="https://github.com/shadps4-emu/shadPS4/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=shadps4-emu/shadPS4&max=24">
+<a href="https://github.com/shadGT-emu/shadGT/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=shadGT-emu/shadGT&max=24">
 </a>
 
 # Contributing
 
-If you want to contribute, please read the [**CONTRIBUTING.md**](https://github.com/shadps4-emu/shadPS4/blob/main/CONTRIBUTING.md) file.\
+If you want to contribute, please read the [**CONTRIBUTING.md**](https://github.com/shadGT-emu/shadGT/blob/main/CONTRIBUTING.md) file.\
 Open a PR and we'll check it :)
 
 
@@ -208,4 +208,4 @@ A few noteworthy teams/projects who've helped us along the way are:
 
 # License
 
-- [**GPL-2.0 license**](https://github.com/shadps4-emu/shadPS4/blob/main/LICENSE)
+- [**GPL-2.0 license**](https://github.com/shadGT-emu/shadGT/blob/main/LICENSE)
