@@ -6,12 +6,12 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
-#include <immintrin.h>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <immintrin.h>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -212,7 +212,6 @@ void BufferCache::TickFrame() {
     }
 }
 
-
 void BufferCache::RecordGdsReadback(VAddr address, u32 gds_offset, u32 size) {
     auto readback = std::make_shared<AsyncReadback>();
     readback->address = address;
@@ -238,7 +237,7 @@ std::vector<std::shared_ptr<BufferCache::AsyncReadback>> BufferCache::TakePendin
     auto readbacks = std::move(pending_async_readbacks);
     pending_async_readbacks.clear();
     inflight_async_readbacks.insert(inflight_async_readbacks.end(), readbacks.begin(),
-                                  readbacks.end());
+                                    readbacks.end());
     num_pending_async_readbacks = 0;
     return readbacks;
 }
@@ -262,8 +261,9 @@ void BufferCache::NoteCpuReadFault(VAddr address, u64 size, u64 exact_write_size
     auto& page_stat = hot_page_stats.pages[fault_page];
     if (page_stat.faults++ == 0) {
         gpu_modified_ranges.ForEachInRange(fault_page, 4_KB, [&](VAddr start, VAddr end) {
-            page_stat.gpu_bytes += fmt::format("{}{:#x}+{:#x}", page_stat.gpu_bytes.empty() ? "" : ",",
-                                               start - fault_page, end - start);
+            page_stat.gpu_bytes +=
+                fmt::format("{}{:#x}+{:#x}", page_stat.gpu_bytes.empty() ? "" : ",",
+                            start - fault_page, end - start);
         });
     }
     page_stat.last_offset = address - fault_page;
@@ -336,8 +336,7 @@ bool BufferCache::RecordHotPageReadbacks() {
     }
     hot_page_stats.recorded += static_cast<u32>(recorded.size());
     std::scoped_lock lk{async_readbacks_mutex};
-    pending_async_readbacks.insert(pending_async_readbacks.end(), recorded.begin(),
-                                   recorded.end());
+    pending_async_readbacks.insert(pending_async_readbacks.end(), recorded.begin(), recorded.end());
     num_pending_async_readbacks = static_cast<u32>(pending_async_readbacks.size());
     num_tracked_async_readbacks =
         static_cast<u32>(pending_async_readbacks.size() + inflight_async_readbacks.size());
@@ -365,8 +364,7 @@ void BufferCache::LogHotPageStats() {
         const auto& [page, stat] = pages[i];
         top += fmt::format(" {:#x}x{} (last +{:#x} size {:#x}, {}, gpu bytes [{}])", page,
                            stat->faults, stat->last_offset, stat->last_size,
-                           stat->touches_gpu_bytes ? "touches them" : "page only",
-                           stat->gpu_bytes);
+                           stat->touches_gpu_bytes ? "touches them" : "page only", stat->gpu_bytes);
     }
     LOG_WARNING(Render_Vulkan,
                 "Readback pages in 2.0 s: {} CPU faults ({} only share a page with GPU writes, "
@@ -389,7 +387,8 @@ void BufferCache::LogHotPageStats() {
     stats.recorded_bytes = 0;
 }
 
-void BufferCache::CompleteAsyncReadbacks(std::span<const std::shared_ptr<AsyncReadback>> readbacks) {
+void BufferCache::CompleteAsyncReadbacks(
+    std::span<const std::shared_ptr<AsyncReadback>> readbacks) {
     std::scoped_lock lk{async_readbacks_mutex};
     for (const auto& readback : readbacks) {
         if (readback->valid && memory->IsValidMapping(readback->address, readback->size) &&
@@ -455,7 +454,8 @@ void BufferCache::InvalidateAsyncReadbacks(VAddr address, u64 size) {
         if (readback->is_gds && split_gds_write_faults) {
             // PERF-015: its page stays GPU-modified until ApplyCompletedReadbacks finds no
             // GPU-written bytes left, so only a write to its own bytes makes it stale.
-            if (readback->address < address + size && address < readback->address + readback->size) {
+            if (readback->address < address + size &&
+                address < readback->address + readback->size) {
                 readback->valid = false;
                 --num_valid_gds_readbacks;
             }
@@ -502,8 +502,7 @@ bool BufferCache::TrySplitGdsWriteFault(VAddr address, u64 exact_write_size) {
     // GPU-written byte of the page is a pending GDS copy and the store (exact size, PERF-011b)
     // misses them, those bytes are kept out of uploads until their value reaches guest memory
     // (SynchronizeMemory), and a CPU store to them meanwhile is detected by the snapshot and wins.
-    if (!split_gds_write_faults || exact_write_size == 0 ||
-        num_valid_gds_readbacks.load() == 0 ||
+    if (!split_gds_write_faults || exact_write_size == 0 || num_valid_gds_readbacks.load() == 0 ||
         gpu_modified_ranges.Intersects(address, exact_write_size)) {
         return false;
     }
@@ -579,27 +578,27 @@ bool BufferCache::TrySplitWriteFault(const Buffer* arena, VAddr address, u64 siz
     std::vector<std::shared_ptr<AsyncReadback>> recorded;
     memory_tracker->ForEachDownloadRange<false>(
         window_start, window_end - window_start, [&](u64 range_address, u64 range_size) {
-            gpu_modified_ranges.ForEachInRange(range_address, range_size, [&](VAddr start,
-                                                                              VAddr end) {
-                if (!memory->IsValidMapping(start, end - start)) {
-                    return;
-                }
-                auto readback = std::make_shared<AsyncReadback>();
-                readback->address = start;
-                readback->size = static_cast<u32>(end - start);
-                readback->download =
-                    staging_pool.Request(readback->size, MemoryType::HostCached, 4, true);
-                readback->snapshot.resize(readback->size);
-                std::memcpy(readback->snapshot.data(), std::bit_cast<const void*>(start),
-                            readback->size);
-                const vk::BufferCopy copy = {
-                    .srcOffset = start - arena->cpu_addr,
-                    .dstOffset = readback->download.offset,
-                    .size = readback->size,
-                };
-                runtime.CopyBuffer(arena, readback->download.buffer, std::span{&copy, 1});
-                recorded.push_back(std::move(readback));
-            });
+            gpu_modified_ranges.ForEachInRange(
+                range_address, range_size, [&](VAddr start, VAddr end) {
+                    if (!memory->IsValidMapping(start, end - start)) {
+                        return;
+                    }
+                    auto readback = std::make_shared<AsyncReadback>();
+                    readback->address = start;
+                    readback->size = static_cast<u32>(end - start);
+                    readback->download =
+                        staging_pool.Request(readback->size, MemoryType::HostCached, 4, true);
+                    readback->snapshot.resize(readback->size);
+                    std::memcpy(readback->snapshot.data(), std::bit_cast<const void*>(start),
+                                readback->size);
+                    const vk::BufferCopy copy = {
+                        .srcOffset = start - arena->cpu_addr,
+                        .dstOffset = readback->download.offset,
+                        .size = readback->size,
+                    };
+                    runtime.CopyBuffer(arena, readback->download.buffer, std::span{&copy, 1});
+                    recorded.push_back(std::move(readback));
+                });
         });
     ++hot_page_stats.split_faults;
     if (!recorded.empty()) {
@@ -654,8 +653,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                         it == small_gpu_writers.end()
                             ? std::string("none recorded")
                             : fmt::format("{} {:#x} at {:#x}+{:#x}", it->second.kind,
-                                          it->second.tag, it->second.address,
-                                          it->second.size));
+                                          it->second.tag, it->second.address, it->second.size));
         }
         DownloadMemory(arena, window_start, window_end - window_start);
         if (is_write) {
@@ -917,11 +915,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         std::scoped_lock lk{async_readbacks_mutex};
         for (const auto* list : {&pending_async_readbacks, &inflight_async_readbacks}) {
             for (const auto& readback : *list) {
-                if (readback->valid && readback->is_gds &&
-                    readback->address < device_addr + size &&
+                if (readback->valid && readback->is_gds && readback->address < device_addr + size &&
                     device_addr < readback->address + readback->size) {
-                    gds_pending.emplace_back(readback->address,
-                                             readback->address + readback->size);
+                    gds_pending.emplace_back(readback->address, readback->address + readback->size);
                 }
             }
         }

@@ -537,10 +537,9 @@ void Rasterizer::OnSubmit() {
     buffer_cache.ReleaseFinishedAsyncReadbacks();
     // GDS readbacks not taken by a deferred fence complete once this submission executes.
     if (auto async_readbacks = buffer_cache.TakePendingAsyncReadbacks(); !async_readbacks.empty()) {
-        scheduler.DeferPriorityOperation(
-            [this, async_readbacks = std::move(async_readbacks)] {
-                buffer_cache.CompleteAsyncReadbacks(async_readbacks);
-            });
+        scheduler.DeferPriorityOperation([this, async_readbacks = std::move(async_readbacks)] {
+            buffer_cache.CompleteAsyncReadbacks(async_readbacks);
+        });
     }
     buffer_cache.TickFrame();
     ProcessDownloadsTimed(DrainSource::Submit);
@@ -582,7 +581,7 @@ void Rasterizer::RecordDrain(DrainSource source, std::chrono::steady_clock::time
     if (now - stats.window_start < std::chrono::seconds{2}) {
         return;
     }
-    static constexpr std::array names = {"submit",    "gfx_eos",         "gfx_eop", "gfx_write",
+    static constexpr std::array names = {"submit",    "gfx_eos",         "gfx_eop",  "gfx_write",
                                          "asc_write", "asc_release_mem", "gds_store"};
     std::string summary;
     for (u32 i = 0; i < names.size(); ++i) {
@@ -638,26 +637,25 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     }
     ++deferred_fences;
     const auto deferred_at = std::chrono::steady_clock::now();
-    scheduler.DeferPriorityOperation([this, address, deferred_at, brings_data,
-                                      readbacks = std::move(readbacks),
-                                      async_readbacks = std::move(async_readbacks),
-                                      signal = std::move(signal)]() mutable {
-        texture_cache.CompleteReadbacks(readbacks);
-        buffer_cache.CompleteAsyncReadbacks(async_readbacks);
-        signal();
-        RecordDeferredFenceLatency(deferred_at);
-        {
-            std::scoped_lock lk{deferred_fences_mutex};
-            if (--deferred_fence_addresses[address] == 0) {
-                deferred_fence_addresses.erase(address);
-                pending_fence_bytes.erase(address);
+    scheduler.DeferPriorityOperation(
+        [this, address, deferred_at, brings_data, readbacks = std::move(readbacks),
+         async_readbacks = std::move(async_readbacks), signal = std::move(signal)]() mutable {
+            texture_cache.CompleteReadbacks(readbacks);
+            buffer_cache.CompleteAsyncReadbacks(async_readbacks);
+            signal();
+            RecordDeferredFenceLatency(deferred_at);
+            {
+                std::scoped_lock lk{deferred_fences_mutex};
+                if (--deferred_fence_addresses[address] == 0) {
+                    deferred_fence_addresses.erase(address);
+                    pending_fence_bytes.erase(address);
+                }
             }
-        }
-        --deferred_fences;
-        if (brings_data) {
-            --readback_fences;
-        }
-    });
+            --deferred_fences;
+            if (brings_data) {
+                --readback_fences;
+            }
+        });
     // Submit so the deferred tick can complete; the GPU thread does not wait.
     scheduler.Flush();
     return true;
@@ -695,10 +693,9 @@ void Rasterizer::RecordDeferredFenceLatency(std::chrono::steady_clock::time_poin
     stats.max_us = std::max(stats.max_us, latency_us);
     if (now - stats.window_start >= std::chrono::seconds{2}) {
         const u64 frames = u64(DebugState.GetFrameNum()) - stats.window_frame;
-        LOG_WARNING(Render_Vulkan,
-                    "Deferred fences: {} in {} frames, latency avg {:.2f} ms max {:.2f} ms",
-                    stats.count, frames, stats.total_us / 1000.0 / stats.count,
-                    stats.max_us / 1000.0);
+        LOG_WARNING(
+            Render_Vulkan, "Deferred fences: {} in {} frames, latency avg {:.2f} ms max {:.2f} ms",
+            stats.count, frames, stats.total_us / 1000.0 / stats.count, stats.max_us / 1000.0);
         stats = {};
         stats.window_start = now;
         stats.window_frame = u64(DebugState.GetFrameNum());
@@ -944,8 +941,7 @@ bool Rasterizer::CanDrawQuadListAsTriangles(bool is_indexed, u32 index_offset) {
         return true;
     }
     // The indices are read from guest memory here, so they must not be waiting in a GPU write.
-    const u32 index_size =
-        regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2 : 4;
+    const u32 index_size = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2 : 4;
     const VAddr address = regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
     if (buffer_cache.IsRegionGpuModified(address, u64(regs.num_indices) * index_size)) {
         static const bool logged = [&] {
@@ -991,8 +987,8 @@ u32 Rasterizer::BindQuadListIndices(bool is_indexed, u32 index_offset) {
     if (is_index16) {
         written = ExpandQuadListIndices<u16>(
             reinterpret_cast<const u16*>(address), count,
-            restart ? std::optional<u16>{u16(regs.primitive_restart_index)} : std::nullopt,
-            corners, reinterpret_cast<u16*>(data));
+            restart ? std::optional<u16>{u16(regs.primitive_restart_index)} : std::nullopt, corners,
+            reinterpret_cast<u16*>(data));
     } else {
         written = ExpandQuadListIndices<u32>(
             reinterpret_cast<const u32*>(address), count,
@@ -1233,8 +1229,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->GetCsRegs();
-                const u64 lds_size =
-                    u64(cs_program.SharedMemSize()) * cs_program.NumWorkgroups();
+                const u64 lds_size = u64(cs_program.SharedMemSize()) * cs_program.NumWorkgroups();
                 // GCN LDS is undefined at workgroup launch, so only reserve a GPU-only region.
                 const auto offset = lds_buffer.Reserve(lds_size, alignment);
                 ASSERT_MSG(offset, "Emulated shared memory size {:#x} exceeds the stream buffer",
@@ -1259,37 +1254,40 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                               vsharp.GetStride(), vsharp.num_records);
                 }
                 // DIAG-006: trace GT Sport's 304-byte fragment constant buffers (tonemap).
-                if (stage.sw_stage == Shader::SwStage::Fragment && size == 304 && !desc.is_written) {
+                if (stage.sw_stage == Shader::SwStage::Fragment && size == 304 &&
+                    !desc.is_written) {
                     static std::unordered_set<u64> seen_shaders;
                     static u64 traced = 0;
-                    const bool first = seen_shaders.size() < 64 &&
-                                       seen_shaders.insert(stage.pgm_hash).second;
-                    if (first || (stage.pgm_hash == 0xb33ec4df && (++traced <= 20 ||
-                                                                   traced % 300 == 0))) {
+                    const bool first =
+                        seen_shaders.size() < 64 && seen_shaders.insert(stage.pgm_hash).second;
+                    if (first ||
+                        (stage.pgm_hash == 0xb33ec4df && (++traced <= 20 || traced % 300 == 0))) {
                         const auto* words = reinterpret_cast<const u32*>(vsharp.base_address);
                         // DIAG-008: where each V# dword came from (user data or guest memory).
                         std::string vsharp_source;
                         const auto& fetch = desc.sharp_fetch;
                         for (u32 i = 0; i < 4; ++i) {
-                            const bool single = fetch.summary == std::remove_cvref_t<
-                                                                     decltype(fetch)>::Summary::SingleLoad;
+                            const bool single =
+                                fetch.summary ==
+                                std::remove_cvref_t<decltype(fetch)>::Summary::SingleLoad;
                             if (!single && !((fetch.load_mask >> i) & 1)) {
                                 vsharp_source += fmt::format(" imm={:08x}", fetch.immediates[i]);
                                 continue;
                             }
-                            const u32 off = single ? u32(fetch.offsets[0]) + i : u32(fetch.offsets[i]);
-                            const u64 src =
-                                off < stage.flattened_ud_src.size() ? stage.flattened_ud_src[off] : 0;
+                            const u32 off =
+                                single ? u32(fetch.offsets[0]) + i : u32(fetch.offsets[i]);
+                            const u64 src = off < stage.flattened_ud_src.size()
+                                                ? stage.flattened_ud_src[off]
+                                                : 0;
                             const u32 now = src ? *reinterpret_cast<const u32*>(src) : 0;
-                            vsharp_source += fmt::format(" [{}]={:08x}{}", off,
-                                                         off < stage.flattened_ud_buf.size()
-                                                             ? stage.flattened_ud_buf[off]
-                                                             : 0,
-                                                         src ? fmt::format("@{:#x}/now {:08x}", src, now)
-                                                             : std::string(" ud"));
+                            vsharp_source += fmt::format(
+                                " [{}]={:08x}{}", off,
+                                off < stage.flattened_ud_buf.size() ? stage.flattened_ud_buf[off]
+                                                                    : 0,
+                                src ? fmt::format("@{:#x}/now {:08x}", src, now)
+                                    : std::string(" ud"));
                         }
-                        const auto dump =
-                            liverpool->FindRecentConstDump(vsharp.base_address, size);
+                        const auto dump = liverpool->FindRecentConstDump(vsharp.base_address, size);
                         const auto describe_cmd = [&](VAddr address, u64 bytes) {
                             const auto cmd = liverpool->FindRecentCmdBuffer(address, bytes);
                             return cmd ? fmt::format("{}{:#x}+{:#x}@{} ago",
@@ -1299,8 +1297,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                        : std::string("none");
                         };
                         const u64 table_address =
-                            !stage.flattened_ud_src.empty() && fetch.offsets[0] <
-                                                                 stage.flattened_ud_src.size()
+                            !stage.flattened_ud_src.empty() &&
+                                    fetch.offsets[0] < stage.flattened_ud_src.size()
                                 ? stage.flattened_ud_src[fetch.offsets[0]]
                                 : 0;
                         if (g_tonemap_checks.size() < 32) {
@@ -1316,15 +1314,15 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                     table_address ? describe_cmd(table_address, 16)
                                                   : std::string("ud"));
                         const auto [ce, de] = liverpool->CeDeCounters();
-                        LOG_WARNING(Render_Vulkan,
-                                    "Constants V# source{} pending_submits={} ce={} de={} dump={}",
-                                    vsharp_source, liverpool->PendingSubmits(), ce, de,
-                                    dump ? fmt::format("{:#x}+{:#x} {} dumps ago at ce={} de={}",
-                                                       dump->address, dump->size,
-                                                       liverpool->ConstDumpSequence() -
-                                                           dump->sequence,
-                                                       dump->ce_count, dump->de_count)
-                                         : std::string("none"));
+                        LOG_WARNING(
+                            Render_Vulkan,
+                            "Constants V# source{} pending_submits={} ce={} de={} dump={}",
+                            vsharp_source, liverpool->PendingSubmits(), ce, de,
+                            dump ? fmt::format("{:#x}+{:#x} {} dumps ago at ce={} de={}",
+                                               dump->address, dump->size,
+                                               liverpool->ConstDumpSequence() - dump->sequence,
+                                               dump->ce_count, dump->de_count)
+                                 : std::string("none"));
                         LOG_WARNING(Render_Vulkan,
                                     "Constants {}_{:#x} at {:#x} frame {} cpu_modified={} "
                                     "gpu_modified={} [4..7]={:08x} {:08x} {:08x} {:08x} "
@@ -2101,8 +2099,7 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
-bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks,
-                                  u64 exact_write_size) {
+bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks, u64 exact_write_size) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;

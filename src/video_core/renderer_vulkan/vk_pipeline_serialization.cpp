@@ -508,9 +508,8 @@ void PipelineCache::WarmUp() {
             return;
         }
         last_progress = now;
-        const auto title =
-            fmt::format("{} - Compiling shaders {} / {} ({}%)", window_title, done, num_cached,
-                        num_cached ? u64(done) * 100 / num_cached : 100);
+        const auto title = fmt::format("{} - Compiling shaders {} / {} ({}%)", window_title, done,
+                                       num_cached, num_cached ? u64(done) * 100 / num_cached : 100);
         SDL_SetWindowTitle(window, title.c_str());
         SDL_PumpEvents();
     };
@@ -521,8 +520,7 @@ void PipelineCache::WarmUp() {
     // build in the background. -DisablePerf 24 builds them all first, as before.
     background_preload = Common::PerfFeatureEnabled(24);
     if (num_cached > 0 && !background_preload) {
-        LOG_INFO(Render, "Precompiling {} cached pipelines on {} threads", num_cached,
-                 num_workers);
+        LOG_INFO(Render, "Precompiling {} cached pipelines on {} threads", num_cached, num_workers);
         queue.emplace(num_workers);
         preload_queue = &*queue;
         report_progress(0, true);
@@ -554,8 +552,7 @@ void PipelineCache::WarmUp() {
             if (is_compute) {
                 result = LoadComputePipeline(ar);
             } else {
-                result = LoadGraphicsPipeline(
-                    ar, version == Serialization::PipelineKeyVersion);
+                result = LoadGraphicsPipeline(ar, version == Serialization::PipelineKeyVersion);
             }
             if (!queue || queue->NumQueued() == queued_before) {
                 ++num_direct;

@@ -215,8 +215,7 @@ struct QuadRectListEmitter : public Sirit::Module {
         // got a first control point matching no vertex shader output, stretching grass and
         // terrain quads across the screen; the array lookup is the suspected cause.
         const Id rotated{OpSMod(int_id, OpIAdd(int_id, invocation_id, Int(1)), Int(3))};
-        const Id index{
-            OpSelect(int_id, OpIEqual(bool_id, invocation_id, Int(3)), Int(3), rotated)};
+        const Id index{OpSelect(int_id, OpIEqual(bool_id, invocation_id, Int(3)), Int(3), rotated)};
 
         // gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;
         const Id in_position{OpLoad(vec4_id, OpAccessChain(input_vec4, gl_in, index, Int(0)))};

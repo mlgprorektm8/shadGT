@@ -16,6 +16,7 @@
 #ifdef _WIN32
 #include <intrin.h>
 #include <windows.h>
+// tlhelp32.h needs the Windows types declared first.
 #include <tlhelp32.h>
 #endif
 
@@ -86,8 +87,7 @@ std::string SampleThreadCpuUsage(size_t max_threads) {
         auto [it, inserted] = threads.try_emplace(entry.th32ThreadID);
         auto& sample = it->second;
         if (inserted) {
-            sample.handle =
-                OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+            sample.handle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
         }
         if (!sample.handle) {
             continue;
@@ -139,9 +139,9 @@ std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks() {
 
 static std::string TakePhaseTimes() {
     static constexpr std::array<const char*, size_t(Phase::Count)> Names = {
-        "setup", "pipeline", "targets", "vtx/idx", "buffers", "textures", "rebind",
-        "begin-rendering", "descriptors", "dynamic", "record", "draw-total", "dispatch-total",
-        "submit"};
+        "setup",    "pipeline",   "targets",         "vtx/idx",     "buffers",
+        "textures", "rebind",     "begin-rendering", "descriptors", "dynamic",
+        "record",   "draw-total", "dispatch-total",  "submit"};
     static u64 last_tsc = PhaseTimer::ReadTsc();
     static auto last_time = std::chrono::steady_clock::now();
     const u64 tsc = PhaseTimer::ReadTsc();

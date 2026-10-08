@@ -9,11 +9,11 @@
 #include <mutex>
 #include <ranges>
 
-#include "common/perf_monitor.h"
 #include "common/elf_info.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/perf_monitor.h"
 #include "common/singleton.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -134,7 +134,6 @@ struct PipelineCache::PipelineBuild {
     // The cached infos the copies were made from; the pipeline points at them once built.
     std::array<const Shader::Info*, MaxShaderStages> canonical{};
 };
-
 
 using Shader::HwStage;
 using Shader::Output;
@@ -601,8 +600,8 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
     if (!build.started.exchange(true)) {
         build.pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
-            build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules,
-            build.sdata, build.preloading);
+            build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules, build.sdata,
+            build.preloading);
         // The copies were only needed while building; draws use the cached infos.
         build.pipeline->SetStageInfos(build.canonical);
         build.info_copies = {};
@@ -785,10 +784,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         bool predicted = false;
         const auto pending = pending_builds.find(graphics_key);
         // PERF-024: a stored pipeline the background preload already built is no miss.
-        const bool preloaded_ready = pending != pending_builds.end() &&
-                                     pending->second->preloading &&
-                                     pending->second->done.wait_for(std::chrono::seconds{0}) ==
-                                         std::future_status::ready;
+        const bool preloaded_ready =
+            pending != pending_builds.end() && pending->second->preloading &&
+            pending->second->done.wait_for(std::chrono::seconds{0}) == std::future_status::ready;
         if (pending == pending_builds.end() || !pending->second->preloading) {
             ++Common::GetWorkCounters().pipelines_compiled;
         }
@@ -817,14 +815,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             FinishBuild(*build);
             const auto now = std::chrono::steady_clock::now();
             if (!preloaded_ready) {
-                LOG_WARNING(
-                    Render_Vulkan,
-                    "Pipeline {:#x} {}: built {:.1f} ms after it was queued, draw waited "
-                    "{:.1f} ms",
-                    pipeline_hash,
-                    build->preloading ? "stored" : (predicted ? "read ahead" : "on demand"),
-                    std::chrono::duration<double, std::milli>(now - build->queued).count(),
-                    std::chrono::duration<double, std::milli>(now - wait_start).count());
+                LOG_WARNING(Render_Vulkan,
+                            "Pipeline {:#x} {}: built {:.1f} ms after it was queued, draw waited "
+                            "{:.1f} ms",
+                            pipeline_hash,
+                            build->preloading ? "stored" : (predicted ? "read ahead" : "on demand"),
+                            std::chrono::duration<double, std::milli>(now - build->queued).count(),
+                            std::chrono::duration<double, std::milli>(now - wait_start).count());
             }
             build->pipeline->SetStageInfos(infos);
             sdata = build->sdata;
@@ -912,10 +909,9 @@ void PipelineCache::RefreshSwizzledBlend(u32 cb, Shader::PsColorBuffer& color_bu
 
     using NumberFormat = AmdGpu::NumberFormat;
     const auto num_format = color_buffer.num_format;
-    const bool blendable_format = num_format == NumberFormat::Unorm ||
-                                  num_format == NumberFormat::Snorm ||
-                                  num_format == NumberFormat::Srgb ||
-                                  num_format == NumberFormat::Float;
+    const bool blendable_format =
+        num_format == NumberFormat::Unorm || num_format == NumberFormat::Snorm ||
+        num_format == NumberFormat::Srgb || num_format == NumberFormat::Float;
     if (!rejection && color_buffer.num_conversion != AmdGpu::NumberConversion::None) {
         rejection = "number conversion";
     } else if (!rejection && !blendable_format) {
@@ -936,13 +932,11 @@ void PipelineCache::RefreshSwizzledBlend(u32 cb, Shader::PsColorBuffer& color_bu
 
     // Report each remaining configuration once; it still blends with the wrong lane order.
     const auto& swizzle = color_buffer.swizzle;
-    const u64 config = u64(std::bit_cast<u32>(bc)) | u64(cb) << 32 |
-                       u64(u32(num_format)) << 36 | u64(swizzle.r) << 40 |
-                       u64(swizzle.g) << 44 | u64(swizzle.b) << 48 | u64(swizzle.a) << 52 |
-                       u64(writes_other_mrt()) << 56 |
-                       u64((regs.color_shader_mask.GetMask(cb) &
-                            AmdGpu::ColorBufferMask::ComponentA) != 0)
-                           << 57;
+    const u64 config =
+        u64(std::bit_cast<u32>(bc)) | u64(cb) << 32 | u64(u32(num_format)) << 36 |
+        u64(swizzle.r) << 40 | u64(swizzle.g) << 44 | u64(swizzle.b) << 48 | u64(swizzle.a) << 52 |
+        u64(writes_other_mrt()) << 56 |
+        u64((regs.color_shader_mask.GetMask(cb) & AmdGpu::ColorBufferMask::ComponentA) != 0) << 57;
     static constexpr size_t MaxLoggedSwizzledBlends = 32;
     if (logged_swizzled_blends.size() >= MaxLoggedSwizzledBlends ||
         !logged_swizzled_blends.insert(config).second) {
@@ -1253,13 +1247,13 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         module = CompileSPV(spv, instance.GetDevice());
     }
     // PERF-DIAG-013: where runtime shader compile time goes.
-    LOG_WARNING(Render_Vulkan, "Shader {} {:#x}: translate {:.1f} ms, module {:.1f} ms, {} words",
-                info.hw_stage, info.pgm_hash,
-                std::chrono::duration<double, std::milli>(translate_end - translate_start).count(),
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                          translate_end)
-                    .count(),
-                spv.size());
+    LOG_WARNING(
+        Render_Vulkan, "Shader {} {:#x}: translate {:.1f} ms, module {:.1f} ms, {} words",
+        info.hw_stage, info.pgm_hash,
+        std::chrono::duration<double, std::milli>(translate_end - translate_start).count(),
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - translate_end)
+            .count(),
+        spv.size());
 
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
 
@@ -1300,8 +1294,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             if (program->modules.size() >= 4 && mismatch_reasons.size() < 600) {
                 u32 index{};
                 const char* reason = permutation.spec.FirstDifference(spec, index);
-                mismatch_reasons += fmt::format(" {}:{}[{}]", perm_idx, reason ? reason : "none",
-                                                index);
+                mismatch_reasons +=
+                    fmt::format(" {}:{}[{}]", perm_idx, reason ? reason : "none", index);
             }
             continue;
         }
@@ -1338,8 +1332,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     // input). The stored key must use the unmodified runtime info, or it never matches the next
     // lookup and the same module is recompiled for every draw.
     auto compile_runtime_info = runtime_info;
-    const auto module =
-        CompileModule(*info, compile_runtime_info, params.code, perm_idx, binding);
+    const auto module = CompileModule(*info, compile_runtime_info, params.code, perm_idx, binding);
     auto spec = Shader::StageSpecialization(*info, runtime_info, profile, start);
     RegisterShaderMeta(*info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
     const auto* info_ptr = info.get();

@@ -28,7 +28,7 @@ struct std::hash<vk::ShaderModule> {
 namespace AmdGpu {
 struct Liverpool;
 union Regs;
-}
+} // namespace AmdGpu
 
 namespace Serialization {
 struct Archive;
@@ -95,8 +95,8 @@ private:
     std::shared_ptr<PipelineBuild> StartPipelineBuild(bool urgent);
     /// PERF-024: a build of the current key, infos and modules, queued at a priority.
     enum class BuildPriority { Urgent, Normal, Background };
-    std::shared_ptr<PipelineBuild> MakePipelineBuild(bool preloading,
-                                                     const GraphicsPipeline::SerializationSupport& sdata);
+    std::shared_ptr<PipelineBuild> MakePipelineBuild(
+        bool preloading, const GraphicsPipeline::SerializationSupport& sdata);
     void QueueBuild(const std::shared_ptr<PipelineBuild>& build, BuildPriority priority);
     /// Builds the pipeline unless a worker already started; returns when it is built.
     void FinishBuild(PipelineBuild& build);
