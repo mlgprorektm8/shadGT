@@ -1,11 +1,11 @@
 <!--
-SPDX-FileCopyrightText: 2026 shadGT Emulator Project
+SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
 <h1 align="center">
   <br>
-  <a href="https://shadGT.net/"><img src="https://github.com/shadGT-emu/shadGT/blob/main/.github/shadGT.png" width="220"></a>
+  <a href="https://shadPS4.net/"><img src="https://github.com/shadGT-emu/shadGT/blob/main/.github/shadGT.png" width="220"></a>
   <br>
   <b>shadGT</b>
   <br>
@@ -24,20 +24,10 @@ SPDX-License-Identifier: GPL-2.0-or-later
         <img src="https://img.shields.io/github/stars/shadGT-emu/shadGT" width="120">
 </h1>
 
-|               Bloodborne by From Software                   |                     Hatsune Miku Project DIVA Future Tone by SEGA                         |
-| :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
-| ![Bloodborne screenshot](./documents/Screenshots/1.png) | ![Project DIVA screenshot](./documents/Screenshots/2.png) |
-
-|                  Yakuza 0 by SEGA                     |                 DRIVECLUB™ by Evolution Studios                    |
-| :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
-| ![Yakuza screenshot](./documents/Screenshots/3.png) | ![DRIVECLUB screenshot](./documents/Screenshots/4.png) |
 
 # General information
 
-**shadGT** is an early **PlayStation 4** emulator for **Windows**, **Linux** and **macOS** written in C++.
-
-> [!IMPORTANT]
-> This is the emulator core, which does not include a GUI. If you just want to use the emulator as an end user, download the [**QtLauncher**](https://github.com/shadGT-emu/shadGT-qtlauncher/releases) instead.
+**shadGT** is an early **PlayStation 4** emulator for **Windows**, written in C++.
 
 If you encounter problems or have doubts, do not hesitate to look at the [**Quickstart**](https://github.com/shadGT-emu/shadGT/wiki/I.-Quick-start-%5BUsers%5D).\
 To verify that a game works, you can look at [**shadGT Game Compatibility**](https://github.com/shadGT-compatibility/shadGT-game-compatibility).\
@@ -66,17 +56,6 @@ For building shadGT in a containerized environment using Docker and VSCode, chec
 ## Windows
 
 Check the build instructions for [**Windows**](https://github.com/shadGT-emu/shadGT/blob/main/documents/building-windows.md).
-
-## Linux
-
-Check the build instructions for [**Linux**](https://github.com/shadGT-emu/shadGT/blob/main/documents/building-linux.md).
-
-## macOS
-
-Check the build instructions for [**macOS**](https://github.com/shadGT-emu/shadGT/blob/main/documents/building-macos.md).
-
-> [!IMPORTANT]
-> macOS users need at least macOS 26.0 to run shadGT. Intel Macs are not supported.
 
 # Usage examples
 
@@ -169,7 +148,7 @@ The following firmware modules are supported and must be placed in shadGT's `sys
 
 
 
-# Main team
+# Main credits
 
 - [**georgemoralis**](https://github.com/georgemoralis)
 - [**psucien**](https://github.com/psucien)
@@ -180,10 +159,8 @@ The following firmware modules are supported and must be placed in shadGT's `sys
 - [**Stephen Miller**](https://github.com/StevenMiller123)
 - [**kalaposfos13**](https://github.com/kalaposfos13)
 
-Logo is done by [**Xphalnos**](https://github.com/Xphalnos)
-
-<a href="https://github.com/shadGT-emu/shadGT/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=shadGT-emu/shadGT&max=24">
+<a href="https://github.com/shadPS4-emu/shadPS4/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=shadPS4-emu/shadPS4&max=24">
 </a>
 
 # Contributing
@@ -208,4 +185,4 @@ A few noteworthy teams/projects who've helped us along the way are:
 
 # License
 
-- [**GPL-2.0 license**](https://github.com/shadGT-emu/shadGT/blob/main/LICENSE)
+- [**GPL-2.0 license**](https://github.com/shadPS4-emu/shadPS4/blob/main/LICENSE)
