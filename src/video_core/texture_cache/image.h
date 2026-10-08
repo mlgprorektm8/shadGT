@@ -181,6 +181,8 @@ public:
     BackingImage* backing{};
     u64 image_uid{};
     u64 contents_version{};
+    // FIX-024: contents_version of the last readback recorded; guest memory already has it.
+    u64 readback_version = ~0ULL;
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};

@@ -118,6 +118,8 @@ try {
         foreach ($prefix in 'CDL_', 'VK_LUNARG_CRASH_DIAGNOSTIC_') {
             Set-Item "env:${prefix}OUTPUT_PATH" $crashDumps
             Set-Item "env:${prefix}TRIGGER_WATCHDOG_TIMEOUT" 'false'
+            # The layer kept firing at 30 s with only the switch above; push the timeout out too.
+            Set-Item "env:${prefix}WATCHDOG_TIMEOUT_MS" '86400000'
             Set-Item "env:${prefix}DUMP_SHADERS" 'on_crash'
             Set-Item "env:${prefix}INSTRUMENT_ALL_COMMANDS" 'true'
         }

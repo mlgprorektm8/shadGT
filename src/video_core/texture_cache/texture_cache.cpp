@@ -198,6 +198,7 @@ std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(I
     // DIAG-037: readback recorded, in the crash report's write history.
     static constexpr u32 NoData = 0;
     Core::MemoryManager::NoteEmulatorWrite(image.info.guest_address, 0, &NoData);
+    image.readback_version = image.contents_version;
     return PendingReadback{image.info.guest_address, download, download_size,
                            HashGuestBytes(image.info.guest_address, download_size)};
 }
@@ -244,6 +245,32 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
+    // FIX-024: read-back images reach guest memory through their readbacks, which already skip
+    // memory the CPU wrote after the GPU (FIX-022, FIX-023). Writing the old result again when the
+    // cache evicts the image overwrote a GT Sport heap free-list link: the game frees these small
+    // render targets to its heap (the dealership and race start crashes). -DisablePerf 34 writes
+    // it anyway.
+    static const bool skip_written_back = Common::PerfFeatureEnabled(34);
+    if (skip_written_back && ShouldReadBack(image)) {
+        // A GPU copy into the image after its last readback is not read back; log those.
+        const bool read_back = image.readback_version == image.contents_version;
+        static std::atomic<u32> skipped{};
+        if (const u32 n = ++skipped; n <= 20 || n % 500 == 0 || !read_back) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-024: download {} of read-back image at {:#x}+{:#x} skipped ({})", n,
+                        image.info.guest_address, image.info.guest_size,
+                        read_back ? "its last GPU result was read back"
+                                  : "a GPU copy after its last readback was not read back");
+        }
+        return;
+    }
+    static std::atomic<u32> downloads{};
+    if (const u32 n = ++downloads; n <= 50 || n % 500 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-024: download {} of evicted image at {:#x}+{:#x}: {}x{} {} bits depth {}",
+                    n, image.info.guest_address, image.info.guest_size, image.info.size.width,
+                    image.info.size.height, image.info.num_bits, bool(image.info.props.is_depth));
+    }
     const u32 download_size = ImageDownloadSize(image);
     ASSERT(download_size <= image.info.guest_size);
     const auto download =
@@ -270,13 +297,24 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download.mapped, download_size);
     } else {
-        scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
+        // FIX-024: the image is freed (and its pages unprotected) before this write lands, so
+        // a guest write in between goes unseen; skip the write if the bytes changed meanwhile.
+        const u64 guest_hash =
+            skip_written_back ? HashGuestBytes(image.info.guest_address, download_size) : 0;
+        scheduler.DeferPriorityOperation([this, device_addr = image.info.guest_address, download,
+                                          download_size, guest_hash] {
+            if (skip_written_back && HashGuestBytes(device_addr, download_size) != guest_hash) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-024: download to {:#x}+{:#x} skipped: the guest changed that "
+                            "memory while it was in flight",
+                            device_addr, download_size);
+            } else {
                 download.Invalidate();
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                           download.mapped, download_size);
-                runtime.GetStagingPool().FreeDeferred(download);
-            });
+            }
+            runtime.GetStagingPool().FreeDeferred(download);
+        });
     }
 }
 
