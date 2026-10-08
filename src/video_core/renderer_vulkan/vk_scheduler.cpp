@@ -6,8 +6,8 @@
 #include <string>
 
 #include "common/assert.h"
-#include "common/logging/log.h"
 #include "common/debug.h"
+#include "common/logging/log.h"
 #include "common/perf_monitor.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"

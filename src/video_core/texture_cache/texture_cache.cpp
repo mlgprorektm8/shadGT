@@ -4,15 +4,15 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <unordered_set>
 #include <limits>
+#include <unordered_set>
 #include <xxhash.h>
 
-#include "common/perf_monitor.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/hash.h"
+#include "common/perf_monitor.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -166,9 +166,9 @@ static u32 ImageDownloadSize(const Image& image) {
 
 bool TextureCache::ShouldReadBack(const Image& image) {
     if (!readback_linear_images || (image.info.props.is_tiled && image.info.size.width > 8) ||
-        image.info.guest_address == 0 || image.info.props.is_depth ||
-        image.info.size.depth > 1 || image.info.num_samples > 1 ||
-        image.info.resources.layers > 1 || ImageDownloadSize(image) > image.info.guest_size) {
+        image.info.guest_address == 0 || image.info.props.is_depth || image.info.size.depth > 1 ||
+        image.info.num_samples > 1 || image.info.resources.layers > 1 ||
+        ImageDownloadSize(image) > image.info.guest_size) {
         return false;
     }
     // CPU-read GPU results such as luminance chains are tiny; large linear targets are not
@@ -179,7 +179,8 @@ bool TextureCache::ShouldReadBack(const Image& image) {
     const u32 size = ImageDownloadSize(image);
     if (size <= MaxReadbackSize) {
         static std::unordered_set<VAddr> logged_readbacks;
-        if (logged_readbacks.size() < 16 && logged_readbacks.insert(image.info.guest_address).second) {
+        if (logged_readbacks.size() < 16 &&
+            logged_readbacks.insert(image.info.guest_address).second) {
             LOG_WARNING(Render_Vulkan, "Reading back {}x{} linear image at {:#x} ({} bytes)",
                         image.info.size.width, image.info.size.height, image.info.guest_address,
                         size);
@@ -190,8 +191,7 @@ bool TextureCache::ShouldReadBack(const Image& image) {
     const u64 key = u64(image.info.size.width) << 32 | image.info.size.height;
     if (logged_sizes.size() < 16 && logged_sizes.insert(key).second) {
         LOG_WARNING(Render_Vulkan, "Not reading back {}x{} linear image at {:#x} ({} bytes)",
-                    image.info.size.width, image.info.size.height, image.info.guest_address,
-                    size);
+                    image.info.size.width, image.info.size.height, image.info.guest_address, size);
     }
     return false;
 }
@@ -750,8 +750,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     collect_same_address(same_address);
     SmallVector<ImageId, 4> newer_subrects;
     for (const auto& cache_id : same_address) {
-        if (cache_id == image_id || !slot_images[cache_id].info.IsSubrectOf(
-                                        slot_images[image_id].info)) {
+        if (cache_id == image_id ||
+            !slot_images[cache_id].info.IsSubrectOf(slot_images[image_id].info)) {
             continue;
         }
         const Image& subrect = slot_images[cache_id];
@@ -761,9 +761,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
     }
     if (!newer_subrects.empty()) {
-        std::ranges::sort(newer_subrects, {}, [&](ImageId id) {
-            return slot_images[id].contents_version;
-        });
+        std::ranges::sort(newer_subrects, {},
+                          [&](ImageId id) { return slot_images[id].contents_version; });
         RefreshImage(slot_images[image_id]);
         for (const auto subrect_id : newer_subrects) {
             runtime.CopySubrect(&slot_images[subrect_id], &slot_images[image_id]);

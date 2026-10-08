@@ -26,8 +26,8 @@ inline void ExportPosition(IREmitter& ir, const StageRuntimeInfo& stage,
         // The final pre-rasterization stage must write these outputs. Auxiliary tessellation
         // forwards layer selection, but point size and viewport selection remain unsupported.
         // only matters for vertex shaders, as geometry shaders come last in pre-rasterization.
-        const auto last_stage_required = output == Output::PointSize ||
-                                         output == Output::ViewportIndex;
+        const auto last_stage_required =
+            output == Output::PointSize || output == Output::ViewportIndex;
         if (tess_emulated_primitive && last_stage_required) {
             LOG_WARNING(Render,
                         "{} is exported in vertex shader but tessellation-based primitive "

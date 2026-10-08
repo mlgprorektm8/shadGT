@@ -103,7 +103,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         // HLE bypasses shader buffer binding, so publish the destination write to image aliases.
         // Buffer preparation must finish before invalidation to preserve untouched image bytes.
         texture_cache.InvalidateMemoryFromGPU(dst_buf_sharp.base_address + dst_offset_min,
-                                             dst_offset_max - dst_offset_min);
+                                              dst_offset_max - dst_offset_min);
         batch_start = batch_end;
     }
 

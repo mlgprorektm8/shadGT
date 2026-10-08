@@ -467,8 +467,7 @@ void LowerDynamicReadConstPass(IR::Program& program, ResourceDiscoveryList& reso
                 const auto* source = value.TryInst();
                 return source && source->GetOpcode() == IR::Opcode::GetUserData;
             };
-            if (!is_host_pointer_dword(base->Arg(0)) ||
-                !is_host_pointer_dword(base->Arg(1))) {
+            if (!is_host_pointer_dword(base->Arg(0)) || !is_host_pointer_dword(base->Arg(1))) {
                 continue;
             }
 

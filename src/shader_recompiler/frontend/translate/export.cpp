@@ -162,11 +162,11 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
             const u32 channel = color_buffer.swizzle.Map(i);
             const auto dst_factor =
                 channel == 3 ? color_buffer.swizzled_alpha_dst : color_buffer.swizzled_color_dst;
-            const auto one_minus = dst_factor == Factor::Zero  ? ir.Imm32(1.f)
-                                   : dst_factor == Factor::One ? ir.Imm32(0.f)
-                                                               : IR::F32{ir.FPSub(
-                                                                     ir.Imm32(1.f),
-                                                                     factor(dst_factor, channel))};
+            const auto one_minus =
+                dst_factor == Factor::Zero ? ir.Imm32(1.f)
+                : dst_factor == Factor::One
+                    ? ir.Imm32(0.f)
+                    : IR::F32{ir.FPSub(ir.Imm32(1.f), factor(dst_factor, channel))};
             ir.SetAttribute(IR::Attribute::RenderTarget1, one_minus, i);
         }
         // Primary source premultiplied by each logical channel's source factor.
@@ -177,10 +177,10 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
             const auto src_factor =
                 channel == 3 ? color_buffer.swizzled_alpha_src : color_buffer.swizzled_color_src;
             components[channel] =
-                src_factor == Factor::Zero  ? ir.Imm32(0.f)
-                : src_factor == Factor::One ? source[channel]
-                                            : IR::F32{ir.FPMul(factor(src_factor, channel),
-                                                               source[channel])};
+                src_factor == Factor::Zero ? ir.Imm32(0.f)
+                : src_factor == Factor::One
+                    ? source[channel]
+                    : IR::F32{ir.FPMul(factor(src_factor, channel), source[channel])};
         }
     }
 

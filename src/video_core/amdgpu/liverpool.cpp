@@ -54,14 +54,22 @@ static void WriteDeferredFence(void* address, const void* data, u32 num_bytes) {
 
 // PERF-DIAG-009: how long each queue's command processing is blocked in wait packets, and on
 // which addresses, reported every 2 s. Only the command processor thread updates it.
-enum class FrontendWait : u32 { GfxWaitRegMem, GfxVoLabel, GfxMemSemaphore, GfxRewind,
-                                AscWaitRegMem, AscMemSemaphore, AscRewind, Count };
+enum class FrontendWait : u32 {
+    GfxWaitRegMem,
+    GfxVoLabel,
+    GfxMemSemaphore,
+    GfxRewind,
+    AscWaitRegMem,
+    AscMemSemaphore,
+    AscRewind,
+    Count
+};
 static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
                                std::chrono::steady_clock::time_point start) {
     // PERF-012: whoever the queue waited for may have written memory later draws read.
     VideoCore::BumpUploadEpoch();
     static constexpr std::array<const char*, size_t(FrontendWait::Count)> Names = {
-        "gfx WAIT_REG_MEM", "gfx VO label", "gfx MEM_SEMAPHORE", "gfx REWIND",
+        "gfx WAIT_REG_MEM", "gfx VO label",      "gfx MEM_SEMAPHORE", "gfx REWIND",
         "asc WAIT_REG_MEM", "asc MEM_SEMAPHORE", "asc REWIND"};
     static std::array<std::pair<u32, double>, size_t(FrontendWait::Count)> totals{};
     static std::pair<u32, double> gfx_on_fence{};
@@ -96,7 +104,7 @@ static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
                            gfx_on_fence.first, gfx_on_fence.second);
     gfx_on_fence = {};
     std::vector<std::pair<uintptr_t, std::pair<FrontendWait, double>>> top(addresses.begin(),
-                                                                          addresses.end());
+                                                                           addresses.end());
     std::ranges::sort(top, std::greater{}, [](const auto& e) { return e.second.second; });
     summary += ";";
     for (size_t i = 0; i < std::min<size_t>(5, top.size()); ++i) {
@@ -132,8 +140,7 @@ static bool SatisfiedByPendingFence(Vulkan::Rasterizer* rasterizer,
     // data back to guest memory. In GT Sport one always does, so it never went early. The
     // exploded vertices first blamed on PERF-014 came from PERF-015.
     static const bool wait_for_readbacks = !Common::PerfFeatureEnabled(1402);
-    if (!enabled || !rasterizer ||
-        wait_reg_mem->mem_space != PM4CmdWaitRegMem::MemSpace::Memory ||
+    if (!enabled || !rasterizer || wait_reg_mem->mem_space != PM4CmdWaitRegMem::MemSpace::Memory ||
         (wait_for_readbacks && rasterizer->HasReadbackFences())) {
         return false;
     }
@@ -457,7 +464,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
             ++Common::GetWorkCounters().pm4_packets;
-            lookahead_dcb = dcb.size() > count + 1 ? dcb.subspan(count + 1) : std::span<const u32>{};
+            lookahead_dcb =
+                dcb.size() > count + 1 ? dcb.subspan(count + 1) : std::span<const u32>{};
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -868,8 +876,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 WriteDeferredFence(address, &data, num_bytes);
                             });
                         },
-                        false,
-                        FenceValueBytes(DataSelect::Data32Low, event_eos->DataDWord(), 0));
+                        false, FenceValueBytes(DataSelect::Data32Low, event_eos->DataDWord(), 0));
                 if (!deferred) {
                     if (rasterizer) {
                         rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEos);
@@ -894,15 +901,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* event_eop = &event;
                 const bool deferred =
                     rasterizer &&
-                    rasterizer->DeferFenceSignal(reinterpret_cast<VAddr>(event_eop->Address<u32>()),
-                                                 [event] {
-                    event.SignalFence(
-                        [](void* address, u64 data, u32 num_bytes) {
-                            WriteDeferredFence(address, &data, num_bytes);
+                    rasterizer->DeferFenceSignal(
+                        reinterpret_cast<VAddr>(event_eop->Address<u32>()),
+                        [event] {
+                            event.SignalFence(
+                                [](void* address, u64 data, u32 num_bytes) {
+                                    WriteDeferredFence(address, &data, num_bytes);
+                                },
+                                [] {
+                                    Platform::IrqC::Instance()->Signal(
+                                        Platform::InterruptId::GfxEop);
+                                });
                         },
-                        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
-                }, false, FenceValueBytes(event_eop->data_sel.Value(), event_eop->DataDWord(),
-                                          event_eop->DataQWord()));
+                        false,
+                        FenceValueBytes(event_eop->data_sel.Value(), event_eop->DataDWord(),
+                                        event_eop->DataQWord()));
                 if (!deferred) {
                     if (rasterizer) {
                         rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEop);
@@ -1037,7 +1050,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto rewind_start = std::chrono::steady_clock::now();
                 const bool rewind_waited =
                     !RefreshRewindTailIfReady(snapshot, live_dcb, rewind_offset);
-                while (rewind_waited && !RefreshRewindTailIfReady(snapshot, live_dcb, rewind_offset)) {
+                while (rewind_waited &&
+                       !RefreshRewindTailIfReady(snapshot, live_dcb, rewind_offset)) {
                     if (diagnostics.Ready()) {
                         LOG_WARNING(Render, "GPU REWIND stalled: snapshot={:#x} live={:#x}",
                                     reinterpret_cast<uintptr_t>(header),
@@ -1046,8 +1060,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                 }
                 if (rewind_waited) {
-                    RecordFrontendWait(FrontendWait::GfxRewind,
-                                       reinterpret_cast<uintptr_t>(header), rewind_start);
+                    RecordFrontendWait(FrontendWait::GfxRewind, reinterpret_cast<uintptr_t>(header),
+                                       rewind_start);
                 }
                 break;
             }
@@ -1617,38 +1631,42 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto pipe_id = queue.pipe_id;
             const bool deferred =
                 rasterizer && release.data_sel != DataSelect::GdsMemStore &&
-                rasterizer->DeferFenceSignal(release.Address<VAddr>(), [release, pipe_id] {
-                    u64 value{};
-                    u32 num_bytes = sizeof(u64);
-                    switch (release.data_sel.Value()) {
-                    case DataSelect::None:
-                        num_bytes = 0;
-                        break;
-                    case DataSelect::Data32Low:
-                        value = release.DataDWord();
-                        num_bytes = sizeof(u32);
-                        break;
-                    case DataSelect::Data64:
-                        value = release.DataQWord();
-                        break;
-                    case DataSelect::GpuClock64:
-                        value = GetGpuClock64();
-                        break;
-                    case DataSelect::PerfCounter:
-                        value = GetGpuPerfCounter();
-                        break;
-                    default:
-                        UNREACHABLE();
-                    }
-                    if (num_bytes != 0) {
-                        WriteDeferredFence(release.Address<void*>(), &value, num_bytes);
-                    }
-                    if (release.int_sel != InterruptSelect::None) {
-                        Platform::IrqC::Instance()->Signal(
-                            static_cast<Platform::InterruptId>(pipe_id));
-                    }
-                }, true, FenceValueBytes(release.data_sel.Value(), release.DataDWord(),
-                                         release.DataQWord()));
+                rasterizer->DeferFenceSignal(
+                    release.Address<VAddr>(),
+                    [release, pipe_id] {
+                        u64 value{};
+                        u32 num_bytes = sizeof(u64);
+                        switch (release.data_sel.Value()) {
+                        case DataSelect::None:
+                            num_bytes = 0;
+                            break;
+                        case DataSelect::Data32Low:
+                            value = release.DataDWord();
+                            num_bytes = sizeof(u32);
+                            break;
+                        case DataSelect::Data64:
+                            value = release.DataQWord();
+                            break;
+                        case DataSelect::GpuClock64:
+                            value = GetGpuClock64();
+                            break;
+                        case DataSelect::PerfCounter:
+                            value = GetGpuPerfCounter();
+                            break;
+                        default:
+                            UNREACHABLE();
+                        }
+                        if (num_bytes != 0) {
+                            WriteDeferredFence(release.Address<void*>(), &value, num_bytes);
+                        }
+                        if (release.int_sel != InterruptSelect::None) {
+                            Platform::IrqC::Instance()->Signal(
+                                static_cast<Platform::InterruptId>(pipe_id));
+                        }
+                    },
+                    true,
+                    FenceValueBytes(release.data_sel.Value(), release.DataDWord(),
+                                    release.DataQWord()));
             if (deferred) {
                 break;
             }

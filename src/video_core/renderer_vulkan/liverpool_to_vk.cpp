@@ -347,9 +347,8 @@ void SetSwizzledFactorBlend(vk::PipelineColorBlendAttachmentState& attachment,
 bool NeedsSwizzledAlphaBlend(AmdGpu::CompMapping swizzle, const AmdGpu::BlendControl& control) {
     using Factor = AmdGpu::BlendControl::BlendFactor;
     using Func = AmdGpu::BlendControl::BlendFunc;
-    return MovesAlphaLane(swizzle) && control.enable &&
-           control.separate_alpha_blend && control.color_func == Func::Add &&
-           control.color_src_factor == Factor::SrcAlpha &&
+    return MovesAlphaLane(swizzle) && control.enable && control.separate_alpha_blend &&
+           control.color_func == Func::Add && control.color_src_factor == Factor::SrcAlpha &&
            control.color_dst_factor == Factor::OneMinusSrcAlpha &&
            control.alpha_func == Func::Add && control.alpha_src_factor == Factor::Zero &&
            control.alpha_dst_factor == Factor::OneMinusSrcAlpha;

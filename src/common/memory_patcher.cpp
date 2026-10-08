@@ -129,8 +129,7 @@ std::string convertValueToHex(const std::string type, const std::string valueStr
 
 void ApplyPendingPatches();
 
-static void ApplyPatchesFromDocument(pugi::xml_document& doc,
-                                     const pugi::xml_parse_result& result);
+static void ApplyPatchesFromDocument(pugi::xml_document& doc, const pugi::xml_parse_result& result);
 
 void ApplyPatchesFromXML(std::filesystem::path path) {
     pugi::xml_document doc;

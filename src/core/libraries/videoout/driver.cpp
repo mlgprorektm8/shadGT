@@ -233,7 +233,6 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
-
 // PERF-DIAG-002: flip pacing. Submit-to-flip latency, Present() time, and queued flips at each
 // vblank, reported every 2 s.
 namespace {

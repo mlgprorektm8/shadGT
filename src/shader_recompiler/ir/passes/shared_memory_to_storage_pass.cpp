@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/ir/ir_emitter.h"
-#include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/ir/passes/shared_memory_to_storage.h"
+#include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 
 namespace Shader::Optimization {

@@ -6,8 +6,8 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
-#include "common/perf_monitor.h"
 #include "common/debug.h"
+#include "common/perf_monitor.h"
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
@@ -282,10 +282,8 @@ bool Instance::CreateDevice() {
     // PERF-017: build runtime pipelines from separately compiled stage libraries.
     if (feature_chain.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
             .graphicsPipelineLibrary &&
-        Common::PerfFeatureEnabled(17) &&
-        add_extension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
-        graphics_pipeline_library =
-            add_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        Common::PerfFeatureEnabled(17) && add_extension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+        graphics_pipeline_library = add_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
     }
     if (dynamic_state_3) {
         dynamic_state_3_features =

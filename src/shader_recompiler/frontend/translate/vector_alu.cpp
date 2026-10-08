@@ -854,10 +854,8 @@ void Translator::V_CVT_PKRTZ_F16_F32(const GcnInst& inst) {
         const IR::U32 exponent{ir.BitFieldExtract(bits, ir.Imm32(23u), ir.Imm32(8u))};
         // f32 biased exponents 113..142 are f16 normals (keep 10 mantissa bits). Below that,
         // f16 denormals keep one bit fewer per exponent step, down to 2^-24 at exponent 103.
-        const IR::U32 denorm_steps{
-            ir.ISub(ir.UMax(exponent, ir.Imm32(103u)), ir.Imm32(103u))};
-        const IR::U32 drop_bits{
-            ir.ISub(ir.Imm32(23u), ir.UMin(denorm_steps, ir.Imm32(10u)))};
+        const IR::U32 denorm_steps{ir.ISub(ir.UMax(exponent, ir.Imm32(103u)), ir.Imm32(103u))};
+        const IR::U32 drop_bits{ir.ISub(ir.Imm32(23u), ir.UMin(denorm_steps, ir.Imm32(10u)))};
         const IR::U32 truncated{
             ir.BitwiseAnd(bits, ir.ShiftLeftLogical(ir.Imm32(0xffffffffu), drop_bits))};
         const IR::U1 is_inf_nan{ir.IEqual(exponent, ir.Imm32(0xffu))};

@@ -24,8 +24,8 @@ inline StageResourceBindings PlanStageResourceBindings(const Shader::Info& stage
 }
 
 template <typename Func>
-u32 ForEachImageDescriptorBinding(const Shader::Info& stage,
-                                  const Shader::ImageResource& resource, Func&& bind) {
+u32 ForEachImageDescriptorBinding(const Shader::Info& stage, const Shader::ImageResource& resource,
+                                  Func&& bind) {
     const u32 count = resource.NumBindings(stage);
     for (u32 i = 0; i < count; ++i) {
         bind(resource.is_written);

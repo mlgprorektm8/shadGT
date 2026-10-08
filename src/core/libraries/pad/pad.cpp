@@ -355,9 +355,8 @@ int PS4_SYSV_ABI scePadOpen(Libraries::UserService::OrbisUserServiceUserId userI
         pad_handle_map[{userId, type, index}] = new_handle;
 
         handle_to_controller_map[new_handle] =
-            controllers[type == (EmulatorSettings.IsUsingSpecialPad() ? 2 : 0)
-                            ? u->player_index - 1
-                            : 4];
+            controllers[type == (EmulatorSettings.IsUsingSpecialPad() ? 2 : 0) ? u->player_index - 1
+                                                                               : 4];
         LOG_INFO(Lib_Pad,
                  "called user_id = {}, type = {}, index = {}, player index = {}, out handle = {}",
                  userId, type, index, u->player_index, new_handle);

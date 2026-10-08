@@ -704,46 +704,44 @@ GraphicsPipeline::GraphicsPipeline(
                    vk::to_string(link_result));
         pipeline = std::move(linked);
         SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
-        LOG_WARNING(Render_Vulkan,
-                    "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
-                    "link {:.1f} ms",
-                    debug_str,
-                    std::chrono::duration<double, std::milli>(libraries_done - create_start)
-                        .count(),
-                    pre_raster_reused ? "reused" : "compiled",
-                    fragment_reused ? "reused" : "compiled",
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                              libraries_done)
-                        .count());
+        LOG_WARNING(
+            Render_Vulkan,
+            "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
+            "link {:.1f} ms",
+            debug_str,
+            std::chrono::duration<double, std::milli>(libraries_done - create_start).count(),
+            pre_raster_reused ? "reused" : "compiled", fragment_reused ? "reused" : "compiled",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                      libraries_done)
+                .count());
 
         auto promise = std::make_shared<std::promise<void>>();
         library_link->optimized = promise->get_future();
         const auto layout = *pipeline_layout;
-        PipelineLinkWorkers::Instance().Push(
-            [this, device, layout, library_handles, promise, cache = pipeline_cache] {
-                // PERF-021: the fast-linked pipeline renders the same, so the optimized one can
-                // wait until new pipelines stop appearing (the worker only sleeps meanwhile).
-                if (Common::PerfFeatureEnabled(21)) {
-                    while (SteadyMs() - last_pipeline_miss_ms.load(std::memory_order_relaxed) <
-                           3000) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{100});
-                    }
+        PipelineLinkWorkers::Instance().Push([this, device, layout, library_handles, promise,
+                                              cache = pipeline_cache] {
+            // PERF-021: the fast-linked pipeline renders the same, so the optimized one can
+            // wait until new pipelines stop appearing (the worker only sleeps meanwhile).
+            if (Common::PerfFeatureEnabled(21)) {
+                while (SteadyMs() - last_pipeline_miss_ms.load(std::memory_order_relaxed) < 3000) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds{100});
                 }
-                const vk::PipelineLibraryCreateInfoKHR libraries_info = {
-                    .libraryCount = static_cast<u32>(library_handles.size()),
-                    .pLibraries = library_handles.data(),
-                };
-                const vk::GraphicsPipelineCreateInfo optimized_info = {
-                    .pNext = &libraries_info,
-                    .flags = vk::PipelineCreateFlagBits::eLinkTimeOptimizationEXT,
-                    .layout = layout,
-                };
-                auto [result, optimized] = device.createGraphicsPipeline(cache, optimized_info);
-                if (result == vk::Result::eSuccess) {
-                    optimized_pipeline.store(optimized, std::memory_order_release);
-                }
-                promise->set_value();
-            });
+            }
+            const vk::PipelineLibraryCreateInfoKHR libraries_info = {
+                .libraryCount = static_cast<u32>(library_handles.size()),
+                .pLibraries = library_handles.data(),
+            };
+            const vk::GraphicsPipelineCreateInfo optimized_info = {
+                .pNext = &libraries_info,
+                .flags = vk::PipelineCreateFlagBits::eLinkTimeOptimizationEXT,
+                .layout = layout,
+            };
+            auto [result, optimized] = device.createGraphicsPipeline(cache, optimized_info);
+            if (result == vk::Result::eSuccess) {
+                optimized_pipeline.store(optimized, std::memory_order_release);
+            }
+            promise->set_value();
+        });
         return;
     }
 

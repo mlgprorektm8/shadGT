@@ -7,10 +7,10 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/decoder.h"
-#include "common/perf_monitor.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
+#include "common/perf_monitor.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
@@ -441,11 +441,11 @@ struct SignalImpl : public PageManager::Impl {
     static u64 ExactWriteSize(void* context, VAddr addr) {
         ZydisDecodedInstruction instruction;
         ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-        const auto status = Common::Decoder::Instance()->decodeInstruction(
-            instruction, operands, Common::GetRip(context));
+        const auto status = Common::Decoder::Instance()->decodeInstruction(instruction, operands,
+                                                                           Common::GetRip(context));
         if (!ZYAN_SUCCESS(status) ||
-            (instruction.attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE |
-                                       ZYDIS_ATTRIB_HAS_REPNE)) != 0) {
+            (instruction.attributes &
+             (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE)) != 0) {
             return 0;
         }
         switch (instruction.mnemonic) {

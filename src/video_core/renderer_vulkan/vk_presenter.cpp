@@ -1106,7 +1106,8 @@ Frame* Presenter::GetRenderFrame() {
         stats.total_ms += ms;
         stats.max_ms = std::max(stats.max_ms, ms);
         if (now - stats.window >= std::chrono::seconds{2}) {
-            LOG_WARNING(Render_Vulkan, "Render frame waits: {} in {:.1f} s, total {:.1f} ms, max {:.2f} ms",
+            LOG_WARNING(Render_Vulkan,
+                        "Render frame waits: {} in {:.1f} s, total {:.1f} ms, max {:.2f} ms",
                         stats.count, std::chrono::duration<double>(now - stats.window).count(),
                         stats.total_ms, stats.max_ms);
             stats = {};

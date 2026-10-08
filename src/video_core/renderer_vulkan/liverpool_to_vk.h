@@ -52,8 +52,7 @@ SwizzledFactorBlend EffectiveBlend(const AmdGpu::BlendControl& control);
 
 /// True when an enabled blend gives a different result depending on which physical lane holds
 /// logical alpha, so the native Vulkan blend is wrong for this swizzle.
-bool IsLaneDependentSwizzledBlend(AmdGpu::CompMapping swizzle,
-                                  const AmdGpu::BlendControl& control);
+bool IsLaneDependentSwizzledBlend(AmdGpu::CompMapping swizzle, const AmdGpu::BlendControl& control);
 
 /// Lane-dependent blends that the general dual-source emulation reproduces exactly. Returns
 /// nullopt for blends handled by NeedsSwizzledAlphaBlend and for unsupported equations.

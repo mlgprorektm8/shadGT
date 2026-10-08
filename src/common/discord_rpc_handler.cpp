@@ -14,7 +14,8 @@ void RPC::init() {
 void RPC::setStatusIdling() {
     DiscordRichPresence rpc{};
     rpc.details = "running on shadGT";
-    rpc.largeImageKey = "https://raw.githubusercontent.com/mlgprorektm8/shadPS4/main/assets/GranTurismoSportIcon.jpg";
+    rpc.largeImageKey = "https://raw.githubusercontent.com/mlgprorektm8/shadPS4/main/assets/"
+                        "GranTurismoSportIcon.jpg";
     rpc.largeImageText = "Gran Turismo Sport";
     status = RPCStatus::Idling;
     Discord_UpdatePresence(&rpc);
@@ -23,7 +24,8 @@ void RPC::setStatusIdling() {
 void RPC::setStatusPlaying(const std::string&, const std::string&) {
     DiscordRichPresence rpc{};
     rpc.details = "running on shadGT";
-    rpc.largeImageKey = "https://raw.githubusercontent.com/mlgprorektm8/shadPS4/main/assets/GranTurismoSportIcon.jpg";
+    rpc.largeImageKey = "https://raw.githubusercontent.com/mlgprorektm8/shadPS4/main/assets/"
+                        "GranTurismoSportIcon.jpg";
     rpc.largeImageText = "Gran Turismo Sport";
     status = RPCStatus::Playing;
     Discord_UpdatePresence(&rpc);
