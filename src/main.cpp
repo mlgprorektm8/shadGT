@@ -112,9 +112,15 @@ int main(int argc, char* argv[]) {
     app.allow_extras();
 
     // ---- No-args behavior ----
-    // Started without arguments (double-clicked): open the built-in game list (Big Picture
-    // mode), where game folders are added under Settings and a game starts with a click.
-    const bool open_game_list = argc == 1;
+    if (argc == 1) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadPS4",
+                                 "This is a CLI application. Please use the '-b' flag for Big "
+                                 "Picture mode, or QTLauncher for a standalone GUI:\n"
+                                 "https://github.com/shadps4-emu/shadps4-qtlauncher/releases",
+                                 nullptr);
+        std::cout << app.help();
+        return -1;
+    }
 
     try {
         bool double_dash_found = false;
@@ -156,7 +162,7 @@ int main(int argc, char* argv[]) {
     EmulatorSettings.Load();
     UserSettings.Load();
 
-    if (bigPicture || open_game_list) {
+    if (bigPicture) {
         BigPictureMode::Launch(argv[0], sameProcess);
         return 0;
     }
