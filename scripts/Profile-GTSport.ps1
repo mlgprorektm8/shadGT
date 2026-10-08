@@ -28,14 +28,14 @@ $BuildDirectory = (Resolve-Path -LiteralPath $BuildDirectory).Path
 $profileDirectory = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../Build/gt-sport-fixed')).Path
 $launcher = Join-Path $PSScriptRoot 'Run-GTSportPerformance.ps1'
 $xperf = 'C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe'
-foreach ($file in @((Join-Path $BuildDirectory 'shadps4.exe'), (Join-Path $BuildDirectory 'shadps4.pdb'),
+foreach ($file in @((Join-Path $BuildDirectory 'shadGT.exe'), (Join-Path $BuildDirectory 'shadGT.pdb'),
         $launcher, $xperf)) {
     if (!(Test-Path -LiteralPath $file -PathType Leaf)) {
         throw "Missing profiling prerequisite: $file"
     }
 }
 $wpr = (Get-Command wpr.exe).Source
-if (Get-Process shadps4 -ErrorAction SilentlyContinue) {
+if (Get-Process shadGT -ErrorAction SilentlyContinue) {
     throw 'Close the current emulator before starting a profiling run.'
 }
 if (!$OutputDirectory) {
@@ -89,7 +89,7 @@ $runner = Start-Process -FilePath powershell.exe -PassThru -ArgumentList @('-NoP
 $emulator = $null
 for ($i = 0; $i -lt 120 -and !$emulator; ++$i) {
     Start-Sleep -Milliseconds 500
-    $emulator = Get-Process shadps4 -ErrorAction SilentlyContinue | Select-Object -First 1
+    $emulator = Get-Process shadGT -ErrorAction SilentlyContinue | Select-Object -First 1
 }
 if (!$emulator) {
     throw 'The emulator did not start; see the performance launcher window.'

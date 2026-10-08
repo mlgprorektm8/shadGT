@@ -119,7 +119,7 @@ void NpHandler::Initialize() {
                 ImGui::ShadNetNotify::Push(
                     ImGui::ShadNetNotify::Kind::Info,
                     fmt::format("shadNet protocol version mismatch (server v{}, emulator v{}). "
-                                "Please update shadPS4. Online features are disabled for this "
+                                "Please update shadGT. Online features are disabled for this "
                                 "session.",
                                 probe.server_version, ShadNet::SHAD_PROTOCOL_VERSION));
                 break;
@@ -248,7 +248,7 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
             ImGui::ShadNetNotify::Push(
                 ImGui::ShadNetNotify::Kind::Info,
                 fmt::format("shadNet protocol version mismatch (server v{}, emulator v{}). "
-                            "Please update shadPS4. Online features are disabled for this "
+                            "Please update shadGT. Online features are disabled for this "
                             "session.",
                             server_ver, ShadNet::SHAD_PROTOCOL_VERSION));
         } else {

@@ -166,7 +166,7 @@ static std::string TakePhaseTimes() {
 bool PerfFeatureEnabled(u32 id) {
     static const std::vector<u32> disabled = [] {
         std::vector<u32> ids;
-        if (const char* env = std::getenv("SHADPS4_DISABLE_PERF")) {
+        if (const char* env = std::getenv("SHADGT_DISABLE_PERF")) {
             std::string list{env};
             size_t pos = 0;
             while (pos < list.size()) {

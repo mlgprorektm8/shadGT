@@ -64,7 +64,7 @@ public:
 
 private:
     void Work(std::stop_token stop) {
-        Common::SetCurrentThreadName("shadPS4:PipelineBuild");
+        Common::SetCurrentThreadName("shadGT:PipelineBuild");
         while (true) {
             std::function<void()> job;
             {

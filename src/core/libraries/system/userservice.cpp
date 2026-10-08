@@ -1106,7 +1106,7 @@ s32 PS4_SYSV_ABI sceUserServiceGetUserName(int user_id, char* user_name, std::si
         return ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
 
-    std::string name = "shadPS4";
+    std::string name = "shadGT";
     auto const* u = UserManagement.GetUserByID(user_id);
     if (u != nullptr) {
         name = u->user_name;

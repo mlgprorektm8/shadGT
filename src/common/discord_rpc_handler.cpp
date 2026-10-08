@@ -18,7 +18,7 @@ void RPC::init() {
 void RPC::setStatusIdling() {
     DiscordRichPresence rpc{};
     rpc.largeImageKey = "https://cdn.jsdelivr.net/gh/shadps4-emu/shadPS4@main/.github/shadps4.png";
-    rpc.largeImageText = "shadPS4 is a PS4 emulator";
+    rpc.largeImageText = "shadGT: Gran Turismo Sport on shadPS4";
     rpc.startTimestamp = startTimestamp;
     rpc.details = "Idle";
 

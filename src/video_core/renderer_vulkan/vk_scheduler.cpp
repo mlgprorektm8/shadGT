@@ -295,7 +295,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 void Scheduler::PerfMonitorThread(std::stop_token stoken) {
     // PERF-DIAG-007: every 2 s, how busy the GPU was (sampled: submitted work not yet complete)
     // and which threads used the CPU, to tell GPU-bound, CPU-bound and serialized frames apart.
-    Common::SetCurrentThreadName("shadPS4:PerfMonitor");
+    Common::SetCurrentThreadName("shadGT:PerfMonitor");
     Common::SampleThreadCpuUsage(0);
     auto window_start = std::chrono::steady_clock::now();
     u64 samples = 0;
@@ -327,7 +327,7 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
-    Common::SetCurrentThreadName("shadPS4:GpuSchedPriorityPendingOpsRunner");
+    Common::SetCurrentThreadName("shadGT:GpuSchedPriorityPendingOpsRunner");
 
     while (!stoken.stop_requested()) {
         PendingOp op;

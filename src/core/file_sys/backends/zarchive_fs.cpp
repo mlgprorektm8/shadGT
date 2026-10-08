@@ -48,7 +48,7 @@ SharedReader::~SharedReader() {
 }
 
 void SharedReader::WorkerLoop() {
-    Common::SetCurrentThreadName("shadPS4:ZArchiveIO");
+    Common::SetCurrentThreadName("shadGT:ZArchiveIO");
     std::unique_lock lk{m_job_mutex};
     while (true) {
         m_job_cv.wait(lk, [this] { return m_has_job || m_stop; });

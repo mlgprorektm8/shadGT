@@ -73,7 +73,7 @@ private:
         const u32 count = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u);
         for (u32 i = 0; i < count; ++i) {
             threads.emplace_back([this](std::stop_token stop) {
-                Common::SetCurrentThreadName("shadPS4:PipelineLink");
+                Common::SetCurrentThreadName("shadGT:PipelineLink");
                 while (true) {
                     std::function<void()> job;
                     {

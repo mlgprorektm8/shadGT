@@ -207,7 +207,7 @@ static void ApplyPatchesFromDocument(pugi::xml_document& doc,
                                            "Failed to parse patch value \"{}\" for \"{}\" in "
                                            "patch \"{}\", error: \"{}\"\n"
                                            "If the patch was working on earlier versions, then it "
-                                           "was using a format that shadPS4 handled incorrectly, "
+                                           "was using a format that shadGT handled incorrectly, "
                                            "and the patch should instead be fixed.",
                                            patchValue, address, currentPatchName, e.what());
                             }

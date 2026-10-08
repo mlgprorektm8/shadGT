@@ -345,7 +345,7 @@ public:
     }
 
     void UffdHandler(std::stop_token token) {
-        Common::SetCurrentThreadName("shadPS4:Uffd");
+        Common::SetCurrentThreadName("shadGT:Uffd");
 
         auto regions = Core::Memory::Instance()->GetAddressSpace().GetUsableRegions();
         for (auto& region : regions) {

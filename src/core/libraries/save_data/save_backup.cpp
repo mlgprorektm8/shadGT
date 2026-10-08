@@ -117,7 +117,7 @@ static void backup(const std::filesystem::path& dir_name) {
 }
 
 static void BackupThreadBody() {
-    Common::SetCurrentThreadName("shadPS4:SaveData:BackupThread");
+    Common::SetCurrentThreadName("shadGT:SaveData:BackupThread");
     while (g_backup_status != WorkerStatus::Stopping) {
         g_backup_status = WorkerStatus::Waiting;
 

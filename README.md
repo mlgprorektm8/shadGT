@@ -4,6 +4,36 @@ SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
 <h1 align="center">
+  <b>shadGT</b>
+  <br>
+  <sub>Gran Turismo Sport on a fork of the shadPS4 emulator</sub>
+</h1>
+
+# shadGT
+
+shadGT is a fork of [shadPS4](https://github.com/shadps4-emu/shadPS4) focused on running
+**Gran Turismo Sport** (CUSA03220, update 1.69) correctly and fast on Windows. It keeps the
+shadPS4 emulator core and adds, among other things:
+
+- Graphics fixes for GT Sport, and car thumbnails that no longer stop the game.
+- Faster races: GPU command processing changes, and pipelines built ahead of their draws on all
+  CPU cores so new scenes stall far less.
+- The GT Sport 1.69 boot patch applied automatically.
+- A portable folder: all settings, saves, shader cache and logs stay beside the executable.
+
+To play, use a portable folder made by `scripts/Make-GTSportPortable.ps1`: start
+`shadGT Launcher.exe` (the [shadPS4 Qt launcher](https://github.com/shadps4-emu/shadps4-qtlauncher)),
+add your games folder, and start GT Sport. Its README lists what you need from your own console.
+
+Details: [GT_SPORT_BASELINE.md](GT_SPORT_BASELINE.md) (tested builds and results) and
+[GT_SPORT_OPTIMIZATION_LOG.md](GT_SPORT_OPTIMIZATION_LOG.md).
+
+All credit for the emulator itself goes to the shadPS4 project and its contributors; shadGT is
+not affiliated with them. The rest of this file is shadPS4's own README.
+
+# About shadPS4 (upstream)
+
+<h1 align="center">
   <br>
   <a href="https://shadPS4.net/"><img src="https://github.com/shadGT-emu/shadGT/blob/main/.github/shadGT.png" width="220"></a>
   <br>

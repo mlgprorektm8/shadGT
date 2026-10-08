@@ -41,7 +41,7 @@ static std::unordered_map<u64, InflateResult> results;
 static u64 next_request_id;
 
 void ZlibTaskThread(const std::stop_token& stop) {
-    Common::SetCurrentThreadName("shadPS4:ZlibTaskThread");
+    Common::SetCurrentThreadName("shadGT:ZlibTaskThread");
 
     while (!stop.stop_requested()) {
         InflateTask task;

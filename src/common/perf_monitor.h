@@ -35,7 +35,7 @@ struct WorkCounters {
 WorkCounters& GetWorkCounters();
 
 /// Experimental-branch switch: false when the PERF id (e.g. 14 for PERF-014) is listed in the
-/// SHADPS4_DISABLE_PERF environment variable (comma separated), for A/B runs without rebuilding.
+/// SHADGT_DISABLE_PERF environment variable (comma separated), for A/B runs without rebuilding.
 bool PerfFeatureEnabled(u32 id);
 
 /// PERF-DIAG-011: command thread time per step of a draw, in TSC ticks, reported every 2 s.

@@ -109,7 +109,7 @@ static auto UserPaths = [] {
 #ifdef _WIN32
     // This fork keeps everything next to the executable on Windows: a user folder in the
     // working directory still wins (the GT Sport launch scripts use one), otherwise the one
-    // beside shadps4.exe is used and created if needed, never AppData.
+    // beside shadGT.exe is used and created if needed, never AppData.
     if (!std::filesystem::exists(user_dir)) {
         user_dir = ExecutableDir() / PORTABLE_DIR;
     }
@@ -119,13 +119,13 @@ static auto UserPaths = [] {
         // NOTE: On Windows we currently just create the portable directory instead.
 #ifdef __APPLE__
         user_dir =
-            std::filesystem::path(getenv("HOME")) / "Library" / "Application Support" / "shadPS4";
+            std::filesystem::path(getenv("HOME")) / "Library" / "Application Support" / "shadGT";
 #elif defined(__linux__)
         const char* xdg_data_home = getenv("XDG_DATA_HOME");
         if (xdg_data_home != nullptr && strlen(xdg_data_home) > 0) {
-            user_dir = std::filesystem::path(xdg_data_home) / "shadPS4";
+            user_dir = std::filesystem::path(xdg_data_home) / "shadGT";
         } else {
-            user_dir = std::filesystem::path(getenv("HOME")) / ".local" / "share" / "shadPS4";
+            user_dir = std::filesystem::path(getenv("HOME")) / ".local" / "share" / "shadGT";
         }
 #elif _WIN32
         // Created below, beside the executable.

@@ -1,4 +1,4 @@
-# Summarizes the 2-second performance reports in a shadPS4 log (PERF-DIAG-001/002/006/007).
+# Summarizes the 2-second performance reports in a shadGT log (PERF-DIAG-001/002/006/007).
 param(
     [Parameter(Mandatory = $true)][string]$LogPath,
     [int]$MinFps = 5

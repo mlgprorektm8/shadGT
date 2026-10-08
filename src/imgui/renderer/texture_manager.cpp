@@ -134,7 +134,7 @@ Inner::~Inner() {
 }
 
 void WorkerLoop() {
-    Common::SetCurrentThreadName("shadPS4:ImGuiTextureManager");
+    Common::SetCurrentThreadName("shadGT:ImGuiTextureManager");
     std::mutex mtx;
     while (g_is_worker_running) {
         std::unique_lock lk{mtx};

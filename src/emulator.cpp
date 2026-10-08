@@ -280,7 +280,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                    std::optional<std::filesystem::path> p_game_folder,
                    std::vector<std::pair<std::filesystem::path, std::string>> mounts,
                    std::vector<std::string> const& env_vars, bool append_log) {
-    Common::SetCurrentThreadName("shadPS4:Main");
+    Common::SetCurrentThreadName("shadGT:Main");
     if (waitForDebuggerBeforeRun) {
         Debugger::WaitForDebuggerAttach();
     }
@@ -461,7 +461,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     ASSERT_MSG(mnt->Exists(guest_eboot_path), "Guest app's main executable {} does not exist",
                guest_eboot_path);
 
-    LOG_INFO(Loader, "Starting shadps4 emulator v{} ", Common::g_version);
+    LOG_INFO(Loader, "Starting shadGT emulator v{} ", Common::g_version);
     LOG_INFO(Loader, "Revision {}", Common::g_scm_rev);
     LOG_INFO(Loader, "Branch {}", Common::g_scm_branch);
     LOG_INFO(Loader, "Description {}", Common::g_scm_desc);
@@ -579,14 +579,14 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     std::string remote_host = Common::GetRemoteNameFromLink();
     if (Common::g_is_release) {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("shadPS4 v{} | {}", Common::g_version, game_title);
+            window_title = fmt::format("shadGT v{} | {}", Common::g_version, game_title);
         } else {
             window_title =
-                fmt::format("shadPS4 {}/v{} | {}", remote_host, Common::g_version, game_title);
+                fmt::format("shadGT {}/v{} | {}", remote_host, Common::g_version, game_title);
         }
     } else {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("shadPS4 v{} {} {} | {}", Common::g_version,
+            window_title = fmt::format("shadGT v{} {} {} | {}", Common::g_version,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         } else {
             // Fork builds show only the game and that this is the current build; the full

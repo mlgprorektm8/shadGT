@@ -62,7 +62,7 @@ void KernelSignalRequest() {
 }
 
 static void KernelServiceThread(std::stop_token stoken) {
-    Common::SetCurrentThreadName("shadPS4:KernelServiceThread");
+    Common::SetCurrentThreadName("shadGT:KernelServiceThread");
 
     while (!stoken.stop_requested()) {
         HLE_TRACE;

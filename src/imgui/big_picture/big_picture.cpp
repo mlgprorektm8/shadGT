@@ -284,7 +284,7 @@ void Launch(char* executableName, bool sameProcess) {
     }
 
     SDL_Window* window =
-        SDL_CreateWindow("shadPS4 Big Picture Mode", 1280, 720,
+        SDL_CreateWindow("shadGT Big Picture Mode", 1280, 720,
                          EmulatorSettings.IsFullScreen() ? SDL_WINDOW_FULLSCREEN : 0);
     if (window == nullptr) {
         LOG_ERROR(ImGui, "SDL Window Creation Error: {}", SDL_GetError());
@@ -433,7 +433,7 @@ void Launch(char* executableName, bool sameProcess) {
         ImVec2 center = ImGui::GetMainViewport()->GetCenter();
         ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         if (ImGui::BeginPopupModal("Confirm Exit", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::Text("This will exit shadPS4!\nAre you sure?");
+            ImGui::Text("This will exit shadGT!\nAre you sure?");
             ImGui::Separator();
 
             if (ImGui::Button("OK", ImVec2(120 * uiScale, 0))) {

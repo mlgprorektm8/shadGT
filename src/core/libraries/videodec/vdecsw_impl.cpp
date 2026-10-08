@@ -229,7 +229,7 @@ s32 VdecDecoder::Reset() {
 }
 
 void VdecDecoder::WorkerLoop(std::stop_token stop_token) {
-    Common::SetCurrentThreadName("shadPS4:VdecswWorker");
+    Common::SetCurrentThreadName("shadGT:VdecswWorker");
 
     std::unique_lock lock{m_mutex};
     while (!stop_token.stop_requested()) {

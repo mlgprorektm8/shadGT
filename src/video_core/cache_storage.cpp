@@ -35,7 +35,7 @@ bool ar_is_read_only{true};
 namespace Storage {
 
 void ProcessIO(const std::stop_token& stoken) {
-    Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
+    Common::SetCurrentThreadName("shadGT:PipelineCacheIO");
 
     while (!stoken.stop_requested()) {
         {

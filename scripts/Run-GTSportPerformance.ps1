@@ -17,14 +17,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$executable = Join-Path $BuildDirectory 'shadps4.exe'
+$executable = Join-Path $BuildDirectory 'shadGT.exe'
 $configPath = Join-Path $ProfileDirectory 'user/config.json'
 foreach ($file in @($executable, $configPath, $GamePath)) {
     if (!(Test-Path -LiteralPath $file -PathType Leaf)) {
         throw "Missing performance-run prerequisite: $file"
     }
 }
-if (Get-Process shadps4 -ErrorAction SilentlyContinue) {
+if (Get-Process shadGT -ErrorAction SilentlyContinue) {
     throw 'Close the current emulator before starting another run.'
 }
 $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
@@ -96,7 +96,7 @@ if (Test-Path -LiteralPath $log) {
     Copy-Item -LiteralPath $log -Destination (Join-Path $ProfileDirectory "log-before-performance-$stamp.txt")
 }
 $variables = @('VK_LOADER_LAYERS_DISABLE', 'VK_LOADER_LAYERS_ENABLE', 'VK_LAYER_PATH', 'CDL_OUTPUT_PATH',
-    'SHADPS4_DISABLE_PERF')
+    'SHADGT_DISABLE_PERF')
 $environment = @{}
 foreach ($name in $variables) {
     $environment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
@@ -106,7 +106,7 @@ try {
     $env:VK_LOADER_LAYERS_DISABLE = '~implicit~'
     $env:VK_LOADER_LAYERS_ENABLE = $null
     $env:VK_LAYER_PATH = $null
-    $env:SHADPS4_DISABLE_PERF = $DisablePerf
+    $env:SHADGT_DISABLE_PERF = $DisablePerf
     if ($DisablePerf) {
         Write-Output "Disabled for this run: PERF $DisablePerf"
     }

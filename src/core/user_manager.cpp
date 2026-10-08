@@ -116,7 +116,7 @@ TransferOption AskMigrationOption() {
         0,
         nullptr,
         "Save Migration",
-        "The shadPS4 save and trophy locations have been updated, and save/trophy "
+        "The shadGT save and trophy locations have been updated, and save/trophy "
         "files have been detected  in the old location.\n"
         "Do you wish to copy them over, move them over, "
 #ifndef _WIN32
@@ -244,7 +244,7 @@ Users UserManager::CreateDefaultUsers() {
     default_users.user = {
         {
             .user_id = 1000,
-            .user_name = "shadPS4",
+            .user_name = "shadGT",
             .user_color = 1,
             .player_index = 1,
             .shadnet_npid = "",
@@ -255,7 +255,7 @@ Users UserManager::CreateDefaultUsers() {
         },
         {
             .user_id = 1001,
-            .user_name = "shadPS4-2",
+            .user_name = "shadGT-2",
             .user_color = 2,
             .player_index = 2,
             .shadnet_npid = "",
@@ -266,7 +266,7 @@ Users UserManager::CreateDefaultUsers() {
         },
         {
             .user_id = 1002,
-            .user_name = "shadPS4-3",
+            .user_name = "shadGT-3",
             .user_color = 3,
             .player_index = 3,
             .shadnet_npid = "",
@@ -277,7 +277,7 @@ Users UserManager::CreateDefaultUsers() {
         },
         {
             .user_id = 1003,
-            .user_name = "shadPS4-4",
+            .user_name = "shadGT-4",
             .user_color = 4,
             .player_index = 4,
             .shadnet_npid = "",

@@ -7,15 +7,15 @@ param(
     [switch]$FullLogging
 )
 
-# Builds a self-contained GT Sport folder: the shadPS4 Qt launcher next to this fork's
-# shadps4.exe, set up to use it. Every setting, save, shader cache and log stays in the "user"
+# Builds a self-contained shadGT folder: the shadPS4 Qt launcher (as shadGT Launcher.exe) next
+# to shadGT.exe, set up to use it. Every setting, save, shader cache and log stays in the "user"
 # (emulator) and "launcher" folders beside them; neither program uses AppData when those
 # folders exist. It copies no game files, firmware modules, fonts, saves, keys or caches: the
 # player supplies those.
 
 $ErrorActionPreference = 'Stop'
 $BuildDirectory = (Resolve-Path -LiteralPath $BuildDirectory).Path
-$executable = Join-Path $BuildDirectory 'shadps4.exe'
+$executable = Join-Path $BuildDirectory 'shadGT.exe'
 if (!(Test-Path -LiteralPath $executable)) {
     throw "Missing $executable; build the Release configuration first."
 }
@@ -26,7 +26,7 @@ if (!(Test-Path -LiteralPath $launcherExe)) {
 $commit = (git -C $PSScriptRoot rev-parse --short HEAD 2>$null)
 if (!$commit) { $commit = 'unknown' }
 if (!$OutputDirectory) {
-    $OutputDirectory = Join-Path $PSScriptRoot "../../shadPS4-portable/GTSport-shadPS4-$(Get-Date -Format 'yyyyMMdd')-$commit"
+    $OutputDirectory = Join-Path $PSScriptRoot "../../shadGT-portable/shadGT-$(Get-Date -Format 'yyyyMMdd')-$commit"
 }
 if (Test-Path -LiteralPath $OutputDirectory) {
     throw "$OutputDirectory already exists; choose another -OutputDirectory."
@@ -37,6 +37,7 @@ foreach ($dir in 'user/sys_modules', 'user/fonts', 'launcher') {
 $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
 Copy-Item -LiteralPath $executable -Destination $OutputDirectory
 Copy-Item -Path (Join-Path $QtLauncherDirectory '*') -Destination $OutputDirectory -Recurse
+Rename-Item -LiteralPath (Join-Path $OutputDirectory 'shadPS4QtLauncher.exe') -NewName 'shadGT Launcher.exe'
 
 # The tested settings, with every machine-specific path cleared so the user folder's own
 # subfolders (sys_modules, fonts, home) are used.
@@ -52,9 +53,9 @@ $config | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $Output
 
 # The launcher starts the selected emulator with its own folder as the working directory, so
 # a path relative to that folder keeps the install movable. No update checks: this fork's
-# shadps4.exe is the version to run.
+# shadGT.exe is the version to run.
 $versions = @(
-    [ordered]@{ name = "GT Sport fork $commit"; path = 'shadps4.exe'; date = (Get-Date -Format 'yyyy-MM-dd'); codename = $commit; type = 2 }
+    [ordered]@{ name = "shadGT $commit"; path = 'shadGT.exe'; date = (Get-Date -Format 'yyyy-MM-dd'); codename = $commit; type = 2 }
 )
 ConvertTo-Json -InputObject $versions -Depth 3 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'launcher/versions.json') -Encoding ASCII
 $launcherSettings = @"
@@ -63,18 +64,18 @@ checkForUpdates=false
 showChangeLog=false
 
 [version_manager]
-versionSelected=shadps4.exe
+versionSelected=shadGT.exe
 checkOnStartup=false
 showChangeLog=false
 "@
 Set-Content -LiteralPath (Join-Path $OutputDirectory 'launcher/qt_ui.ini') -Value $launcherSettings -Encoding ASCII
 
 $readme = @"
-GT Sport on shadPS4 (fork build $commit)
+shadGT (build $commit): Gran Turismo Sport on a fork of the shadPS4 emulator
 
-Start shadPS4QtLauncher.exe. It is the shadPS4 Qt launcher, set up to run this folder's
-shadps4.exe (the fork build tested with GT Sport; keep it selected in the launcher's version
-list). Everything both programs write stays in this folder: the emulator's settings
+Start "shadGT Launcher.exe". It is the shadPS4 Qt launcher, set up to run this folder's
+shadGT.exe (the build tested with GT Sport; keep "shadGT $commit" selected in the launcher's
+version list). Everything both programs write stays in this folder: the emulator's settings
 (user\config.json), saves, shader cache and logs in "user", the launcher's settings in
 "launcher". Nothing goes to AppData. Copy or move the whole folder to move an installation.
 

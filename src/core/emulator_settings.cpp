@@ -366,7 +366,7 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                         0,
                         nullptr,
                         "Config Migration",
-                        "The shadPS4 config backend has been updated, and you only have "
+                        "The shadGT config backend has been updated, and you only have "
                         "the old version of the config. Do you wish to update it "
                         "automatically, or continue with the default config?",
                         2,

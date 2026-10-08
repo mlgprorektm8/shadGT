@@ -43,14 +43,14 @@ int main(int argc, char* argv[]) {
     size_t sysctl_size = sizeof(sysctl_ret);
     sysctlbyname("sysctl.proc_translated", &sysctl_ret, &sysctl_size, nullptr, 0);
     if (sysctl_ret != 1) {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadPS4",
-                                 "shadPS4 only supports Apple Silicon Macs.", nullptr);
-        std::cout << "shadPS4 only supports Apple Silicon Macs." << std::endl;
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadGT",
+                                 "shadGT only supports Apple Silicon Macs.", nullptr);
+        std::cout << "shadGT only supports Apple Silicon Macs." << std::endl;
         return -1;
     }
 #endif
 
-    CLI::App app{"shadPS4 Emulator CLI"};
+    CLI::App app{"shadGT (shadPS4 fork for Gran Turismo Sport) CLI"};
 
     // ---- CLI state ----
     std::optional<std::string> gamePath;
@@ -113,7 +113,7 @@ int main(int argc, char* argv[]) {
 
     // ---- No-args behavior ----
     if (argc == 1) {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadPS4",
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadGT",
                                  "This is a CLI application. Please use the '-b' flag for Big "
                                  "Picture mode, or QTLauncher for a standalone GUI:\n"
                                  "https://github.com/shadps4-emu/shadps4-qtlauncher/releases",
@@ -149,7 +149,7 @@ int main(int argc, char* argv[]) {
         Core::Debugger::WaitForPid(*waitPid);
 
     // Initialize main log with default config
-    Common::Log::Setup("shadps4.log");
+    Common::Log::Setup("shadgt.log");
 
     LOG_INFO(Debug, "Run: {}", fmt::join(std::span(argv, argc), ""));
 
