@@ -38,6 +38,13 @@ $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
 Copy-Item -LiteralPath $executable -Destination $OutputDirectory
 Copy-Item -Path (Join-Path $QtLauncherDirectory '*') -Destination $OutputDirectory -Recurse
 Rename-Item -LiteralPath (Join-Path $OutputDirectory 'shadPS4QtLauncher.exe') -NewName 'shadGT Launcher.exe'
+# shadGT name and icon on the launcher (Build/tools/rebrand-exe, built with clang-cl)
+$rebrand = Join-Path $PSScriptRoot '../Build/tools/rebrand-exe/rebrand.exe'
+if (Test-Path -LiteralPath $rebrand) {
+    & $rebrand (Join-Path $OutputDirectory 'shadGT Launcher.exe') (Join-Path $PSScriptRoot '../src/dist/shadps4.ico') 'shadGT' 'shadGT Launcher'
+} else {
+    Write-Warning 'Build/tools/rebrand-exe/rebrand.exe is missing; the launcher keeps the shadPS4 icon and name.'
+}
 
 # The tested settings, with every machine-specific path cleared so the user folder's own
 # subfolders (sys_modules, fonts, home) are used.
