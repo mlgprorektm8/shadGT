@@ -360,7 +360,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.vs.instance_sgpr_offset = draw_indirect_params.instance_sgpr_offset;
         info.sw.vs.tess_emulated_primitive =
             regs.primitive_type == AmdGpu::PrimitiveType::RectList ||
-            regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
+            (regs.primitive_type == AmdGpu::PrimitiveType::QuadList && !QuadListAsTriangles());
         break;
     case SwStage::TessellationControl: {
         info.sw.tcs.num_input_control_points = regs.ls_hs_config.hs_input_control_points;
@@ -977,7 +977,8 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.depth_clip_enable = regs.clipper_control.ZclipEnable();
     key.clip_space = regs.clipper_control.clip_space;
     key.provoking_vtx_last = regs.polygon_control.provoking_vtx_last;
-    key.prim_type = regs.primitive_type;
+    key.prim_type =
+        QuadListAsTriangles() ? AmdGpu::PrimitiveType::TriangleList : regs.primitive_type;
     key.polygon_mode = regs.polygon_control.PolyMode();
     key.patch_control_points =
         regs.stage_enable.hs_en ? regs.ls_hs_config.hs_input_control_points : 0;
@@ -1351,7 +1352,16 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
 bool PipelineCache::IsTessEmulatedDraw() const {
     const auto prim = Regs().primitive_type;
-    return prim == AmdGpu::PrimitiveType::RectList || prim == AmdGpu::PrimitiveType::QuadList;
+    return prim == AmdGpu::PrimitiveType::RectList ||
+           (prim == AmdGpu::PrimitiveType::QuadList && !QuadListAsTriangles());
+}
+
+bool PipelineCache::QuadListAsTriangles() const {
+    // PERF-028: the rasterizer draws quad lists as triangle lists through generated indices
+    // (Rasterizer::BindQuadListIndices). Their pipeline is a plain triangle-list pipeline, and
+    // the vertex shader writes the fragment shader's inputs directly.
+    return Regs().primitive_type == AmdGpu::PrimitiveType::QuadList &&
+           !draw_indirect_params.tessellate_quads && Common::PerfFeatureEnabled(28);
 }
 
 void PipelineCache::RecoverAttributeFlags(Shader::Info& info,

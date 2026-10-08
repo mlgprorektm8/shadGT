@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <optional>
 #include <fmt/ranges.h>
 #include "common/debug.h"
 #include "common/perf_monitor.h"
@@ -149,6 +150,49 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     }
 }
 
+// PERF-028: quad lists are drawn as triangle lists through generated indices instead of the
+// tessellation helper shaders. On GT Sport's Nurburgring the grass is drawn as quad lists, and
+// through the helpers some patches got corners matching no vertex shader output (RenderDoc:
+// 66 of 714 patches of one draw, with correct vertex data and sequential indices), stretching
+// grass and terrain across the screen.
+// Quad (v0, v1, v2, v3) becomes two triangles that keep its winding and its provoking vertex:
+// v0 with the first-vertex convention, v3 with the last-vertex one (the OpenGL rule for
+// independent quads). Which diagonal the PS4 itself splits along is not documented.
+static constexpr std::array<u32, 6> QuadCornersFirstVertex{0, 1, 2, 0, 2, 3};
+static constexpr std::array<u32, 6> QuadCornersLastVertex{0, 1, 3, 1, 2, 3};
+static constexpr u64 MaxQuadListIndexBytes = 16ULL << 20;
+
+template <typename T>
+static u32 ExpandQuadListIndices(const T* in, u32 count, const std::optional<T> restart,
+                                 const std::array<u32, 6>& corners, T* out) {
+    u32 written = 0;
+    if (!restart) {
+        for (u32 quad = 0; quad + 4 <= count; quad += 4) {
+            for (const u32 corner : corners) {
+                out[written++] = in[quad + corner];
+            }
+        }
+        return written;
+    }
+    // A restart index ends the current primitive; an unfinished quad is dropped.
+    std::array<T, 4> quad{};
+    u32 filled = 0;
+    for (u32 i = 0; i < count; ++i) {
+        if (in[i] == *restart) {
+            filled = 0;
+            continue;
+        }
+        quad[filled++] = in[i];
+        if (filled == 4) {
+            for (const u32 corner : corners) {
+                out[written++] = quad[corner];
+            }
+            filled = 0;
+        }
+    }
+    return written;
+}
+
 static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader::Info& info,
                                           const Shader::Gcn::FetchShaderData& fetch_shader) {
     u32 vertex_offset = regs.index_offset;
@@ -202,12 +246,21 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline{};
+    bool quad_triangles = false;
+    u32 num_quad_indices = 0;
     {
         PhaseTimer t{Phase::Pipeline};
         if (!FilterDraw()) {
             return;
         }
-        pipeline = pipeline_cache.GetGraphicsPipeline();
+        const bool quad_list = regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
+        quad_triangles = quad_list && Common::PerfFeatureEnabled(28) &&
+                         CanDrawQuadListAsTriangles(is_indexed, index_offset);
+        pipeline = pipeline_cache.GetGraphicsPipeline({
+            .vertex_sgpr_offset = 0,
+            .instance_sgpr_offset = 0,
+            .tessellate_quads = quad_list && !quad_triangles,
+        });
         if (!pipeline) {
             return;
         }
@@ -220,7 +273,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     {
         PhaseTimer t{Phase::VertexIndex};
         BindVertexBuffers(pipeline);
-        if (is_indexed) {
+        if (quad_triangles) {
+            num_quad_indices = BindQuadListIndices(is_indexed, index_offset);
+        } else if (is_indexed) {
             BindIndexBuffer(index_offset);
         }
     }
@@ -244,7 +299,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     {
         PhaseTimer t{Phase::DynamicState};
-        UpdateDynamicState(pipeline, is_indexed);
+        UpdateDynamicState(pipeline, is_indexed, quad_triangles);
         scheduler.BeginRendering(state);
     }
     PhaseTimer record_timer{Phase::Record};
@@ -256,7 +311,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
-    if (is_indexed) {
+    if (quad_triangles) {
+        // Non-indexed quads index from 0 with the first vertex as the vertex offset, which
+        // gives the vertex shader the same vertex indices as the original draw.
+        if (num_quad_indices != 0) {
+            cmdbuf.drawIndexed(num_quad_indices, regs.num_instances.NumInstances(), 0,
+                               s32(vertex_offset), instance_offset);
+        }
+    } else if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
     } else {
@@ -284,6 +346,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const DrawIndirectParams params = {
         .vertex_sgpr_offset = vertex_sgpr_offset,
         .instance_sgpr_offset = instance_sgpr_offset,
+        // PERF-028: the vertex count is in GPU memory, so quads cannot be expanded here.
+        .tessellate_quads = true,
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
@@ -864,6 +928,81 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
     bound_buffers.emplace_back(buffer, offset, index_buffer_size, false); // FIX-016
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
+}
+
+bool Rasterizer::CanDrawQuadListAsTriangles(bool is_indexed, u32 index_offset) {
+    const auto& regs = liverpool->regs;
+    if (u64(regs.num_indices) / 4 * 6 * sizeof(u32) > MaxQuadListIndexBytes) {
+        static const bool logged = [&] {
+            LOG_WARNING(Render_Vulkan, "Quad list of {} vertices drawn through tessellation",
+                        regs.num_indices);
+            return true;
+        }();
+        return false;
+    }
+    if (!is_indexed) {
+        return true;
+    }
+    // The indices are read from guest memory here, so they must not be waiting in a GPU write.
+    const u32 index_size =
+        regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2 : 4;
+    const VAddr address = regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+    if (buffer_cache.IsRegionGpuModified(address, u64(regs.num_indices) * index_size)) {
+        static const bool logged = [&] {
+            LOG_WARNING(Render_Vulkan,
+                        "Quad list with GPU-written indices drawn through tessellation");
+            return true;
+        }();
+        return false;
+    }
+    return true;
+}
+
+u32 Rasterizer::BindQuadListIndices(bool is_indexed, u32 index_offset) {
+    const auto& regs = liverpool->regs;
+    const auto& corners = regs.polygon_control.provoking_vtx_last == AmdGpu::ProvokingVtxLast::Last
+                              ? QuadCornersLastVertex
+                              : QuadCornersFirstVertex;
+    const u32 count = regs.num_indices;
+    const u32 max_indices = count / 4 * 6;
+    if (max_indices == 0) {
+        return 0;
+    }
+    auto& stream = buffer_cache.GetStreamBuffer();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    if (!is_indexed) {
+        const auto [data, offset] = stream.Map(u64(max_indices) * sizeof(u32), sizeof(u32));
+        auto* out = reinterpret_cast<u32*>(data);
+        for (u32 quad = 0; quad + 4 <= count; quad += 4) {
+            for (const u32 corner : corners) {
+                *out++ = quad + corner;
+            }
+        }
+        stream.Commit();
+        cmdbuf.bindIndexBuffer(stream.Handle(), offset, vk::IndexType::eUint32);
+        return max_indices;
+    }
+    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+    const VAddr address = regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+    const bool restart = (regs.enable_primitive_restart & 1) != 0;
+    const auto [data, offset] = stream.Map(u64(max_indices) * index_size, sizeof(u32));
+    u32 written;
+    if (is_index16) {
+        written = ExpandQuadListIndices<u16>(
+            reinterpret_cast<const u16*>(address), count,
+            restart ? std::optional<u16>{u16(regs.primitive_restart_index)} : std::nullopt,
+            corners, reinterpret_cast<u16*>(data));
+    } else {
+        written = ExpandQuadListIndices<u32>(
+            reinterpret_cast<const u32*>(address), count,
+            restart ? std::optional<u32>{regs.primitive_restart_index} : std::nullopt, corners,
+            reinterpret_cast<u32*>(data));
+    }
+    stream.Commit();
+    cmdbuf.bindIndexBuffer(stream.Handle(), offset,
+                           is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32);
+    return written;
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
@@ -2017,10 +2156,11 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed,
+                                    const bool quad_triangles) const {
     UpdateViewportScissorState();
     UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
+    UpdatePrimitiveState(is_indexed, quad_triangles);
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
 
@@ -2258,7 +2398,7 @@ void Rasterizer::UpdateDepthStencilState() const {
     }
 }
 
-void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
+void Rasterizer::UpdatePrimitiveState(const bool is_indexed, const bool quad_triangles) const {
     const auto& regs = liverpool->regs;
     auto& dynamic_state = scheduler.GetDynamicState();
 
@@ -2276,8 +2416,9 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
                type == AmdGpu::PrimitiveType::QuadList || type == AmdGpu::PrimitiveType::RectList;
     };
 
+    // PERF-028: generated quad indices have their restarts already applied.
     const auto prim_restart =
-        (regs.enable_primitive_restart & 1) != 0 &&
+        !quad_triangles && (regs.enable_primitive_restart & 1) != 0 &&
         (instance.IsListRestartSupported() || !is_list_topology(regs.primitive_type)) &&
         (instance.IsPatchListRestartSupported() || !is_patch_list_topology(regs.primitive_type));
     ASSERT_MSG(!is_indexed || !prim_restart || regs.primitive_restart_index == 0xFFFF ||

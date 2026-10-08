@@ -47,6 +47,9 @@ class ShaderCache;
 struct DrawIndirectParams {
     u16 vertex_sgpr_offset;
     u32 instance_sgpr_offset;
+    /// PERF-028: draw a quad list through the tessellation helpers instead of as triangles
+    /// (indirect draws, or indices the command thread cannot read).
+    bool tessellate_quads{};
 };
 
 class PipelineCache {
@@ -117,6 +120,8 @@ private:
                                    Shader::Backend::Bindings& binding);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
     bool IsTessEmulatedDraw() const;
+    /// PERF-028: the current draw is a quad list drawn as a triangle list.
+    bool QuadListAsTriangles() const;
     void RecoverAttributeFlags(Shader::Info& info, const Shader::StageSpecialization& spec,
                                const Shader::ShaderParams& params,
                                const Shader::RuntimeInfo& runtime_info, size_t perm_idx);

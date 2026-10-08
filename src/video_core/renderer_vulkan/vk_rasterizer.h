@@ -147,10 +147,11 @@ private:
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
+                            bool quad_triangles = false) const;
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
-    void UpdatePrimitiveState(bool is_indexed) const;
+    void UpdatePrimitiveState(bool is_indexed, bool quad_triangles) const;
     void UpdateRasterizationState() const;
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
@@ -170,6 +171,8 @@ private:
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
+    bool CanDrawQuadListAsTriangles(bool is_indexed, u32 index_offset);
+    u32 BindQuadListIndices(bool is_indexed, u32 index_offset);
 
     void ResetBindings(bool is_compute);
 
