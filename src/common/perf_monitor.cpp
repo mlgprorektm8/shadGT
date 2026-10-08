@@ -10,6 +10,7 @@
 #include <vector>
 #include <fmt/format.h>
 
+#include "common/logging/log.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
 
@@ -137,6 +138,16 @@ std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks() {
     return g_phase_ticks;
 }
 
+// The counters only grow; each reader keeps its own snapshot of the values it last reported.
+template <size_t N>
+static std::array<u64, N> Snapshot(const std::array<std::atomic<u64>, N>& values) {
+    std::array<u64, N> out{};
+    for (size_t i = 0; i < N; ++i) {
+        out[i] = values[i].load(std::memory_order_relaxed);
+    }
+    return out;
+}
+
 static std::string TakePhaseTimes() {
     static constexpr std::array<const char*, size_t(Phase::Count)> Names = {
         "setup",    "pipeline",   "targets",         "vtx/idx",     "buffers",
@@ -150,11 +161,14 @@ static std::string TakePhaseTimes() {
     const double ticks_per_ms = seconds > 0 ? double(tsc - last_tsc) / (seconds * 1000.0) : 1.0;
     last_tsc = tsc;
     last_time = now;
+    static auto last_ticks = Snapshot(GetPhaseTicks());
+    const auto ticks = Snapshot(GetPhaseTicks());
     std::string out;
     for (size_t i = 0; i < Names.size(); ++i) {
-        out += fmt::format(" {}={:.1f}ms", Names[i],
-                           double(GetPhaseTicks()[i].exchange(0)) / ticks_per_ms);
+        out +=
+            fmt::format(" {}={:.1f}ms", Names[i], double(ticks[i] - last_ticks[i]) / ticks_per_ms);
     }
+    last_ticks = ticks;
     return out;
 }
 
@@ -183,19 +197,110 @@ WorkCounters& GetWorkCounters() {
     return counters;
 }
 
+// A copy of the counters at one moment, for differences between two moments.
+struct WorkSnapshot {
+    u64 pm4_packets, draws, dispatches, find_image, obtain_buffer, obtain_stream, uploads,
+        upload_bytes, protects, protect_bytes, shaders_compiled, pipelines_compiled, upload_epochs,
+        waits_skipped, gpu_waits, gpu_wait_us, frontend_waits, frontend_wait_us, pipeline_waits,
+        pipeline_wait_us, file_reads, file_read_bytes, file_read_us;
+};
+
+static WorkSnapshot TakeSnapshot() {
+    const auto& c = GetWorkCounters();
+    const auto l = [](const std::atomic<u64>& v) { return v.load(std::memory_order_relaxed); };
+    return {l(c.pm4_packets),      l(c.draws),
+            l(c.dispatches),       l(c.find_image),
+            l(c.obtain_buffer),    l(c.obtain_stream),
+            l(c.uploads),          l(c.upload_bytes),
+            l(c.protects),         l(c.protect_bytes),
+            l(c.shaders_compiled), l(c.pipelines_compiled),
+            l(c.upload_epochs),    l(c.waits_skipped),
+            l(c.gpu_waits),        l(c.gpu_wait_us),
+            l(c.frontend_waits),   l(c.frontend_wait_us),
+            l(c.pipeline_waits),   l(c.pipeline_wait_us),
+            l(c.file_reads),       l(c.file_read_bytes),
+            l(c.file_read_us)};
+}
+
+static WorkSnapshot Difference(const WorkSnapshot& now, const WorkSnapshot& then) {
+    WorkSnapshot d;
+    const auto* a = reinterpret_cast<const u64*>(&now);
+    const auto* b = reinterpret_cast<const u64*>(&then);
+    auto* out = reinterpret_cast<u64*>(&d);
+    for (size_t i = 0; i < sizeof(WorkSnapshot) / sizeof(u64); ++i) {
+        out[i] = a[i] - b[i];
+    }
+    return d;
+}
+
+void NoteGameFrame() {
+    static const double threshold_ms = [] {
+        const char* env = std::getenv("SHADGT_STALL_MS");
+        return env && *env ? std::stod(env) : 100.0;
+    }();
+    static auto last_time = std::chrono::steady_clock::now();
+    static u64 last_tsc = PhaseTimer::ReadTsc();
+    static auto last_work = TakeSnapshot();
+    static auto last_ticks = Snapshot(GetPhaseTicks());
+    static u64 frame = 0;
+    static u64 stalls = 0;
+    const auto now = std::chrono::steady_clock::now();
+    const u64 tsc = PhaseTimer::ReadTsc();
+    const auto work = TakeSnapshot();
+    const auto ticks = Snapshot(GetPhaseTicks());
+    const double ms = std::chrono::duration<double, std::milli>(now - last_time).count();
+    ++frame;
+    if (ms >= threshold_ms) {
+        const double ticks_per_ms = ms > 0 ? double(tsc - last_tsc) / ms : 1.0;
+        const auto phase_ms = [&](Phase phase) {
+            return double(ticks[size_t(phase)] - last_ticks[size_t(phase)]) / ticks_per_ms;
+        };
+        const auto d = Difference(work, last_work);
+        const double draw = phase_ms(Phase::DrawTotal);
+        const double dispatch = phase_ms(Phase::DispatchTotal);
+        const double submit = phase_ms(Phase::Submit);
+        const double gpu_wait = d.gpu_wait_us / 1000.0;
+        const double frontend_wait = d.frontend_wait_us / 1000.0;
+        const double pipeline_wait = d.pipeline_wait_us / 1000.0;
+        const double accounted = draw + dispatch + submit + gpu_wait + frontend_wait;
+        if (++stalls <= 400 || stalls % 50 == 0) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "DIAG-033 stall {}: game frame {} took {:.0f} ms. GPU thread: draws {:.0f} ms "
+                "(pipeline {:.0f}, buffers {:.0f}, textures {:.0f}, vtx/idx {:.0f}), dispatches "
+                "{:.0f} ms, submits {:.0f} ms; waited for the GPU {} times {:.0f} ms, for "
+                "command-buffer waits {} times {:.0f} ms, for pipelines {} times {:.0f} ms; "
+                "unaccounted {:.0f} ms. Work: {} draws, {} dispatches, {} shaders and {} "
+                "pipelines compiled, {} uploads {} KB, {} protections {} KB. Game file reads: {} "
+                "({} KB, {:.0f} ms)",
+                stalls, frame, ms, draw, phase_ms(Phase::Pipeline), phase_ms(Phase::Buffers),
+                phase_ms(Phase::Textures), phase_ms(Phase::VertexIndex), dispatch, submit,
+                d.gpu_waits, gpu_wait, d.frontend_waits, frontend_wait, d.pipeline_waits,
+                pipeline_wait, std::max(0.0, ms - accounted), d.draws, d.dispatches,
+                d.shaders_compiled, d.pipelines_compiled, d.uploads, d.upload_bytes / 1024,
+                d.protects, d.protect_bytes / 1024, d.file_reads, d.file_read_bytes / 1024,
+                d.file_read_us / 1000.0);
+        }
+    }
+    last_time = now;
+    last_tsc = tsc;
+    last_work = work;
+    last_ticks = ticks;
+}
+
 std::string TakeWorkCounters() {
-    auto& c = GetWorkCounters();
+    static auto last = TakeSnapshot();
+    const auto now = TakeSnapshot();
+    const auto c = Difference(now, last);
+    last = now;
     return fmt::format("{} PM4 packets, {} draws, {} dispatches, {} image lookups, {} buffer "
                        "binds ({} streamed), {} uploads ({} KB), {} protection calls ({} KB), "
                        "{} shaders and {} pipelines compiled, {} upload epochs, {} GPU-side waits "
                        "ordered behind pending fences",
-                       c.pm4_packets.exchange(0), c.draws.exchange(0), c.dispatches.exchange(0),
-                       c.find_image.exchange(0), c.obtain_buffer.exchange(0),
-                       c.obtain_stream.exchange(0), c.uploads.exchange(0),
-                       c.upload_bytes.exchange(0) / 1024, c.protects.exchange(0),
-                       c.protect_bytes.exchange(0) / 1024, c.shaders_compiled.exchange(0),
-                       c.pipelines_compiled.exchange(0), c.upload_epochs.exchange(0),
-                       c.waits_skipped.exchange(0)) +
+                       c.pm4_packets, c.draws, c.dispatches, c.find_image, c.obtain_buffer,
+                       c.obtain_stream, c.uploads, c.upload_bytes / 1024, c.protects,
+                       c.protect_bytes / 1024, c.shaders_compiled, c.pipelines_compiled,
+                       c.upload_epochs, c.waits_skipped) +
            ";" + TakePhaseTimes();
 }
 

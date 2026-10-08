@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
+#include "common/perf_monitor.h"
 #include "common/scope_exit.h"
 #include "common/singleton.h"
 #include "core/file_sys/devices/console_device.h"
@@ -354,11 +355,19 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     if (file_buf.capacity() < nbytes) {
         file_buf.reserve(nbytes);
     }
+    const auto read_start = std::chrono::steady_clock::now();
     s64 bytes = file->Read(file_buf.data(), nbytes);
     if (bytes < 0) {
         return bytes;
     }
     std::memcpy(buf, file_buf.data(), bytes);
+    // DIAG-033: the game's file reads, for the stall report.
+    auto& counters = Common::GetWorkCounters();
+    ++counters.file_reads;
+    counters.file_read_bytes += u64(bytes);
+    counters.file_read_us += u64(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - read_start)
+                                     .count());
     return bytes;
 }
 

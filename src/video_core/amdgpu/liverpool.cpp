@@ -77,6 +77,8 @@ static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
     static auto window_start = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(now - start).count();
+    ++Common::GetWorkCounters().frontend_waits;
+    Common::GetWorkCounters().frontend_wait_us += u64(ms * 1000.0);
     auto& total = totals[size_t(kind)];
     ++total.first;
     total.second += ms;

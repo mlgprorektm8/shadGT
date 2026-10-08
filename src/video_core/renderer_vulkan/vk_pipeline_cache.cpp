@@ -817,6 +817,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             const auto wait_start = std::chrono::steady_clock::now();
             FinishBuild(*build);
             const auto now = std::chrono::steady_clock::now();
+            ++Common::GetWorkCounters().pipeline_waits;
+            Common::GetWorkCounters().pipeline_wait_us += u64(
+                std::chrono::duration_cast<std::chrono::microseconds>(now - wait_start).count());
             if (!preloaded_ready) {
                 LOG_WARNING(Render_Vulkan,
                             "Pipeline {:#x} {}: built {:.1f} ms after it was queued, draw waited "

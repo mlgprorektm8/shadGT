@@ -20,6 +20,9 @@ std::mutex Scheduler::submit_mutex;
 
 // PERF-DIAG-001: where threads block on the GPU (scheduler Wait/Finish), reported every 2 s.
 static void RecordGpuWait(const std::source_location& loc, std::chrono::steady_clock::duration d) {
+    auto& counters = Common::GetWorkCounters();
+    ++counters.gpu_waits;
+    counters.gpu_wait_us += u64(std::chrono::duration_cast<std::chrono::microseconds>(d).count());
     static std::mutex mutex;
     static std::map<std::string, std::pair<u32, double>> sites;
     static auto window_start = std::chrono::steady_clock::now();

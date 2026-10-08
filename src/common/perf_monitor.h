@@ -34,6 +34,16 @@ struct WorkCounters {
     std::atomic<u64> pipelines_compiled{};
     std::atomic<u64> upload_epochs{};
     std::atomic<u64> waits_skipped{};
+    // DIAG-033: where the time of a long frame went (cumulative, like the counters above).
+    std::atomic<u64> gpu_waits{};
+    std::atomic<u64> gpu_wait_us{};
+    std::atomic<u64> frontend_waits{};
+    std::atomic<u64> frontend_wait_us{};
+    std::atomic<u64> pipeline_waits{};
+    std::atomic<u64> pipeline_wait_us{};
+    std::atomic<u64> file_reads{};
+    std::atomic<u64> file_read_bytes{};
+    std::atomic<u64> file_read_us{};
 };
 WorkCounters& GetWorkCounters();
 
@@ -60,6 +70,10 @@ enum class Phase : u32 {
     Count,
 };
 std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();
+
+/// DIAG-033: called for every presented game frame. A frame that took longer than
+/// SHADGT_STALL_MS (default 100) is logged with what the emulator did during it.
+void NoteGameFrame();
 
 // PERF-026: the draw-step timers run about 14 times per draw, so the counter read and the
 // tick array are inline instead of function calls.
