@@ -654,6 +654,16 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
     const bool dedupe = Common::PerfFeatureEnabled(21);
     liverpool->ScanAheadForPipelines([&](const AmdGpu::Regs& regs) {
         ++draws;
+        // FIX-014: draws the rasterizer filters out (Rasterizer::FilterDraw) never get a
+        // pipeline; building one for them can fail (primitive type 'None' asserted on a build
+        // worker when selecting a car).
+        using OperationMode = AmdGpu::ColorControl::OperationMode;
+        const auto mode = regs.color_control.mode;
+        if (regs.primitive_type == AmdGpu::PrimitiveType::None ||
+            mode == OperationMode::EliminateFastClear || mode == OperationMode::FmaskDecompress ||
+            mode == OperationMode::Resolve) {
+            return false;
+        }
         if (dedupe) {
             // Everything the pipeline key is built from that the commands can change: graphics
             // shader registers (programs and user data), context registers (targets, blending,
