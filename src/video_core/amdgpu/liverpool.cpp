@@ -385,6 +385,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     // PERF-019: a command buffer can be reused with other contents; never continue an earlier
     // read-ahead into this one.
     scan_buffer_end = nullptr;
+    if (lookahead_outer.empty()) {
+        scanned_packets.clear();
+    }
     if (on_command_buffer_start && !dcb.empty()) {
         lookahead_dcb = dcb;
         on_command_buffer_start();
@@ -1268,16 +1271,20 @@ bool Liverpool::ScanPackets(std::span<const u32> dcb,
         case PM4ItOpcode::DrawIndexIndirect:
         case PM4ItOpcode::DrawIndexIndirectMulti:
         case PM4ItOpcode::DrawIndexIndirectCountMulti:
-            --draws_left;
-            if (on_draw(shadow)) {
-                --builds_left;
+            if (!Common::PerfFeatureEnabled(22) || scanned_packets.insert(header).second) {
+                --draws_left;
+                if (on_draw(shadow)) {
+                    --builds_left;
+                }
             }
             break;
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             const auto* ib = indirect_buffer->Address<const u32>();
             const u32 ib_size = indirect_buffer->ib_size;
-            if (depth < 4 && ib && ib_size > 0 && ib_size < (1u << 22)) {
+            const bool new_ib =
+                !Common::PerfFeatureEnabled(22) || scanned_packets.insert(ib).second;
+            if (new_ib && depth < 4 && ib && ib_size > 0 && ib_size < (1u << 22)) {
                 ScanPackets({ib, ib_size}, on_draw, depth + 1, draws_left, builds_left, nullptr);
             }
             break;

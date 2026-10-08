@@ -14,6 +14,7 @@
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <queue>
 
@@ -258,6 +259,9 @@ private:
     const u32* scan_buffer_end{};
     const u32* scan_resume{};
     bool scan_finished{};
+    // PERF-022: draw packets and nested command buffers the read-ahead has already read in the
+    // current submission; each is read once however often a read-ahead passes over it.
+    std::unordered_set<const void*> scanned_packets;
     bool ScanPackets(std::span<const u32> dcb, const std::function<bool(const Regs&)>& on_draw,
                      u32 depth, u32& draws_left, u32& builds_left, const u32** stopped_at);
 

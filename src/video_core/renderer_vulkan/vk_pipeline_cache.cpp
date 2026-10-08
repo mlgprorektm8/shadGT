@@ -601,7 +601,17 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
             constexpr u32 ShGfxRegs = 0x200;
             constexpr u32 NumContextRegs = 0x400;
             constexpr u32 PrimitiveRegs = 0x100;
-            u64 hash = XXH3_64bits(&r[AmdGpu::Regs::ShRegWordOffset], ShGfxRegs * sizeof(u32));
+            std::array<u32, ShGfxRegs> sh;
+            std::memcpy(sh.data(), &r[AmdGpu::Regs::ShRegWordOffset], sizeof(sh));
+            if (Common::PerfFeatureEnabled(22)) {
+                // PERF-022: user data (per-draw constants and resource pointers) changes on
+                // nearly every draw; the programs and the other state decide the pipeline.
+                // Each stage's 16 user data registers start 0xC after its program registers.
+                for (u32 stage_base = 0; stage_base < ShGfxRegs; stage_base += 0x40) {
+                    std::fill_n(sh.begin() + stage_base + 0xC, 16, 0u);
+                }
+            }
+            u64 hash = XXH3_64bits(sh.data(), sizeof(sh));
             hash = XXH3_64bits_withSeed(&r[AmdGpu::Regs::ContextRegWordOffset],
                                         NumContextRegs * sizeof(u32), hash);
             hash = XXH3_64bits_withSeed(&r[AmdGpu::Regs::UconfigRegWordOffset + 0x200],
