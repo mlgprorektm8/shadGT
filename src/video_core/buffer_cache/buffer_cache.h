@@ -159,9 +159,9 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
-    /// DIAG-028: compares the guest pages of a quad-list draw's vertex range with the guest
-    /// bytes they were last uploaded from, and logs pages whose GPU copy is out of date.
-    void CheckVertexPagesCurrent(VAddr address, u64 size);
+    /// FIX-017: before a quad-list draw's uploads, compares its vertex pages with the guest
+    /// bytes they were last uploaded from and uploads again the ones that changed unnoticed.
+    void RefreshQuadVertexPages(VAddr address, u64 size);
 
 private:
     void InvalidateAsyncReadbacks(VAddr address, u64 size);
@@ -266,7 +266,14 @@ private:
     /// DIAG-028: hash of the guest bytes each watched page (4 KB) was last uploaded from.
     std::mutex vertex_pages_mutex;
     std::unordered_map<u64, u64> vertex_page_hashes;
-    u64 stale_vertex_draws{};
+    struct VertexPageStats {
+        u64 checked{};
+        u64 first_seen{};
+        u64 stale_hot{};
+        u64 stale_untracked{};
+        u64 big_stale_logged{};
+    } vertex_page_stats;
+    std::chrono::steady_clock::time_point vertex_stats_time{};
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

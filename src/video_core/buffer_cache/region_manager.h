@@ -181,6 +181,26 @@ public:
         }
     }
 
+    /// FIX-017: the next upload of the range copies it from guest memory again, also for hot
+    /// pages already uploaded in this epoch.
+    void ForceUpload(u64 offset, u64 size) {
+        {
+            std::scoped_lock lk{mutex};
+            IterateWords(GetBounds(offset, size),
+                         [&](u64 index, u64 mask) { uploaded[index] &= ~mask; });
+        }
+        ChangeRegionState<StateOp::Set, StateOp::None>(offset, size);
+    }
+
+    /// FIX-017: true when a page of the range is a PERF-012 hot page.
+    bool IsRegionHot(u64 offset, u64 size) {
+        std::scoped_lock lk{mutex};
+        bool any = false;
+        IterateWords(GetBounds(offset, size),
+                     [&](u64 index, u64 mask) { any |= (hot[index] & mask) != 0; });
+        return any;
+    }
+
     /// PERF-012: counts CPU write faults on pages that were just made writable (lock held);
     /// a page that keeps faulting becomes hot and stays unprotected.
     void NoteCpuWriteFault(u64 offset, u64 size) noexcept {

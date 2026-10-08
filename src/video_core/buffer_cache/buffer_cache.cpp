@@ -1019,46 +1019,65 @@ void BufferCache::RecordWatchedUploads(VAddr start, VAddr end) {
     }
 }
 
-void BufferCache::CheckVertexPagesCurrent(VAddr address, u64 size) {
-    // DIAG-028: the Nurburgring grass is drawn as quad lists and stretches across the screen
-    // with correct vertex data in guest memory. This checks, after the draw's uploads, that
-    // the GPU copy of every vertex page still matches guest memory. A page the CPU changed
-    // without its tracking noticing ("untracked") keeps old vertices on the GPU.
+void BufferCache::RefreshQuadVertexPages(VAddr address, u64 size) {
+    // FIX-017: the Nurburgring grass is drawn as quad lists and stretched across the screen.
+    // In a capture its vertex pages were never uploaded during the frame, so the GPU drew an
+    // older copy. Before the draw's uploads, each vertex page is compared with the guest bytes
+    // it was last uploaded from. A changed page is either a PERF-012 hot page already uploaded
+    // in this epoch ("hot"), or one the CPU changed without a tracked write ("untracked"); both
+    // are uploaded again. -DisablePerf 29 only counts them.
+    static const bool refresh = Common::PerfFeatureEnabled(29);
+    constexpr u64 BigRange = 16_KB;
     std::scoped_lock lk{vertex_pages_mutex};
-    u32 untracked = 0;
-    u32 tracked = 0;
-    VAddr first_untracked = 0;
+    auto& stats = vertex_page_stats;
     for (VAddr page = Common::AlignDown(address, WatchedPageSize); page < address + size;
          page += WatchedPageSize) {
         if (memory->ClampRangeSize(page, WatchedPageSize) < WatchedPageSize ||
             memory_tracker->IsRegionGpuModified(page, WatchedPageSize)) {
             continue;
         }
+        ++stats.checked;
         const u64 hash = XXH3_64bits(std::bit_cast<const void*>(page), WatchedPageSize);
         const auto [it, inserted] = vertex_page_hashes.try_emplace(page >> WatchedPageBits, hash);
-        if (inserted || it->second == hash) {
+        if (inserted) {
+            // What the GPU copy holds is unknown; upload it so the next check has a reference.
+            ++stats.first_seen;
+            if (refresh) {
+                memory_tracker->ForceUpload(page, WatchedPageSize);
+            }
             continue;
         }
-        // Tracked: the page is marked CPU-modified (written since its upload, or a PERF-012
-        // hot page), so the next use uploads it. Untracked: nothing will upload it.
-        if (memory_tracker->IsRegionCpuModified(page, WatchedPageSize)) {
-            ++tracked;
-        } else {
-            if (untracked++ == 0) {
-                first_untracked = page;
-            }
+        if (it->second == hash) {
+            continue;
+        }
+        const bool hot = memory_tracker->IsRegionHot(page, WatchedPageSize);
+        if (!hot && memory_tracker->IsRegionCpuModified(page, WatchedPageSize)) {
+            // A tracked write: this draw's uploads copy the page.
+            continue;
+        }
+        ++(hot ? stats.stale_hot : stats.stale_untracked);
+        if (size >= BigRange && stats.big_stale_logged < 60) {
+            ++stats.big_stale_logged;
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-017: quad-list vertex page {:#x} changed since its upload ({}) in "
+                        "vertex range {:#x}+{:#x}",
+                        page, hot ? "hot page" : "untracked", address, size);
+        }
+        if (refresh) {
+            memory_tracker->ForceUpload(page, WatchedPageSize);
         }
     }
-    if (untracked == 0 && tracked == 0) {
-        return;
-    }
-    const u64 count = ++stale_vertex_draws;
-    if (count <= 40 || count % 500 == 0) {
-        LOG_WARNING(Render_Vulkan,
-                    "DIAG-028: quad-list draw {} reads vertex pages whose GPU copy differs from "
-                    "guest memory: {} untracked (first {:#x}), {} marked modified; vertex range "
-                    "{:#x}+{:#x}",
-                    count, untracked, first_untracked, tracked, address, size);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - vertex_stats_time >= std::chrono::seconds{2}) {
+        if (stats.stale_hot + stats.stale_untracked != 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-017: quad-list vertex pages in 2.0 s: {} checked, {} first seen, "
+                        "{} changed on hot pages, {} changed untracked{}",
+                        stats.checked, stats.first_seen, stats.stale_hot, stats.stale_untracked,
+                        refresh ? "; uploaded again" : "");
+        }
+        stats = {.big_stale_logged = stats.big_stale_logged};
+        vertex_stats_time = now;
     }
 }
 

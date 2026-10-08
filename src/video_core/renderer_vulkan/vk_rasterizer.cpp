@@ -857,8 +857,12 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     }
 
     // Map buffers for merged ranges
+    const bool quad_list = regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+        if (quad_list) {
+            buffer_cache.RefreshQuadVertexPages(range.base_address, size);
+        }
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
@@ -867,12 +871,6 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         // it the copy can overwrite the vertices while this draw still reads them, mixing
         // old and new data (the suspected cause of stretched Nürburgring grass and terrain).
         bound_buffers.emplace_back(range.buffer, range.offset, size, false);
-    }
-
-    if (regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
-        for (const auto& range : ranges_merged) {
-            buffer_cache.CheckVertexPagesCurrent(range.base_address, range.GetSize());
-        }
     }
 
     // Bind vertex buffers
