@@ -214,11 +214,20 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         std::string frames;
         for (size_t i = 0; i < stack_read / sizeof(u64); ++i) {
             const auto description = memory->DescribeAddress(stack[i]);
-            if (description.find(" Code ") != std::string::npos) {
+            if (description.find(" Code ") != std::string::npos ||
+                description.find("prot 0x5 ") != std::string::npos ||
+                description.find("prot 0x7 ") != std::string::npos) {
                 frames += fmt::format(" | [rsp+{:#x}] {:#x} {}", i * 8, stack[i], description);
             }
         }
         LOG_CRITICAL(Debug, "Code addresses on the stack:{}", frames.empty() ? " none" : frames);
+        // DIAG-035: emulator writes into guest memory near what the registers point at.
+        for (const auto& [name, value] : regs) {
+            if (value >= 0x10000 && memory->IsValidMapping(value)) {
+                LOG_CRITICAL(Debug, "Emulator writes near {} {:#x}:{}", name, value,
+                             memory->DescribeBackingWrites(value, 0x100));
+            }
+        }
         Common::Log::Flush();
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }

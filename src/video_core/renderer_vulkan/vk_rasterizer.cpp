@@ -2146,6 +2146,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
                               !buffer_cache.HasGpuImageAlias(address, num_bytes);
         if (cpu_path) {
             u32* buffer = std::bit_cast<u32*>(address);
+            Core::MemoryManager::NoteEmulatorWrite(address, num_bytes, &value);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             VideoCore::BumpUploadEpoch();
             return;

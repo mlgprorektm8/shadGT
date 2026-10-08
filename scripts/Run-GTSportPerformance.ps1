@@ -113,6 +113,14 @@ try {
     if ($CrashDiagnostics) {
         $env:VK_LAYER_PATH = $sdkLayers
         $env:CDL_OUTPUT_PATH = $crashDumps
+        # The default 30 s "no GPU progress" watchdog fires during GT Sport's startup loading and
+        # records an empty report; record real device losses instead, with the failing shaders.
+        foreach ($prefix in 'CDL_', 'VK_LUNARG_CRASH_DIAGNOSTIC_') {
+            Set-Item "env:${prefix}OUTPUT_PATH" $crashDumps
+            Set-Item "env:${prefix}TRIGGER_WATCHDOG_TIMEOUT" 'false'
+            Set-Item "env:${prefix}DUMP_SHADERS" 'on_crash'
+            Set-Item "env:${prefix}INSTRUMENT_ALL_COMMANDS" 'true'
+        }
     }
     $arguments = '"{0}" --show-fps' -f $GamePath
     $process = Start-Process -FilePath $executable -ArgumentList $arguments `

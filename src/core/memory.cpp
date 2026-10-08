@@ -162,8 +162,55 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
-bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+// DIAG-035: a ring of the emulator's own writes into guest memory.
+struct BackingWrite {
+    VAddr address;
+    u64 size;
+    const char* file;
+    u32 line;
+    u32 first_dword;
+    std::chrono::steady_clock::time_point time;
+};
+static constexpr size_t BackingWriteCount = 1 << 16;
+static std::array<BackingWrite, BackingWriteCount> g_backing_writes{};
+static std::atomic<u64> g_backing_write_index{};
+
+std::string MemoryManager::DescribeBackingWrites(VAddr address, u64 margin) {
+    const u64 end_index = g_backing_write_index.load();
+    const u64 begin_index = end_index > BackingWriteCount ? end_index - BackingWriteCount : 0;
+    const auto now = std::chrono::steady_clock::now();
+    std::string out;
+    u32 found = 0;
+    for (u64 i = begin_index; i < end_index; ++i) {
+        const auto& w = g_backing_writes[i % BackingWriteCount];
+        if (w.address < address + margin && address < w.address + w.size + margin) {
+            std::string_view file = w.file ? w.file : "?";
+            if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+                file.remove_prefix(slash + 1);
+            }
+            if (++found <= 24) {
+                out += fmt::format(" | {:#x}+{:#x} from {}:{} first dword {:08x}, {:.0f} ms ago",
+                                   w.address, w.size, file, w.line, w.first_dword,
+                                   std::chrono::duration<double, std::milli>(now - w.time).count());
+            }
+        }
+    }
+    return found == 0 ? std::string(" none of the last 65536")
+                      : fmt::format(" {} writes:{}", found, out);
+}
+
+void MemoryManager::NoteEmulatorWrite(VAddr address, u64 size, const void* data,
+                                      std::source_location loc) {
+    u32 first = 0;
+    std::memcpy(&first, data, std::min<u64>(size, sizeof(first)));
+    auto& w = g_backing_writes[g_backing_write_index.fetch_add(1) % BackingWriteCount];
+    w = {address, size, loc.file_name(), loc.line(), first, std::chrono::steady_clock::now()};
+}
+
+bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size,
+                                    std::source_location loc) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
+    NoteEmulatorWrite(virtual_addr, size, data, loc);
     std::shared_lock lk{mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);

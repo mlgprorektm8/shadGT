@@ -5,6 +5,7 @@
 
 #include <map>
 #include <mutex>
+#include <source_location>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -257,7 +258,15 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
-    bool TryWriteBacking(void* address, const void* data, u64 size);
+    bool TryWriteBacking(void* address, const void* data, u64 size,
+                         std::source_location loc = std::source_location::current());
+
+    /// DIAG-035: the emulator's own writes into guest memory (readbacks, fences) that overlap
+    /// [address - margin, address + margin), oldest first, for crash reports.
+    std::string DescribeBackingWrites(VAddr address, u64 margin);
+    /// DIAG-035: records an emulator write into guest memory made without TryWriteBacking.
+    static void NoteEmulatorWrite(VAddr address, u64 size, const void* data,
+                                  std::source_location loc = std::source_location::current());
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 

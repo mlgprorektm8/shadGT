@@ -990,6 +990,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         if (rasterizer) {
                             rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxWriteData);
                         }
+                        Core::MemoryManager::NoteEmulatorWrite(reinterpret_cast<VAddr>(address),
+                                                               data_size, write_data->data);
                         std::memcpy(address, write_data->data, data_size);
                         VideoCore::BumpUploadEpoch();
                     } else {
@@ -1581,6 +1583,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (rasterizer) {
                     rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::AscWriteData);
                 }
+                Core::MemoryManager::NoteEmulatorWrite(write_data->Address<VAddr>(), data_size,
+                                                       write_data->data);
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
                 VideoCore::BumpUploadEpoch();
             } else {
