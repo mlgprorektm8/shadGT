@@ -2264,7 +2264,17 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     buffer_cache.InvalidateMemory(addr, size);
-    texture_cache.UnmapMemory(addr, size);
+    // FIX-026: the texture cache has no cache-wide lock since upstream #5219; freeing images here
+    // on a game thread raced with the GPU thread freeing the same image ("Trying to unregister an
+    // already unregistered image" when starting a race). Free them on the GPU thread and wait,
+    // as CPU fault flushes already do. -DisablePerf 35 frees them here.
+    static const bool unmap_on_gpu_thread = Common::PerfFeatureEnabled(35);
+    if (unmap_on_gpu_thread &&
+        std::this_thread::get_id() != liverpool->GetGpuCommandProcessorThread()) {
+        liverpool->SendCommand<true>([&] { texture_cache.UnmapMemory(addr, size); });
+    } else {
+        texture_cache.UnmapMemory(addr, size);
+    }
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
