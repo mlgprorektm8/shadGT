@@ -129,10 +129,42 @@ std::string convertValueToHex(const std::string type, const std::string valueStr
 
 void ApplyPendingPatches();
 
+static void ApplyPatchesFromDocument(pugi::xml_document& doc,
+                                     const pugi::xml_parse_result& result);
+
 void ApplyPatchesFromXML(std::filesystem::path path) {
     pugi::xml_document doc;
-    pugi::xml_parse_result result = doc.load_file(path.c_str());
+    const pugi::xml_parse_result result = doc.load_file(path.c_str());
+    ApplyPatchesFromDocument(doc, result);
+}
 
+// Gran Turismo Sport 1.69 crashes at boot with an ADHOC nil error unless boot init is delayed
+// so BootSequenceDone fires after ProductBootScreen is ready ("Fix 1.69 update boot crash" by
+// Kravickas, from the shadPS4 game patch repository). It is built in so the game starts
+// whether or not patches are loaded from files or from a launcher. Applying it again from a
+// patch file writes the same bytes.
+static constexpr const char* BuiltInGtSportPatch = R"xml(<?xml version="1.0"?>
+<Patch>
+    <Metadata Title="Gran Turismo SPORT" Name="Fix 1.69 update boot crash (built in)" Author="Kravickas" PatchVer="1.0" AppVer="01.69" AppElf="eboot.bin" isEnabled="true">
+        <PatchList>
+            <Line Type="bytes" Address="0x0211ab30" Value="e92ba3490090"/>
+            <Line Type="bytes" Address="0x025b4e60" Value="505756525141504151bf404b4c00ff15845e7b0041594158595a5e5f58ff25256f7b00"/>
+        </PatchList>
+    </Metadata>
+</Patch>)xml";
+
+static void ApplyBuiltInPatches() {
+    if (g_game_serial != "CUSA03220" && g_game_serial != "CUSA02168") {
+        return;
+    }
+    pugi::xml_document doc;
+    const pugi::xml_parse_result result = doc.load_string(BuiltInGtSportPatch);
+    LOG_INFO(Loader, "Applying the built-in Gran Turismo Sport 1.69 boot patch");
+    ApplyPatchesFromDocument(doc, result);
+}
+
+static void ApplyPatchesFromDocument(pugi::xml_document& doc,
+                                     const pugi::xml_parse_result& result) {
     auto* param_sfo = Common::Singleton<PSF>::Instance();
     auto app_version = param_sfo->GetString("APP_VER").value_or("Unknown version");
 
@@ -272,6 +304,7 @@ void OnGameLoaded() {
             }
         }
     }
+    ApplyBuiltInPatches();
     ApplyPendingPatches();
 }
 
