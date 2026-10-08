@@ -143,3 +143,7 @@ information, so check them before sharing.
 # License
 
 Licensed under [GPL-2.0-or-later](LICENSE), like shadPS4.
+
+<p align="center">
+  <img src="assets/GranTurismoSportBanner2.webp" width="800" alt="Gran Turismo Sport banner">
+</p>
