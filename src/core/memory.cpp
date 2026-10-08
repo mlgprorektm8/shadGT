@@ -179,24 +179,31 @@ std::string MemoryManager::DescribeBackingWrites(VAddr address, u64 margin) {
     const u64 end_index = g_backing_write_index.load();
     const u64 begin_index = end_index > BackingWriteCount ? end_index - BackingWriteCount : 0;
     const auto now = std::chrono::steady_clock::now();
-    std::string out;
+    // The newest 40 matches, listed oldest first.
+    std::vector<std::string> newest;
     u32 found = 0;
-    for (u64 i = begin_index; i < end_index; ++i) {
+    for (u64 i = end_index; i-- > begin_index;) {
         const auto& w = g_backing_writes[i % BackingWriteCount];
         if (w.address < address + margin && address < w.address + w.size + margin) {
-            std::string_view file = w.file ? w.file : "?";
-            if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
-                file.remove_prefix(slash + 1);
-            }
-            if (++found <= 24) {
-                out += fmt::format(" | {:#x}+{:#x} from {}:{} first dword {:08x}, {:.0f} ms ago",
-                                   w.address, w.size, file, w.line, w.first_dword,
-                                   std::chrono::duration<double, std::milli>(now - w.time).count());
+            ++found;
+            if (newest.size() < 40) {
+                std::string_view file = w.file ? w.file : "?";
+                if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+                    file.remove_prefix(slash + 1);
+                }
+                newest.push_back(
+                    fmt::format(" | {:#x}+{:#x} from {}:{} first dword {:08x}, {:.0f} ms ago",
+                                w.address, w.size, file, w.line, w.first_dword,
+                                std::chrono::duration<double, std::milli>(now - w.time).count()));
             }
         }
     }
+    std::string out;
+    for (auto it = newest.rbegin(); it != newest.rend(); ++it) {
+        out += *it;
+    }
     return found == 0 ? std::string(" none of the last 65536")
-                      : fmt::format(" {} writes:{}", found, out);
+                      : fmt::format(" {} entries, newest {}:{}", found, newest.size(), out);
 }
 
 void MemoryManager::NoteEmulatorWrite(VAddr address, u64 size, const void* data,

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <limits>
 #include <unordered_set>
+#include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -180,6 +181,9 @@ std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(I
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
     };
     runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
+    // DIAG-037: readback recorded, in the crash report's write history.
+    static constexpr u32 NoData = 0;
+    Core::MemoryManager::NoteEmulatorWrite(image.info.guest_address, 0, &NoData);
     return PendingReadback{image.info.guest_address, download, download_size,
                            HashGuestBytes(image.info.guest_address, download_size)};
 }
@@ -279,6 +283,11 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(pages_start, pages_end - pages_start,
                          [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
+    if (!image_ids.empty()) {
+        // DIAG-037: a CPU write fault on image memory, in the crash report's write history.
+        static constexpr u32 NoData = 0;
+        Core::MemoryManager::NoteEmulatorWrite(addr, 0, &NoData);
+    }
 
     for (const auto image_id : image_ids) {
         Image& image = slot_images[image_id];
@@ -839,11 +848,31 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
+// DIAG-036: the first time each image is queued for readback, what it is and who writes it.
+static void LogReadbackImage(ImageId image_id, const Image& image, const char* writer) {
+    static std::mutex mutex;
+    static std::unordered_set<u32> seen;
+    std::scoped_lock lk{mutex};
+    if (seen.size() >= 400 || !seen.insert(image_id.index).second) {
+        return;
+    }
+    const auto& info = image.info;
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-036: readback image {} ({}) at {:#x}+{:#x}: {}x{}x{} pitch {} {} bits {} "
+                "tile {} array {} levels {} layers {} samples {}",
+                image_id.index, writer, info.guest_address, info.guest_size, info.size.width,
+                info.size.height, info.size.depth, info.pitch, info.num_bits,
+                vk::to_string(info.pixel_format), magic_enum::enum_name(info.tile_mode),
+                magic_enum::enum_name(info.array_mode), info.resources.levels,
+                info.resources.layers, info.num_samples);
+}
+
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.MarkGpuModified();
         if (ShouldReadBack(image)) {
+            LogReadbackImage(image_id, image, "storage image");
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
         }
@@ -856,6 +885,10 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     Image& image = slot_images[image_id];
     image.MarkGpuModified();
     if (ShouldReadBack(image)) {
+        LogReadbackImage(image_id, image, "render target");
+        // DIAG-037: drawn into (queued for readback), in the crash report's write history.
+        static constexpr u32 NoData = 0;
+        Core::MemoryManager::NoteEmulatorWrite(image.info.guest_address, 0, &NoData);
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     }
