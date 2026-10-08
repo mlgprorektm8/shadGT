@@ -211,6 +211,189 @@ static int Inspect(ICaptureFile* file, const std::filesystem::path& out, int arg
     std::cout << actions.size() << " actions, " << replay->GetTextures().size()
               << " textures; final target " << Id(final_target) << '\n';
 
+    if (argc > 4 && std::string(argv[3]) == "ib-dump") {
+        // The draw's real index buffer and primitive restart state.
+        const uint32_t event = std::stoul(argv[4]);
+        replay->SetFrameEvent(event, false);
+        const auto* vk = replay->GetVulkanPipelineState();
+        const auto& ia = vk->inputAssembly;
+        const ActionDescription* action = nullptr;
+        for (const auto* a : actions) if (a->eventId == event) action = a;
+        std::ofstream dump(out / "ib-dump.txt");
+        dump << "restart=" << ia.primitiveRestartEnable << " stride=" << ia.indexBuffer.byteStride
+             << " offset=" << ia.indexBuffer.byteOffset << " count=" << action->numIndices
+             << " first=" << action->indexOffset << " base=" << action->baseVertex << '\n';
+        const uint32_t stride = ia.indexBuffer.byteStride ? ia.indexBuffer.byteStride : 4;
+        const bytebuf data = replay->GetBufferData(
+            ia.indexBuffer.resourceId, ia.indexBuffer.byteOffset + uint64_t(action->indexOffset) * stride,
+            uint64_t(action->numIndices) * stride);
+        for (size_t i = 0; i * stride < data.size(); ++i) {
+            uint32_t index = 0;
+            std::memcpy(&index, data.data() + i * stride, stride);
+            dump << index << (i % 4 == 3 ? '\n' : ' ');
+        }
+        replay->Shutdown();
+        return 0;
+    }
+
+    if (argc > 7 && std::string(argv[3]) == "buffer-dump") {
+        // Raw dwords of a buffer at an event: buffer-dump <event> <resource> <offset> <bytes>.
+        replay->SetFrameEvent(std::stoul(argv[4]), false);
+        const bytebuf data = replay->GetBufferData(Resource(std::stoull(argv[5])),
+                                                   std::stoull(argv[6]), std::stoull(argv[7]));
+        std::ofstream dump(out / "buffer-dump.txt");
+        for (size_t offset = 0; offset + 4 <= data.size(); offset += 4) {
+            uint32_t word;
+            std::memcpy(&word, data.data() + offset, 4);
+            dump << word << (offset % 56 == 52 ? '\n' : ' ');
+        }
+        replay->Shutdown();
+        return 0;
+    }
+
+    if (argc > 5 && std::string(argv[3]) == "mesh-dump") {
+        // Clip-space positions of one draw's vertex shader (vs) or tessellation (gs) output.
+        replay->SetFrameEvent(std::stoul(argv[4]), false);
+        const auto stage = std::string(argv[5]) == "gs" ? MeshDataStage::GSOut : MeshDataStage::VSOut;
+        const MeshFormat mesh = replay->GetPostVSData(0, 0, stage);
+        const bytebuf data =
+            replay->GetBufferData(mesh.vertexResourceId, mesh.vertexByteOffset, 64 << 20);
+        std::ofstream dump(out / "mesh-dump.txt");
+        dump << "stride=" << mesh.vertexByteStride << " topology=" << static_cast<int>(mesh.topology)
+             << " indices=" << mesh.numIndices << " indexed=" << (mesh.indexResourceId != ResourceId())
+             << '\n';
+        if (mesh.indexResourceId != ResourceId()) {
+            const bytebuf indices = replay->GetBufferData(
+                mesh.indexResourceId, mesh.indexByteOffset, mesh.numIndices * mesh.indexByteStride);
+            std::ofstream index_dump(out / "index-dump.txt");
+            index_dump << "base_vertex=" << mesh.baseVertex << " stride=" << mesh.indexByteStride << '\n';
+            for (uint32_t i = 0; i < mesh.numIndices; ++i) {
+                uint32_t index = 0;
+                std::memcpy(&index, indices.data() + i * mesh.indexByteStride, mesh.indexByteStride);
+                index_dump << index << (i % 4 == 3 ? '\n' : ' ');
+            }
+        }
+        const size_t count = mesh.vertexByteStride ? data.size() / mesh.vertexByteStride : 0;
+        for (size_t v = 0; v < count && v < 200000; ++v) {
+            float p[4];
+            std::memcpy(p, data.data() + v * mesh.vertexByteStride, sizeof(p));
+            dump << v << ' ' << p[0] << ' ' << p[1] << ' ' << p[2] << ' ' << p[3] << '\n';
+        }
+        replay->Shutdown();
+        return 0;
+    }
+
+    if (argc > 3 && std::string(argv[3]) == "sliver-scan") {
+        // Stretched geometry: triangles (tessellation output, a triangle list) whose longest
+        // screen-space edge is long while their area is tiny.
+        std::ofstream report(out / "sliver-scan.txt");
+        for (const auto* action : actions) {
+            if (!(action->flags & ActionFlags::Drawcall)) continue;
+            replay->SetFrameEvent(action->eventId, false);
+            const MeshFormat mesh = replay->GetPostVSData(0, 0, MeshDataStage::GSOut);
+            if (mesh.vertexResourceId == ResourceId() || mesh.vertexByteStride < 16) continue;
+            const bytebuf data =
+                replay->GetBufferData(mesh.vertexResourceId, mesh.vertexByteOffset, 64 << 20);
+            const size_t count = data.size() / mesh.vertexByteStride;
+            size_t slivers = 0, triangles = 0;
+            float longest = 0.f;
+            float example[6]{};
+            for (size_t t = 0; t + 2 < count; t += 3) {
+                float sx[3], sy[3];
+                bool visible = true;
+                for (int k = 0; k < 3; ++k) {
+                    float p[4];
+                    std::memcpy(p, data.data() + (t + k) * mesh.vertexByteStride, sizeof(p));
+                    if (!(p[3] > 1e-4f) || !std::isfinite(p[0]) || !std::isfinite(p[1])) {
+                        visible = false;
+                        break;
+                    }
+                    sx[k] = (p[0] / p[3] * 0.5f + 0.5f) * 1920.f;
+                    sy[k] = (p[1] / p[3] * 0.5f + 0.5f) * 1080.f;
+                }
+                if (!visible) continue;
+                ++triangles;
+                float edge = 0.f;
+                for (int k = 0; k < 3; ++k) {
+                    const float dx = sx[k] - sx[(k + 1) % 3], dy = sy[k] - sy[(k + 1) % 3];
+                    edge = std::max(edge, std::sqrt(dx * dx + dy * dy));
+                }
+                const float area = std::fabs((sx[1] - sx[0]) * (sy[2] - sy[0]) -
+                                             (sx[2] - sx[0]) * (sy[1] - sy[0])) * 0.5f;
+                const bool on_screen = std::max({sx[0], sx[1], sx[2]}) > 0 &&
+                                       std::min({sx[0], sx[1], sx[2]}) < 1920 &&
+                                       std::max({sy[0], sy[1], sy[2]}) > 0 &&
+                                       std::min({sy[0], sy[1], sy[2]}) < 1080;
+                if (on_screen && edge > 300.f && area < edge * 4.f) {
+                    if (edge > longest) {
+                        longest = edge;
+                        for (int k = 0; k < 3; ++k) { example[k * 2] = sx[k]; example[k * 2 + 1] = sy[k]; }
+                    }
+                    ++slivers;
+                }
+            }
+            if (slivers > 0) {
+                report << action->eventId << " triangles=" << triangles << " slivers=" << slivers
+                       << " longest=" << longest << " example=(" << example[0] << ',' << example[1]
+                       << ")(" << example[2] << ',' << example[3] << ")(" << example[4] << ','
+                       << example[5] << ") indices=" << action->numIndices << '\n';
+                report.flush();
+            }
+        }
+        replay->Shutdown();
+        return 0;
+    }
+
+    if (argc > 3 && std::string(argv[3]) == "vsout-scan") {
+        // Exploded geometry: per draw, how many transformed positions are non-finite or
+        // absurdly far outside the clip volume.
+        const uint32_t first = argc > 4 ? std::stoul(argv[4]) : 0;
+        const uint32_t last = argc > 5 ? std::stoul(argv[5]) : UINT32_MAX;
+        std::ofstream report(out / "vsout-scan.txt");
+        for (const auto* action : actions) {
+            if (!(action->flags & ActionFlags::Drawcall) || action->eventId < first ||
+                action->eventId > last) {
+                continue;
+            }
+            replay->SetFrameEvent(action->eventId, false);
+            const bool vs_only = argc > 6 && std::string(argv[6]) == "vs";
+            for (const auto stage : {MeshDataStage::GSOut, MeshDataStage::VSOut}) {
+                if (vs_only && stage == MeshDataStage::GSOut) continue;
+                const MeshFormat mesh = replay->GetPostVSData(0, 0, stage);
+                if (mesh.vertexResourceId == ResourceId() || mesh.vertexByteStride < 16) {
+                    continue;
+                }
+                const bytebuf data = replay->GetBufferData(mesh.vertexResourceId,
+                                                           mesh.vertexByteOffset, 64 << 20);
+                const size_t count = data.size() / mesh.vertexByteStride;
+                size_t bad = 0, far = 0;
+                float worst = 0.f;
+                for (size_t v = 0; v < count; ++v) {
+                    float p[4];
+                    std::memcpy(p, data.data() + v * mesh.vertexByteStride, sizeof(p));
+                    if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) ||
+                        !std::isfinite(p[3])) {
+                        ++bad;
+                        continue;
+                    }
+                    const float w = std::max(std::fabs(p[3]), 1e-6f);
+                    const float extent = std::max(std::fabs(p[0]), std::fabs(p[1])) / w;
+                    worst = std::max(worst, extent);
+                    if (extent > 1000.f || std::fabs(p[3]) > 1e7f) {
+                        ++far;
+                    }
+                }
+                report << action->eventId << ' ' << (stage == MeshDataStage::GSOut ? "gs" : "vs")
+                       << " verts=" << count << " nonfinite=" << bad << " far=" << far
+                       << " worst=" << worst << " indices=" << action->numIndices
+                       << " name=" << action->customName.c_str() << '\n';
+                break;
+            }
+        }
+        replay->Shutdown();
+        return 0;
+    }
+
     const uint32_t event = argc > 3 ? std::stoul(argv[3]) : final_event;
     replay->SetFrameEvent(event, true);
     const auto& structured = replay->GetStructuredFile();
