@@ -6,106 +6,60 @@ SPDX-License-Identifier: GPL-2.0-or-later
 <h1 align="center">
   <b>shadGT</b>
   <br>
-  <sub>Gran Turismo Sport on a fork of the shadPS4 emulator</sub>
+  <sub>Gran Turismo Sport on PC, built on the shadPS4 emulator</sub>
 </h1>
 
-# shadGT
+<p align="center">
+  <a href="https://discord.gg/De94trHtj5">
+    <img src="https://img.shields.io/badge/Discord-shadGT-5865F2?logo=discord&logoColor=white" width="160">
+  </a>
+</p>
 
-shadGT is a fork of [shadPS4](https://github.com/shadps4-emu/shadPS4) focused on running
-**Gran Turismo Sport** (CUSA03220, update 1.69) correctly and fast on Windows. It keeps the
-shadPS4 emulator core and adds, among other things:
+# About
 
-- Graphics fixes for GT Sport, and car thumbnails that no longer stop the game.
-- Faster races: GPU command processing changes, and pipelines built ahead of their draws on all
-  CPU cores so new scenes stall far less.
-- The GT Sport 1.69 boot patch applied automatically.
-- A portable folder: all settings, saves, shader cache and logs stay beside the executable.
+shadGT is a fork of the [shadPS4](https://github.com/shadps4-emu/shadPS4) PlayStation 4 emulator
+focused on one game: **Gran Turismo Sport** (CUSA03220, update 1.69), on **Windows**. The goal is
+for the game to run its normal code paths, render correctly and play smoothly, without graphical
+hacks.
 
-To play, use a portable folder made by `scripts/Make-GTSportPortable.ps1`: start
-`shadGT Launcher.exe` (the [shadPS4 Qt launcher](https://github.com/shadps4-emu/shadps4-qtlauncher)),
-add your games folder, and start GT Sport. Its README lists what you need from your own console.
+What shadGT adds on top of shadPS4:
 
-Details: [GT_SPORT_BASELINE.md](GT_SPORT_BASELINE.md) (tested builds and results) and
-[GT_SPORT_OPTIMIZATION_LOG.md](GT_SPORT_OPTIMIZATION_LOG.md).
+- **Graphics fixes** for GT Sport, including car thumbnails that used to stop the game with
+  "BREAK! thumbnail_functions.ad:473".
+- **Faster races**: changes to GPU command processing and memory tracking, and new pipelines
+  built ahead of their draws on all CPU cores, so new scenes stall far less.
+- **The 1.69 boot patch built in**, so the game starts however it is launched.
+- **A portable install**: every setting, save, shader cache and log stays in the folder beside
+  the executable, never in AppData.
 
-All credit for the emulator itself goes to the shadPS4 project and its contributors; shadGT is
-not affiliated with them. The rest of this file is shadPS4's own README.
-
-# About shadPS4 (upstream)
-
-<h1 align="center">
-  <br>
-  <a href="https://shadPS4.net/"><img src="https://github.com/shadGT-emu/shadGT/blob/main/.github/shadGT.png" width="220"></a>
-  <br>
-  <b>shadGT</b>
-  <br>
-</h1>
-
-<h1 align="center">
- <a href="[https://discord.gg/bFJxfftGW6](https://discord.gg/De94trHtj5)">
-        <img src="https://img.shields.io/discord/1080089157554155590?color=5865F2&label=shadGT%20Discord&logo=Discord&logoColor=white" width="275">
- <a href="https://github.com/shadGT-emu/shadGT/releases/latest">
-        <img src="https://img.shields.io/github/downloads/shadGT-emu/shadGT/total.svg" width="140">
- <a href="https://shadGT.net/">
-        <img src="https://img.shields.io/badge/shadGT-website-8A2BE2" width="150">
- <a href="https://x.com/shadGT">
-        <img src="https://img.shields.io/badge/-Join%20us-black?logo=X&logoColor=white" width="100">
- <a href="https://github.com/shadGT-emu/shadGT/stargazers">
-        <img src="https://img.shields.io/github/stars/shadGT-emu/shadGT" width="120">
-</h1>
-
-
-# General information
-
-**shadGT** is an early **PlayStation 4** emulator for **Windows**, written in C++.
-
-If you encounter problems or have doubts, do not hesitate to look at the [**Quickstart**](https://github.com/shadGT-emu/shadGT/wiki/I.-Quick-start-%5BUsers%5D).\
-To verify that a game works, you can look at [**shadGT Game Compatibility**](https://github.com/shadGT-compatibility/shadGT-game-compatibility).\
-To discuss shadGT development, suggest ideas or to ask for help, join our [**Discord server**](https://discord.gg/bFJxfftGW6).\
-To get the latest news, go to our [**X (Twitter)**](https://x.com/shadGT) or our [**website**](https://shadGT.net/).\
-You can donate to the project via our [**Kofi page**](https://ko-fi.com/shadGT).
-
-# Status
+Test results and the current baseline are in [GT_SPORT_BASELINE.md](GT_SPORT_BASELINE.md); every
+change and its measurements are in [GT_SPORT_OPTIMIZATION_LOG.md](GT_SPORT_OPTIMIZATION_LOG.md).
 
 > [!IMPORTANT]
-> shadGT is early in development, don't expect a flawless experience.
+> shadGT is tested with GT Sport only. Other games may run as they do on shadPS4, or not at all.
 
-Currently, the emulator can successfully run games like [**Bloodborne**](https://www.youtube.com/watch?v=5sZgWyVflFM), [**Dark Souls Remastered**](https://www.youtube.com/watch?v=-3PA-Xwszts), [**Red Dead Redemption**](https://www.youtube.com/watch?v=Al7yz_5nLag), and many other games.
+# Getting started
 
-# Why
+A shadGT folder (made with `scripts/Make-GTSportPortable.ps1`) contains `shadGT.exe` and
+`shadGT Launcher.exe`, the [shadPS4 Qt launcher](https://github.com/shadps4-emu/shadps4-qtlauncher)
+set up to run it.
 
-This project began for fun. Given our limited free time, it may take some time before shadGT can run more complex games, but we're committed to making small, regular updates.
+1. Copy the firmware modules listed below from your own PS4 into `user\sys_modules`.
+2. Start `shadGT Launcher.exe` and add the folder that contains your GT Sport game folder
+   (CUSA03220, dumped from your own console with update 1.69).
+3. Double-click Gran Turismo Sport.
+
+The first time a scene is shown its shaders are compiled, so it can stutter briefly; after that
+they are cached in `user\cache` and load at startup.
+
+Questions and reports: [shadGT Discord](https://discord.gg/De94trHtj5).
 
 # Building
 
-## Docker
-
-For building shadGT in a containerized environment using Docker and VSCode, check the instructions here:  
-[**Docker Build Instructions**](https://github.com/shadGT-emu/shadGT/blob/main/documents/building-docker.md)
-
-## Windows
-
-Check the build instructions for [**Windows**](https://github.com/shadGT-emu/shadGT/blob/main/documents/building-windows.md).
-
-# Usage examples
-
-> [!IMPORTANT]
-> For a user-friendly GUI, download the [**QtLauncher**](https://github.com/shadGT-emu/shadGT-qtlauncher/releases).
-
-To get the list of all available commands and also a more detailed description of what each command does, please refer to the `--help` flag's output.
-
-Below is a list of commonly used command patterns:
-```sh
-shadGT CUSA00001 # Searches for a game folder called CUSA00001 in the list of game install folders, and boots it.
-shadGT --fullscreen true --config-clean CUSA00001    # the game argument is always the last one,
-shadGT -g CUSA00001 --fullscreen true --config-clean # ...unless manually specified otherwise.
-shadGT /path/to/game.elf # Boots a PS4 ELF file directly. Useful if you want to boot an executable that is not named eboot.bin.
-shadGT CUSA00001 -- -flag1 -flag2 # Passes '-flag1' and '-flag2' to the game executable in argv.
-```
-
-# Debugging and reporting issues
-
-For more information on how to test, debug and report issues with the emulator or games, read the [**Debugging documentation**](https://github.com/shadGT-emu/shadGT/blob/main/documents/Debugging/Debugging.md).
+shadGT builds like shadPS4: see the [Windows build instructions](documents/building-windows.md).
+The executable is `shadGT.exe`. `scripts/Run-GTSportPerformance.ps1` runs GT Sport with a test
+profile and prints a performance summary; `-DisablePerf <ids>` switches individual changes off
+for comparisons.
 
 # Keyboard and Mouse Mappings
 
@@ -152,11 +106,9 @@ R3 | M |
 
 Keyboard and mouse inputs can be customized in the settings menu by clicking the Controller button, and further details and help on controls are  also found there. Custom bindings are saved per-game. Inputs support up to three keys per binding, mouse buttons, mouse movement mapped to joystick input, and more.
 
-
 # Firmware files
 
-shadGT can load some PlayStation 4 firmware files.
-The following firmware modules are supported and must be placed in shadGT's `sys_modules` folder.
+GT Sport needs these PlayStation 4 firmware modules, placed in the `user\sys_modules` folder:
 
 <div align="center">
 
@@ -174,45 +126,21 @@ The following firmware modules are supported and must be placed in shadGT's `sys
 </div>
 
 > [!Caution]
-> The above modules are required to run the games properly and must be dumped from your legally owned PlayStation 4 console.
+> The firmware modules and the game must be dumped from your own PlayStation 4 console.
 
+# Credits
 
+shadGT is built on [**shadPS4**](https://github.com/shadps4-emu/shadPS4) and would not exist
+without the shadPS4 project and
+[**all of its contributors**](https://github.com/shadps4-emu/shadPS4/graphs/contributors). The
+emulator core, its libraries and almost all of the code here are their work; shadGT's changes are
+listed in [GT_SPORT_OPTIMIZATION_LOG.md](GT_SPORT_OPTIMIZATION_LOG.md). The Qt launcher is the
+[shadPS4 Qt launcher](https://github.com/shadps4-emu/shadps4-qtlauncher). The GT Sport 1.69 boot
+patch is by Kravickas, from the shadPS4 game patch repository.
 
-# Main credits
-
-- [**georgemoralis**](https://github.com/georgemoralis)
-- [**psucien**](https://github.com/psucien)
-- [**viniciuslrangel**](https://github.com/viniciuslrangel)
-- [**roamic**](https://github.com/roamic)
-- [**squidbus**](https://github.com/squidbus)
-- [**frodo**](https://github.com/baggins183)
-- [**Stephen Miller**](https://github.com/StevenMiller123)
-- [**kalaposfos13**](https://github.com/kalaposfos13)
-
-<a href="https://github.com/shadPS4-emu/shadPS4/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=shadPS4-emu/shadPS4&max=24">
-</a>
-
-# Contributing
-
-If you want to contribute, please read the [**CONTRIBUTING.md**](https://github.com/shadGT-emu/shadGT/blob/main/CONTRIBUTING.md) file.\
-Open a PR and we'll check it :)
-
-
-# Special Thanks
-
-A few noteworthy teams/projects who've helped us along the way are:
-
-- [**Panda3DS**](https://github.com/wheremyfoodat/Panda3DS): A multiplatform 3DS emulator from our co-author wheremyfoodat. They have been incredibly helpful in understanding and solving problems that came up from natively executing the x64 code of PS4 binaries
-
-- [**fpPS4**](https://github.com/red-prig/fpPS4): The fpPS4 team has assisted massively with understanding some of the more complex parts of the PS4 operating system and libraries, by helping with reverse engineering work and research.
-
-- **yuzu**: Our shader compiler has been designed with yuzu's Hades compiler as a blueprint. This allowed us to focus on the challenges of emulating a modern AMD GPU while having a high-quality optimizing shader compiler implementation as a base.
-
-- [**felix86**](https://github.com/OFFTKP/felix86): A new x86-64 → RISC-V Linux userspace emulator
-
-- [**emudev.org**](https://emudev.org/): A network of people interested in the documentation, emulation, simulation and re-implementation of hardware near extinction . Belongs to my friend skmp and me (shadow) also a member of it
+shadGT is not affiliated with the shadPS4 project, Sony Interactive Entertainment or Polyphony
+Digital. Gran Turismo is a trademark of Sony Interactive Entertainment.
 
 # License
 
-- [**GPL-2.0 license**](https://github.com/shadPS4-emu/shadPS4/blob/main/LICENSE)
+- [**GPL-2.0 license**](LICENSE), like shadPS4.
