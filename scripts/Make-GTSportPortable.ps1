@@ -5,8 +5,8 @@ param(
     [switch]$FullLogging
 )
 
-# Builds a self-contained GT Sport folder: shadps4.exe with every setting, save, shader cache
-# and log in the "user" folder beside it (this fork never uses AppData on Windows). It copies
+# Builds a self-contained GT Sport folder: shadps4.exe (double-click opens the game list) with
+# every setting, save, shader cache and log in the "user" folder beside it (this fork never uses AppData on Windows). It copies
 # no game files, firmware modules, fonts, saves, keys or caches: the player supplies those.
 
 $ErrorActionPreference = 'Stop'
@@ -40,32 +40,6 @@ $config.General.show_fps_counter = $true
 $config.Log.filter = if ($FullLogging) { '*:Info' } else { '*:Warning' }
 $config | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'user/config.json') -Encoding UTF8
 
-$launcher = @'
-@echo off
-setlocal
-rem Starts GT Sport with this folder's shadPS4. Drag eboot.bin (or the game folder) onto this
-rem file, or put the path to eboot.bin in game_path.txt beside it.
-cd /d "%~dp0"
-set "GAME=%~1"
-if "%GAME%"=="" if exist "game_path.txt" set /p GAME=<"game_path.txt"
-if "%GAME%"=="" (
-    echo Path to GT Sport's eboot.bin, for example E:\PS4\CUSA03220\eboot.bin:
-    set /p GAME=
-)
-if exist "%GAME%\eboot.bin" set "GAME=%GAME%\eboot.bin"
-if not exist "%GAME%" (
-    echo Not found: %GAME%
-    pause
-    exit /b 1
-)
-> "game_path.txt" echo %GAME%
-rem Third-party Vulkan overlays (recorders, tuning tools) can crash the emulator.
-set "VK_LOADER_LAYERS_DISABLE=~implicit~"
-"%~dp0shadps4.exe" "%GAME%"
-endlocal
-'@
-Set-Content -LiteralPath (Join-Path $OutputDirectory 'Launch GT Sport.bat') -Value $launcher -Encoding ASCII
-
 $readme = @"
 GT Sport on shadPS4 (fork build $commit)
 
@@ -80,8 +54,13 @@ You need to provide, from your own console:
    libSceJpegDec and libSceJson2, which have no built-in replacement in the emulator.
 3. Optionally the system fonts, copied into user\fonts.
 
-To play: drag eboot.bin (or the game folder) onto "Launch GT Sport.bat". It remembers the
-path in game_path.txt, so next time a double-click is enough.
+To play: double-click shadps4.exe. It opens the game list. The first time, open
+Settings > Game Folders > Add Folder and pick the folder that contains your GT Sport
+folder (CUSA03220). Close Settings, and GT Sport appears in the list; click it to start.
+The folder is remembered, so later a double-click and a click on the game is enough.
+
+If the game crashes on start, a third-party overlay (screen recorder, FPS counter, GPU
+tuning tool) may be hooking Vulkan; close it and try again.
 
 The first launch compiles shaders as the game needs them, so it stutters until the shader
 cache in user\cache has been built up; later launches precompile it with a progress counter

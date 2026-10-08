@@ -1,4 +1,4 @@
-﻿# GT Sport Graphics Baseline
+# GT Sport Graphics Baseline
 
 ## Current baseline: October 7, 2026 (read-ahead pipeline builds)
 
@@ -30,7 +30,7 @@ Changes since the performance baseline below:
 - DIAG-013 compile timing and DIAG-026 (names a shader the translator rejects) in the log.
 
 `-DisablePerf <ids>` switches any of PERF-017 to PERF-023 off. Reference copy:
-`D:/Development/shadPS4-regression-baselines/GT-Sport-20261007-readahead`.
+`D:/Development/shadPS4-regression-baseline`, with a portable folder.
 
 Still open: 60 FPS in races (the command thread spends about 14 ms per frame on draw setup
 for about 1,450 draws; the GPU is busy about 35%).
