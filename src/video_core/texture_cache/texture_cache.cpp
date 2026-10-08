@@ -103,11 +103,35 @@ std::vector<TextureCache::PendingReadback> TextureCache::RecordPendingReadbacks(
     return readbacks;
 }
 
+// FIX-022: hash of guest memory read through its backing (no protection faults).
+static u64 HashGuestBytes(VAddr address, u32 size) {
+    thread_local std::vector<u8> bytes;
+    bytes.resize(size);
+    Core::Memory::Instance()->CopySparseMemory(address, bytes.data(), size);
+    return XXH3_64bits(bytes.data(), size);
+}
+
 void TextureCache::CompleteReadbacks(std::span<const PendingReadback> readbacks) {
     // May run on the scheduler thread after the GPU work completed. The guest may have unmapped
     // the memory meanwhile (for example while loading a race); skip those writes.
+    // FIX-022: skip it too when the guest changed the bytes after the readback was recorded.
+    // GT Sport frees a small render target's memory and reuses it for its heap while the
+    // readback is in flight; the stale image then overwrote a free-list link and the game
+    // crashed in its allocator after buying a car or starting a race.
+    static const bool check_guest_bytes = Common::PerfFeatureEnabled(33);
     auto* memory = Core::Memory::Instance();
     for (const auto& readback : readbacks) {
+        if (check_guest_bytes && memory->IsValidMapping(readback.address, readback.size) &&
+            HashGuestBytes(readback.address, readback.size) != readback.guest_hash) {
+            static std::atomic<u32> skipped{};
+            if (const u32 n = ++skipped; n <= 20 || n % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-022: image readback {} to {:#x}+{:#x} skipped: the guest changed "
+                            "that memory after it was recorded",
+                            n, readback.address, readback.size);
+            }
+            continue;
+        }
         if (memory->IsValidMapping(readback.address, readback.size)) {
             readback.download.Invalidate();
             memory->TryWriteBacking(std::bit_cast<u8*>(readback.address), readback.download.mapped,
@@ -156,7 +180,8 @@ std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(I
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
     };
     runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
-    return PendingReadback{image.info.guest_address, download, download_size};
+    return PendingReadback{image.info.guest_address, download, download_size,
+                           HashGuestBytes(image.info.guest_address, download_size)};
 }
 
 static u32 ImageDownloadSize(const Image& image) {

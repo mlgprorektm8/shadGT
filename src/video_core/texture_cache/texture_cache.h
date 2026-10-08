@@ -366,6 +366,8 @@ private:
         VAddr address;
         Vulkan::StagingBufferRef download;
         u32 size;
+        /// FIX-022: hash of the guest bytes when the readback was recorded.
+        u64 guest_hash;
     };
     std::optional<PendingReadback> RecordImageReadback(ImageId image_id);
 
