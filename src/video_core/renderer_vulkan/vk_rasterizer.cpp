@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <fstream>
 #include <optional>
 #include <fmt/ranges.h>
 #include "common/debug.h"
+#include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -897,7 +899,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         // FIX-016: record the vertex fetch as a read of the range, so a later upload into it
         // (GT Sport rewrites grass vertex buffers between draws) waits for this draw. Without
         // it the copy can overwrite the vertices while this draw still reads them, mixing
-        // old and new data (the suspected cause of stretched Nürburgring grass and terrain).
+        // old and new data (the suspected cause of stretched NÃ¼rburgring grass and terrain).
         bound_buffers.emplace_back(range.buffer, range.offset, size, false);
     }
 
@@ -1222,6 +1224,40 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     static std::atomic<u64> watched_binds{};
     const u64 watched_bind = watched ? ++watched_binds : 0;
     const bool log_watched = watched && (watched_bind <= 12 || watched_bind % 300 == 0);
+    // DIAG-032: once, well into the session, dump the GPU copy of every buffer of a grass vertex
+    // dispatch (cs 0xab6a2d10), then the vertex ranges of the grass draws that follow.
+    static std::atomic<u32> grass_dispatches{};
+    static const u32 dump_at = [] {
+        const char* env = std::getenv("SHADGT_DUMP_GRASS_AT");
+        return env && *env ? u32(std::stoul(env)) : 600u;
+    }();
+    if (stage.pgm_hash == 0xab6a2d10 && ++grass_dispatches == dump_at) {
+        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "grass-dump";
+        std::filesystem::create_directories(dir);
+        std::ofstream index{dir / "index.txt"};
+        u32 i = 0;
+        for (const auto& desc : stage.buffers) {
+            const u32 index_number = i++;
+            if (desc.IsSpecial()) {
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(stage);
+            const u64 size = vsharp.base_address
+                                 ? memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize())
+                                 : 0;
+            index << fmt::format("buffer {} {} {:#x}+{:#x} stride {} records {:#x}\n", index_number,
+                                 desc.is_written ? "write" : "read", u64(vsharp.base_address), size,
+                                 vsharp.GetStride(), vsharp.num_records);
+            if (size != 0 && size <= 64_MB) {
+                buffer_cache.DumpRange(vsharp.base_address, size,
+                                       dir / fmt::format("dispatch_buffer{}", index_number));
+            }
+        }
+        buffer_cache.grass_dump_dir = dir;
+        buffer_cache.grass_vertex_dumps_left = 5;
+        LOG_WARNING(Render_Vulkan, "DIAG-032: dumped the buffers of grass dispatch {} to {}",
+                    dump_at, dir.string());
+    }
     u32 buffer_index = 0;
     for (const auto& desc : stage.buffers) {
         ++buffer_index;

@@ -16,6 +16,7 @@
 #include <xxhash.h>
 
 #include "common/alignment.h"
+#include "common/io_file.h"
 #include "common/perf_monitor.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -1025,6 +1026,30 @@ void BufferCache::RecordWatchedUploads(VAddr start, VAddr end) {
     }
 }
 
+void BufferCache::DumpRange(VAddr address, u64 size, const std::filesystem::path& base) {
+    const u64 first_block = address >> block_shift;
+    const u64 last_block = (address + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    EnsureResident(arena, first_block, last_block);
+    const auto download = staging_pool.Request(size, MemoryType::HostCached);
+    const vk::BufferCopy copy{
+        .srcOffset = arena->Offset(address),
+        .dstOffset = download.offset,
+        .size = size,
+    };
+    runtime.CopyBuffer(arena, download.buffer, std::span{&copy, 1});
+    scheduler.Finish();
+    download.buffer->Invalidate(download.offset, size);
+    auto gpu_path = base;
+    gpu_path += ".gpu.bin";
+    Common::FS::IOFile{gpu_path, Common::FS::FileAccessMode::Create}.WriteRaw<u8>(download.mapped,
+                                                                                  size);
+    auto guest_path = base;
+    guest_path += ".guest.bin";
+    Common::FS::IOFile{guest_path, Common::FS::FileAccessMode::Create}.WriteRaw<u8>(
+        std::bit_cast<const u8*>(address), size);
+}
+
 void BufferCache::InlineGuestWrite(VAddr address, std::span<const u8> data) {
     const u64 size = data.size();
     const u64 first_block = address >> block_shift;
@@ -1098,6 +1123,15 @@ void BufferCache::RefreshReadPages(VAddr address, u64 size, u64 shader_hash, boo
     constexpr u64 BigRange = 16_KB;
     std::scoped_lock lk{vertex_pages_mutex};
     auto& stats = vertex_page_stats;
+    if (quad_vertices && size >= BigRange && grass_vertex_dumps_left.load() != 0) {
+        // DIAG-032: the vertices the grass draws read, after the dumped grass dispatch.
+        const u32 n = grass_vertex_dumps_left--;
+        const auto base =
+            grass_dump_dir / fmt::format("vertices_{}_{:#x}_vs{:#x}", 6 - n, address, shader_hash);
+        DumpRange(address, size, base);
+        LOG_WARNING(Render_Vulkan, "DIAG-032: dumped quad-list vertices {:#x}+{:#x} to {}", address,
+                    size, base.string());
+    }
     if (quad_vertices && size >= BigRange) {
         // DIAG-029: where the vertices of large quad-list draws (the grass) come from.
         const u64 count = ++big_quad_draws_logged;

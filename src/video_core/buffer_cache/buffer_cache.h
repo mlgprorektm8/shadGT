@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -163,6 +164,13 @@ public:
     /// FIX-017: before a quad-list draw's uploads, compares its vertex pages with the guest
     /// bytes they were last uploaded from and uploads again the ones that changed unnoticed.
     void RefreshReadPages(VAddr address, u64 size, u64 shader_hash, bool quad_vertices);
+
+    /// DIAG-032: writes the GPU copy of a guest range, and the guest bytes, to files (waits for
+    /// the GPU). For one-off dumps of the Nurburgring grass buffers.
+    void DumpRange(VAddr address, u64 size, const std::filesystem::path& base);
+    /// DIAG-032: the next large quad-list vertex ranges to dump after a grass dispatch dump.
+    std::atomic<u32> grass_vertex_dumps_left{};
+    std::filesystem::path grass_dump_dir;
 
     /// FIX-019: writes guest bytes into the GPU copy of their memory in command order, without
     /// changing how the memory is tracked (guest memory receives the same bytes later).
