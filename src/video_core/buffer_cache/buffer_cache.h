@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -161,7 +162,7 @@ public:
 
     /// FIX-017: before a quad-list draw's uploads, compares its vertex pages with the guest
     /// bytes they were last uploaded from and uploads again the ones that changed unnoticed.
-    void RefreshQuadVertexPages(VAddr address, u64 size);
+    void RefreshQuadVertexPages(VAddr address, u64 size, u64 vs_hash);
 
 private:
     void InvalidateAsyncReadbacks(VAddr address, u64 size);
@@ -182,6 +183,9 @@ private:
         u64 size;
     };
     std::unordered_map<VAddr, GpuWriter> small_gpu_writers;
+    /// DIAG-029: GPU writes larger than 4 KB, by start address.
+    std::map<VAddr, GpuWriter> large_gpu_writers;
+    u64 big_quad_draws_logged{};
 
     std::mutex async_readbacks_mutex;
     std::vector<std::shared_ptr<AsyncReadback>> pending_async_readbacks;

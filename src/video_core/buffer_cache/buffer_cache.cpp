@@ -744,6 +744,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             }
             small_gpu_writers[Common::AlignDown(device_addr, 4_KB)] =
                 GpuWriter{g_gpu_write_kind, g_gpu_write_tag, device_addr, size};
+        } else {
+            if (large_gpu_writers.size() > 16384) {
+                large_gpu_writers.clear();
+            }
+            large_gpu_writers[device_addr] =
+                GpuWriter{g_gpu_write_kind, g_gpu_write_tag, device_addr, size};
         }
     }
     return {arena, arena->Offset(device_addr)};
@@ -1019,7 +1025,7 @@ void BufferCache::RecordWatchedUploads(VAddr start, VAddr end) {
     }
 }
 
-void BufferCache::RefreshQuadVertexPages(VAddr address, u64 size) {
+void BufferCache::RefreshQuadVertexPages(VAddr address, u64 size, u64 vs_hash) {
     // FIX-017: the Nurburgring grass is drawn as quad lists and stretched across the screen.
     // In a capture its vertex pages were never uploaded during the frame, so the GPU drew an
     // older copy. Before the draw's uploads, each vertex page is compared with the guest bytes
@@ -1030,6 +1036,43 @@ void BufferCache::RefreshQuadVertexPages(VAddr address, u64 size) {
     constexpr u64 BigRange = 16_KB;
     std::scoped_lock lk{vertex_pages_mutex};
     auto& stats = vertex_page_stats;
+    if (size >= BigRange) {
+        // DIAG-029: where the vertices of large quad-list draws (the grass) come from.
+        const u64 count = ++big_quad_draws_logged;
+        if (count <= 60 || count % 1000 == 0) {
+            u32 pages = 0;
+            u32 gpu_pages = 0;
+            for (VAddr page = Common::AlignDown(address, WatchedPageSize); page < address + size;
+                 page += WatchedPageSize) {
+                ++pages;
+                gpu_pages += memory_tracker->IsRegionGpuModified(page, WatchedPageSize);
+            }
+            std::string writers;
+            auto it = large_gpu_writers.upper_bound(address + size);
+            for (u32 n = 0; it != large_gpu_writers.begin() && n < 64; ++n) {
+                --it;
+                const auto& w = it->second;
+                if (w.address + w.size > address && writers.size() < 600) {
+                    writers +=
+                        fmt::format(" [{} {:#x} at {:#x}+{:#x}]", w.kind, w.tag, w.address, w.size);
+                }
+            }
+            for (VAddr page = Common::AlignDown(address, 4_KB); page < address + size;
+                 page += 4_KB) {
+                const auto small = small_gpu_writers.find(page);
+                if (small != small_gpu_writers.end() && writers.size() < 600) {
+                    const auto& w = small->second;
+                    writers +=
+                        fmt::format(" [{} {:#x} at {:#x}+{:#x}]", w.kind, w.tag, w.address, w.size);
+                }
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-029: quad-list draw {} (vs {:#x}) vertices {:#x}+{:#x}: {} of {} "
+                        "pages GPU-written; writers:{}",
+                        count, vs_hash, address, size, gpu_pages, pages,
+                        writers.empty() ? " none recorded" : writers);
+        }
+    }
     for (VAddr page = Common::AlignDown(address, WatchedPageSize); page < address + size;
          page += WatchedPageSize) {
         if (memory->ClampRangeSize(page, WatchedPageSize) < WatchedPageSize ||
@@ -1161,6 +1204,11 @@ void BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
         ApplyCompletedReadbacks();
         memory_tracker->MarkRegionAsGpuModified(export_image.address, export_image.size);
         gpu_modified_ranges.Add(export_image.address, export_image.size);
+        if (large_gpu_writers.size() > 16384) {
+            large_gpu_writers.clear();
+        }
+        large_gpu_writers[export_image.address] =
+            GpuWriter{"image export", 0, export_image.address, export_image.size};
         image.flags |= ImageFlagBits::BufferCoherent;
         if (image_alias_exports_logged < 16) {
             ++image_alias_exports_logged;

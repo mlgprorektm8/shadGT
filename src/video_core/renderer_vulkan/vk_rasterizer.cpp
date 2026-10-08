@@ -861,7 +861,8 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
         if (quad_list) {
-            buffer_cache.RefreshQuadVertexPages(range.base_address, size);
+            buffer_cache.RefreshQuadVertexPages(
+                range.base_address, size, pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
         }
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
