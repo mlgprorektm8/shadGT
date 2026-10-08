@@ -1,6 +1,41 @@
 ﻿# GT Sport Graphics Baseline
 
-## Current baseline: October 7, 2026 (performance)
+## Current baseline: October 7, 2026 (read-ahead pipeline builds)
+
+Set as the baseline by the player on October 7, 2026 (CUSA03220 update 1.69), after the
+run below; graphics reported fine on the read-ahead builds. Commit `6219309e`, tag
+`gt-sport-baseline-20261007-readahead`.
+
+Measured (log `Build/gt-sport-fixed/runs/20261007-220322-6219309e.log`, 824 s): average
+42.6 FPS, 10th percentile 25.5, 90th 60.0, while building 947 pipelines the cache did not
+have yet. 1,171 of them were built ahead of their draw, 81 on demand; draws waited over
+50 ms 233 times (worst 187 ms), mostly in the race preview. Read-ahead cost 14 s of the
+command thread's 824 s.
+
+Changes since the performance baseline below:
+
+- Car thumbnails no longer stop the game with "BREAK! thumbnail_functions.ad:473" (FIX-012:
+  the shader cache stores attribute loads/stores; linear images up to 256 KB are read back).
+  Cache entries stored before FIX-012 still load.
+- All user data stays in the `user` folder beside the executable on Windows;
+  `scripts/Make-GTSportPortable.ps1` packages a portable folder.
+- PERF-017: runtime pipelines are fast-linked from stage libraries; an optimized link
+  replaces them later (PERF-021: only after 3 s without new pipelines).
+- PERF-018: stage libraries shared between pipelines, the two shader libraries compiled at
+  the same time.
+- PERF-019 to PERF-023: on a pipeline miss (and, for 2 s after one, at the start of every
+  command buffer) the command thread reads the following commands with a copy of the
+  registers and queues every new pipeline on build workers (all cores but two). Draws use
+  exactly the pipeline their real registers select; a wrong guess only costs a build.
+- DIAG-013 compile timing and DIAG-026 (names a shader the translator rejects) in the log.
+
+`-DisablePerf <ids>` switches any of PERF-017 to PERF-023 off. Reference copy:
+`D:/Development/shadPS4-regression-baselines/GT-Sport-20261007-readahead`.
+
+Still open: 60 FPS in races (the command thread spends about 14 ms per frame on draw setup
+for about 1,450 draws; the GPU is busy about 35%).
+
+## Previous baseline: October 7, 2026 (performance)
 
 The player called this build "fantastic" on October 7, 2026 (CUSA03220 update 1.69): a
 solid 30+ FPS throughout races and no exploded vertices when sparks fly. Lighting, sparks
