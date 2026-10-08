@@ -105,6 +105,34 @@ std::string ListGcnCode(std::span<const u32> code) {
     return out;
 }
 
+bool HasLaneReadsAndLoop(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    bool lane_reads = false;
+    bool loop = false;
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        switch (inst.opcode) {
+        case Opcode::V_READLANE_B32:
+        case Opcode::V_MBCNT_LO_U32_B32:
+        case Opcode::V_MBCNT_HI_U32_B32:
+            lane_reads = true;
+            break;
+        default:
+            break;
+        }
+        if (inst.category == InstCategory::FlowControl && inst.control.sopp.simm < 0 &&
+            (inst.IsUnconditionalBranch() || inst.IsConditionalBranch())) {
+            loop = true;
+        }
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return lane_reads && loop;
+}
+
 bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
     using namespace Gcn;
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());

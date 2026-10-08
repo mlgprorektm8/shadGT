@@ -34,6 +34,11 @@ struct Pools {
 /// that next scope with every invocation active.
 [[nodiscard]] bool HasEmptyScopeBeforeElse(std::span<const u32> code);
 
+/// FIX-020: true when the code reads single lanes or lane masks and has a loop (a backward
+/// branch). On hosts with 32-wide subgroups, translations before FIX-020 left those reads 32-wide
+/// in compute shaders with more than 32 invocations per workgroup.
+[[nodiscard]] bool HasLaneReadsAndLoop(std::span<const u32> code);
+
 /// DIAG-031: a readable listing of GCN code (pc, opcode, operands, memory offsets).
 [[nodiscard]] std::string ListGcnCode(std::span<const u32> code);
 

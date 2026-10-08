@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_set>
 #include "common/logging/classes.h"
+#include "common/perf_monitor.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
@@ -35,8 +37,100 @@ static bool IsDivergentCondition(const IR::U1& condition) {
         .value_or(false);
 }
 
+// FIX-020: whether a loop condition can differ between the invocations of a GCN wave. GCN
+// loops are often driven by scalar branches: SCC, or VCC/EXEC masks built from scalar values and
+// EXEC itself. Those take the same path in every active invocation. Values that differ per lane
+// (lane and invocation ids, shuffles, atomics, the bits of a ballot of a per-lane condition) make
+// the loop divergent. Wave-wide reductions (lane reads, ballots) end the search: their result is
+// the same everywhere.
+static bool IsDivergentLoopCondition(const IR::U1& condition) {
+    if (condition.IsImmediate()) {
+        return false;
+    }
+    std::vector<const IR::Inst*> stack{condition.Inst()};
+    std::unordered_set<const IR::Inst*> visited{condition.Inst()};
+    bool in_inverse_ballot = false;
+    const auto push_args = [&](const IR::Inst* inst) {
+        for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+            const IR::Value value{inst->Arg(arg)};
+            if (!value.IsImmediate() && visited.insert(value.Inst()).second) {
+                stack.push_back(value.Inst());
+            }
+        }
+    };
+    while (!stack.empty()) {
+        const IR::Inst* inst = stack.back();
+        stack.pop_back();
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::LaneId:
+        case IR::Opcode::MaskedBitCount32:
+        case IR::Opcode::WriteLane:
+        case IR::Opcode::Shuffle:
+        case IR::Opcode::ShuffleXor:
+        case IR::Opcode::QuadBroadcast:
+        case IR::Opcode::DataAppend:
+        case IR::Opcode::DataConsume:
+            return true;
+        case IR::Opcode::GetAttributeU32: {
+            const auto attribute = inst->Arg(0).Attribute();
+            if (attribute == IR::Attribute::LocalInvocationId ||
+                attribute == IR::Attribute::LocalInvocationIndex) {
+                return true;
+            }
+            break;
+        }
+        case IR::Opcode::GetExec:
+            // EXEC by itself is a per-invocation condition (an EXEC scope).
+            return true;
+        case IR::Opcode::ReadLane:
+        case IR::Opcode::ReadFirstLane:
+        case IR::Opcode::BallotFindLsb:
+            continue;
+        case IR::Opcode::InverseBallot:
+            // The invocation's bit of a mask: the same in every active invocation only when the
+            // mask is made of EXEC and wave-wide values.
+            in_inverse_ballot = true;
+            break;
+        case IR::Opcode::Ballot: {
+            const IR::Value arg{inst->Arg(0)};
+            const bool exec_ballot =
+                !arg.IsImmediate() && arg.Inst()->GetOpcode() == IR::Opcode::GetExec;
+            if (in_inverse_ballot && !exec_ballot) {
+                return true;
+            }
+            continue;
+        }
+        default:
+            if (inst->MayHaveSideEffects()) {
+                // Atomics and other memory operations return per-invocation values.
+                return true;
+            }
+            break;
+        }
+        push_args(inst);
+    }
+    return false;
+}
+
 static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
     using Type = IR::AbstractSyntaxNode::Type;
+    static const bool uniform_loops_enabled = Common::PerfFeatureEnabled(31);
+
+    // FIX-020: loops whose exit conditions take the same path in every invocation, by merge block.
+    // Ballots and lane reads in them used to be left as 32-wide operations on NVIDIA, so a wave64
+    // scan in a loop (GT Sport's grass prefix sums, cs 0x766d0f18) read lane 63 from the wrong
+    // subgroup and produced wrong offsets.
+    std::unordered_set<const IR::Block*> divergent_loops;
+    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+        if (node.type == Type::Repeat &&
+            (!uniform_loops_enabled || IsDivergentLoopCondition(node.data.repeat.cond))) {
+            divergent_loops.insert(node.data.repeat.merge);
+        } else if (node.type == Type::Break &&
+                   (!uniform_loops_enabled ||
+                    IsDivergentLoopCondition(node.data.break_node.cond))) {
+            divergent_loops.insert(node.data.break_node.merge);
+        }
+    }
 
     struct ConditionalScope {
         const IR::Block* merge;
@@ -47,6 +141,7 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
     std::vector<ConditionalScope> conditionals;
     std::vector<const IR::Block*> loops;
     u32 divergence_depth{};
+    u32 divergent_loop_depth{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case Type::If: {
@@ -62,15 +157,17 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
             break;
         case Type::Loop:
             loops.push_back(node.data.loop.merge);
+            divergent_loop_depth += divergent_loops.contains(node.data.loop.merge);
             break;
         case Type::Repeat:
             if (loops.empty() || loops.back() != node.data.repeat.merge) {
                 return {};
             }
+            divergent_loop_depth -= divergent_loops.contains(loops.back());
             loops.pop_back();
             break;
         case Type::Block:
-            if (divergence_depth == 0 && loops.empty()) {
+            if (divergence_depth == 0 && divergent_loop_depth == 0) {
                 blocks.push_back(node.data.block);
             }
             break;

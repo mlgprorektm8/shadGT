@@ -9,6 +9,7 @@
 #include <future>
 #include <mutex>
 #include <ranges>
+#include <sstream>
 
 #include "common/elf_info.h"
 #include "common/hash.h"
@@ -1291,10 +1292,16 @@ void PipelineCache::LoadElseScopeFixed() {
     else_scope_fixed_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
                             fmt::format("{}.else-scope-fix", serial);
     std::ifstream file{else_scope_fixed_path};
-    u64 hash{};
-    size_t boundary{};
-    while (file >> std::hex >> hash >> std::dec >> boundary) {
-        else_scope_fixed[hash] = boundary;
+    std::string line;
+    while (std::getline(file, line)) {
+        std::istringstream fields{line};
+        u64 hash{};
+        size_t boundary{};
+        u32 fixes = 1; // Lines written before FIX-020 have no mask.
+        if (fields >> std::hex >> hash >> std::dec >> boundary) {
+            fields >> fixes;
+            else_scope_fixed[hash] = {boundary, fixes};
+        }
     }
     if (!else_scope_fixed.empty()) {
         LOG_INFO(Render_Vulkan, "FIX-018: {} programs already translated with the else-scope fix",
@@ -1307,8 +1314,9 @@ void PipelineCache::SaveElseScopeFixed() const {
         return;
     }
     std::ofstream file{else_scope_fixed_path, std::ios::trunc};
-    for (const auto& [hash, boundary] : else_scope_fixed) {
-        file << std::hex << hash << ' ' << std::dec << boundary << '\n';
+    for (const auto& [hash, program] : else_scope_fixed) {
+        file << std::hex << hash << ' ' << std::dec << program.boundary << ' ' << program.fixes
+             << '\n';
     }
 }
 
@@ -1334,16 +1342,28 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         LOG_WARNING(Render_Vulkan, "DIAG-031: wrote the code of {}_{:#x} ({} dwords) to {}",
                     hw_stage, params.hash, params.code.size(), (dir / (name + ".txt")).string());
     }
-    if (first_use && !else_scope_fixed.contains(params.hash) &&
-        Shader::HasEmptyScopeBeforeElse(params.code)) {
+    // FIX-018/FIX-020: stored translations made before a translator fix that changes them.
+    u32 needed_fixes = 0;
+    if (first_use) {
+        needed_fixes |= Shader::HasEmptyScopeBeforeElse(params.code) ? 1u : 0u;
+        const auto& wg = runtime_info.hw.cs.workgroup_size;
+        if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
+            wg[0] * wg[1] * wg[2] > 32 && Common::PerfFeatureEnabled(31) &&
+            Shader::HasLaneReadsAndLoop(params.code)) {
+            needed_fixes |= 2u;
+        }
+    }
+    const auto known = else_scope_fixed.find(params.hash);
+    const u32 applied_fixes = known != else_scope_fixed.end() ? known->second.fixes : 0u;
+    if ((needed_fixes & ~applied_fixes) != 0) {
         auto& boundary = stored_perm_end[params.hash];
         boundary = std::max(boundary, it_pgm.value()->modules.size());
         if (boundary != 0) {
             LOG_WARNING(Render_Vulkan,
-                        "FIX-018: translating {}_{:#x} again with the else-scope fix ({} stored "
+                        "FIX-018/020: translating {}_{:#x} again (fixes {:#x}, {} stored "
                         "permutations)",
-                        hw_stage, params.hash, boundary);
-            else_scope_fixed[params.hash] = boundary;
+                        hw_stage, params.hash, needed_fixes, boundary);
+            else_scope_fixed[params.hash] = {boundary, applied_fixes | needed_fixes};
             SaveElseScopeFixed();
             if (!it_pgm.value()->modules.empty()) {
                 // Pipelines already built keep the old modules alive.

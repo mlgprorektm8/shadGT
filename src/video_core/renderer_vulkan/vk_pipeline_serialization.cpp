@@ -392,7 +392,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     perm_end = std::max(perm_end, perm_idx + 1);
     // FIX-018: translated before the else-scope fix.
     if (const auto fixed = else_scope_fixed.find(info->pgm_hash);
-        fixed != else_scope_fixed.end() && perm_idx < fixed->second) {
+        fixed != else_scope_fixed.end() && perm_idx < fixed->second.boundary) {
         return false;
     }
 

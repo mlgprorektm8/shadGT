@@ -151,7 +151,11 @@ private:
     tsl::robin_map<size_t, size_t> stored_perm_end;
     /// FIX-018: programs translated again with the else-scope fix, and the first permutation
     /// index made with it; stored permutations below it are not preloaded.
-    std::unordered_map<u64, size_t> else_scope_fixed;
+    struct RetranslatedProgram {
+        size_t boundary;
+        u32 fixes; ///< 1: FIX-018 else scope, 2: FIX-020 wave64 lane reads in loops
+    };
+    std::unordered_map<u64, RetranslatedProgram> else_scope_fixed;
     std::unordered_set<u64> else_scope_checked;
     std::vector<std::unique_ptr<Program>> retired_programs;
     std::filesystem::path else_scope_fixed_path;
