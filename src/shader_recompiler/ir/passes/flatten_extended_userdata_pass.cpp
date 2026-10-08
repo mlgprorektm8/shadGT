@@ -32,6 +32,23 @@ using namespace Xbyak::util;
 static constexpr size_t SrtCodegenSize = 256_MB;
 static Xbyak::CodeGenerator g_srt_codegen(SrtCodegenSize);
 static const u8* g_srt_codegen_start = nullptr;
+namespace {
+static bool SrtWalkerSignalHandler(void* context, void* fault_address);
+}
+
+// FIX-015: the fault handler covers the whole code buffer from its first byte. It used to start
+// at the position of the first walker translated at runtime, so with walkers already loaded
+// from the shader cache (144 MB of them) its range ran past the end of the buffer and claimed
+// game threads' ordinary memory faults ("Unsupported register for SRT walker patch").
+static void EnsureSrtWalkerSignalHandler() {
+    if (g_srt_codegen_start != nullptr) {
+        return;
+    }
+    g_srt_codegen_start = g_srt_codegen.getCode();
+    // Call after the memory invalidation handler
+    constexpr u32 priority = 1;
+    Core::Signals::Instance()->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
+}
 
 // Reports walker code use each time it crosses another 16 MB.
 static void ReportSrtCodegenUse() {
@@ -59,6 +76,7 @@ PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size, u64 key) {
             }
         }
     }
+    EnsureSrtWalkerSignalHandler();
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
     g_srt_codegen.db(ptr, size);
     g_srt_codegen.ready();
@@ -703,14 +721,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         return;
     }
 
-    // Register the signal handler for SRT walker, if not already registered
-    if (g_srt_codegen_start == nullptr) {
-        g_srt_codegen_start = c.getCurr();
-        auto* signals = Core::Signals::Instance();
-        // Call after the memory invalidation handler
-        constexpr u32 priority = 1;
-        signals->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
-    }
+    EnsureSrtWalkerSignalHandler();
 
     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
     // Offset computations clobber rcx and rdx, so keep the source-address array in r11.
