@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <magic_enum/magic_enum.hpp>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -508,6 +509,29 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
     new_vma.type = type;
     new_vma.phys_areas.clear();
     return new_vma_handle;
+}
+
+std::string MemoryManager::DescribeAddress(VAddr addr) {
+    if (vma_map.empty() || addr < vma_map.begin()->first) {
+        return "below all mappings";
+    }
+    const auto it = FindVMA(addr);
+    const auto& vma = it->second;
+    const auto describe = [](const VirtualMemoryArea& v) {
+        return fmt::format("{:#x}+{:#x} {} prot {:#x} \"{}\"", v.base, v.size,
+                           magic_enum::enum_name(v.type), u32(v.prot), v.name);
+    };
+    if (!vma.IsFree() && addr < vma.base + vma.size) {
+        return fmt::format("in {} at +{:#x}", describe(vma), addr - vma.base);
+    }
+    std::string out = fmt::format("unmapped (free area {:#x}+{:#x})", vma.base, vma.size);
+    if (it != vma_map.begin()) {
+        out += fmt::format("; before it {}", describe(std::prev(it)->second));
+    }
+    if (std::next(it) != vma_map.end()) {
+        out += fmt::format("; after it {}", describe(std::next(it)->second));
+    }
+    return out;
 }
 
 void MemoryManager::LogDirectMemoryAlias(VAddr new_addr, PAddr phys_addr, u64 size) {

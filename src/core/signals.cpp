@@ -6,10 +6,12 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/logging/log.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
+#include "core/memory.h"
 #include "core/signals.h"
 #include "emulator.h"
 
@@ -177,6 +179,47 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                              decoder->disassembleInst(instruction, operands, ctx.Rip));
             }
         }
+        // DIAG-034: where the fault address, RIP and the registers point, and the code addresses
+        // on the stack (likely return addresses), so a crash can be traced from the log alone.
+        auto* memory = Core::Memory::Instance();
+        if (code == EXCEPTION_ACCESS_VIOLATION && pExp->ExceptionRecord->NumberParameters >= 2) {
+            LOG_CRITICAL(Debug, "Fault address {:#x}: {}",
+                         pExp->ExceptionRecord->ExceptionInformation[1],
+                         memory->DescribeAddress(pExp->ExceptionRecord->ExceptionInformation[1]));
+        }
+        LOG_CRITICAL(Debug, "RIP {:#x}: {}", ctx.Rip, memory->DescribeAddress(ctx.Rip));
+        const std::array<std::pair<const char*, u64>, 14> regs = {{{"RAX", ctx.Rax},
+                                                                   {"RBX", ctx.Rbx},
+                                                                   {"RCX", ctx.Rcx},
+                                                                   {"RDX", ctx.Rdx},
+                                                                   {"RSI", ctx.Rsi},
+                                                                   {"RDI", ctx.Rdi},
+                                                                   {"RBP", ctx.Rbp},
+                                                                   {"R8", ctx.R8},
+                                                                   {"R9", ctx.R9},
+                                                                   {"R10", ctx.R10},
+                                                                   {"R12", ctx.R12},
+                                                                   {"R13", ctx.R13},
+                                                                   {"R14", ctx.R14},
+                                                                   {"R15", ctx.R15}}};
+        for (const auto& [name, value] : regs) {
+            if (value >= 0x10000) {
+                LOG_CRITICAL(Debug, "{} {:#x}: {}", name, value, memory->DescribeAddress(value));
+            }
+        }
+        std::array<u64, 96> stack{};
+        SIZE_T stack_read = 0;
+        ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(ctx.Rsp), stack.data(),
+                          sizeof(stack), &stack_read);
+        std::string frames;
+        for (size_t i = 0; i < stack_read / sizeof(u64); ++i) {
+            const auto description = memory->DescribeAddress(stack[i]);
+            if (description.find(" Code ") != std::string::npos) {
+                frames += fmt::format(" | [rsp+{:#x}] {:#x} {}", i * 8, stack[i], description);
+            }
+        }
+        LOG_CRITICAL(Debug, "Code addresses on the stack:{}", frames.empty() ? " none" : frames);
+        Common::Log::Flush();
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 

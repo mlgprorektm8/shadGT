@@ -307,6 +307,10 @@ public:
 
     void InvalidateMemory(VAddr addr, u64 size) const;
 
+    /// DIAG-034: the mapping that contains an address (for crash reports): base, size, type,
+    /// protection and name, or "unmapped" with the nearest mappings. Does not lock.
+    std::string DescribeAddress(VAddr addr);
+
 private:
     VMAHandle FindVMA(VAddr target) {
         return std::prev(vma_map.upper_bound(target));
