@@ -869,6 +869,12 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         bound_buffers.emplace_back(range.buffer, range.offset, size, false);
     }
 
+    if (regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
+        for (const auto& range : ranges_merged) {
+            buffer_cache.CheckVertexPagesCurrent(range.base_address, range.GetSize());
+        }
+    }
+
     // Bind vertex buffers
     VertexInputs<vk::Buffer> host_buffers;
     VertexInputs<vk::DeviceSize> host_offsets;

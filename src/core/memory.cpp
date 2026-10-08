@@ -510,6 +510,33 @@ MemoryManager::VMAHandle MemoryManager::CreateArea(VAddr virtual_addr, u64 size,
     return new_vma_handle;
 }
 
+void MemoryManager::LogDirectMemoryAlias(VAddr new_addr, PAddr phys_addr, u64 size) {
+    // DIAG-027: direct memory mapped at a second address. The GPU caches track writes per
+    // virtual address, so a CPU write through one mapping is not seen on the other one.
+    static u32 logged = 0;
+    if (++logged > 64) {
+        return;
+    }
+    std::string others;
+    for (const auto& [base, vma] : vma_map) {
+        if (vma.type != VMAType::Direct) {
+            continue;
+        }
+        for (const auto& [offset, area] : vma.phys_areas) {
+            const PAddr start = std::max<PAddr>(area.base, phys_addr);
+            const PAddr end = std::min<PAddr>(area.base + area.size, phys_addr + size);
+            if (start < end) {
+                others +=
+                    fmt::format(" {:#x}+{:#x}", base + offset + (start - area.base), end - start);
+            }
+        }
+    }
+    LOG_WARNING(Kernel_Vmm,
+                "DIAG-027: direct memory {:#x}+{:#x} mapped again at {:#x} (GPU-mapped: {}); "
+                "already mapped at:{}",
+                phys_addr, size, new_addr, IsValidGpuMapping(new_addr, size), others);
+}
+
 s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, MemoryProt prot,
                              MemoryMapFlags flags, VMAType type, std::string_view name,
                              bool validate_dmem, PAddr phys_addr, u64 alignment) {
@@ -648,6 +675,10 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
             const auto offset_in_dma = start_phys_addr - dmem_area->second.base;
             const auto size_in_dma =
                 std::min<u64>(dmem_area->second.size - offset_in_dma, remaining_size);
+            if (dmem_area->second.dma_type == PhysicalMemoryType::Mapped) {
+                LogDirectMemoryAlias(mapped_addr + (start_phys_addr - phys_addr), start_phys_addr,
+                                     size_in_dma);
+            }
             const auto dmem_handle = CarvePhysArea(dmem_map, start_phys_addr, size_in_dma);
             auto& new_dmem_area = dmem_handle->second;
             new_dmem_area.dma_type = PhysicalMemoryType::Mapped;

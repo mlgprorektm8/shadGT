@@ -13,6 +13,7 @@
 #include <vector>
 #include <immintrin.h>
 #include <magic_enum/magic_enum.hpp>
+#include <xxhash.h>
 
 #include "common/alignment.h"
 #include "common/perf_monitor.h"
@@ -954,6 +955,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
     });
     if (!copies.empty()) {
+        for (const auto& copy : copies) {
+            RecordWatchedUploads(copy.dstOffset, copy.dstOffset + copy.size);
+        }
         Common::GetWorkCounters().uploads += copies.size();
         Common::GetWorkCounters().upload_bytes += total_size_bytes;
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
@@ -995,6 +999,67 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         return SynchronizeMetadata(arena, device_addr, size);
     }
     return false;
+}
+
+static constexpr u64 WatchedPageBits = 12;
+static constexpr u64 WatchedPageSize = u64{1} << WatchedPageBits;
+
+void BufferCache::RecordWatchedUploads(VAddr start, VAddr end) {
+    std::scoped_lock lk{vertex_pages_mutex};
+    if (vertex_page_hashes.empty()) {
+        return;
+    }
+    // Only whole pages: a partial upload leaves the rest of the page as it was.
+    for (VAddr page = Common::AlignUp(start, WatchedPageSize); page + WatchedPageSize <= end;
+         page += WatchedPageSize) {
+        const auto it = vertex_page_hashes.find(page >> WatchedPageBits);
+        if (it != vertex_page_hashes.end()) {
+            it->second = XXH3_64bits(std::bit_cast<const void*>(page), WatchedPageSize);
+        }
+    }
+}
+
+void BufferCache::CheckVertexPagesCurrent(VAddr address, u64 size) {
+    // DIAG-028: the Nurburgring grass is drawn as quad lists and stretches across the screen
+    // with correct vertex data in guest memory. This checks, after the draw's uploads, that
+    // the GPU copy of every vertex page still matches guest memory. A page the CPU changed
+    // without its tracking noticing ("untracked") keeps old vertices on the GPU.
+    std::scoped_lock lk{vertex_pages_mutex};
+    u32 untracked = 0;
+    u32 tracked = 0;
+    VAddr first_untracked = 0;
+    for (VAddr page = Common::AlignDown(address, WatchedPageSize); page < address + size;
+         page += WatchedPageSize) {
+        if (memory->ClampRangeSize(page, WatchedPageSize) < WatchedPageSize ||
+            memory_tracker->IsRegionGpuModified(page, WatchedPageSize)) {
+            continue;
+        }
+        const u64 hash = XXH3_64bits(std::bit_cast<const void*>(page), WatchedPageSize);
+        const auto [it, inserted] = vertex_page_hashes.try_emplace(page >> WatchedPageBits, hash);
+        if (inserted || it->second == hash) {
+            continue;
+        }
+        // Tracked: the page is marked CPU-modified (written since its upload, or a PERF-012
+        // hot page), so the next use uploads it. Untracked: nothing will upload it.
+        if (memory_tracker->IsRegionCpuModified(page, WatchedPageSize)) {
+            ++tracked;
+        } else {
+            if (untracked++ == 0) {
+                first_untracked = page;
+            }
+        }
+    }
+    if (untracked == 0 && tracked == 0) {
+        return;
+    }
+    const u64 count = ++stale_vertex_draws;
+    if (count <= 40 || count % 500 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-028: quad-list draw {} reads vertex pages whose GPU copy differs from "
+                    "guest memory: {} untracked (first {:#x}), {} marked modified; vertex range "
+                    "{:#x}+{:#x}",
+                    count, untracked, first_untracked, tracked, address, size);
+    }
 }
 
 bool BufferCache::SynchronizeMetadata(const Buffer* arena, VAddr device_addr, u32 size) {

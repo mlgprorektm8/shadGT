@@ -3,16 +3,16 @@
 
 #pragma once
 
-#include <deque>
-#include <vector>
-#include <span>
-#include <mutex>
-#include <memory>
 #include <atomic>
 #include <chrono>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -159,6 +159,10 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
+    /// DIAG-028: compares the guest pages of a quad-list draw's vertex range with the guest
+    /// bytes they were last uploaded from, and logs pages whose GPU copy is out of date.
+    void CheckVertexPagesCurrent(VAddr address, u64 size);
+
 private:
     void InvalidateAsyncReadbacks(VAddr address, u64 size);
     /// PERF-011: handles a CPU write fault on a page with GPU-written bytes that the write does
@@ -243,6 +247,8 @@ private:
     bool SynchronizeMetadata(const Buffer* arena, VAddr device_addr, u32 size);
 
     void SynchronizeMemoryFromImage(VAddr device_addr, u32 size);
+    /// DIAG-028: records the guest bytes of watched pages as they are uploaded.
+    void RecordWatchedUploads(VAddr start, VAddr end);
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -257,6 +263,10 @@ private:
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
     u32 image_alias_exports_logged{};
+    /// DIAG-028: hash of the guest bytes each watched page (4 KB) was last uploaded from.
+    std::mutex vertex_pages_mutex;
+    std::unordered_map<u64, u64> vertex_page_hashes;
+    u64 stale_vertex_draws{};
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
