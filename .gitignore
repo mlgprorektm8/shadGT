@@ -440,6 +440,12 @@ cmake-build-*
 # Nix Result symlink
 result
 
+# Retired non-Windows dependency checkouts left on existing workstations.
+/externals/date/
+/externals/epoll-shim/
+/externals/mesa-kosmickrisp/
+/externals/vulkan-loader/
+
 # Build/ is shared on purpose so a friend can grab the same workflow and help too.
 # Only the builder workflow (run/capture/profile scripts, helper tools' source, and
 # the docs) is tracked. Everything else in here is build output, logs, captures or

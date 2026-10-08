@@ -84,15 +84,6 @@ if (WIN32)
         "${_programfiles}/LibreSSL"
     )
     unset(_programfiles)
-elseif(APPLE)
-    # Homebrew installs LibreSSL here
-    set(_LIBRESSL_ROOT_PATHS
-        "/usr/local/opt/libressl"
-    )
-else()
-    set(_LIBRESSL_ROOT_PATHS
-        "/usr/local/"
-    )
 endif()
 
 # Combine

@@ -7,48 +7,25 @@ cmake_minimum_required(VERSION 3.24)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-if(APPLE)
-    list(APPEND ADDITIONAL_LANGUAGES OBJC)
-    # Minimum OS version for KosmicKrisp
-    set(CMAKE_OSX_DEPLOYMENT_TARGET 26.0 CACHE STRING "")
-endif()
-
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-project(shadPS4 CXX C ASM ${ADDITIONAL_LANGUAGES})
+project(shadPS4 CXX C ASM)
 
-include(FetchContent)
-
-# Forcing PIE makes sure that the base address is high enough so that it doesn't clash with the PS4 memory.
-if(UNIX AND NOT APPLE)
-    set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
-
-    # check PIE support at link time
-    include(CheckPIESupported)
-    check_pie_supported(OUTPUT_VARIABLE pie_check LANGUAGES C CXX)
-    if(NOT CMAKE_C_LINK_PIE_SUPPORTED OR NOT CMAKE_CXX_LINK_PIE_SUPPORTED)
-        message(WARNING "PIE is not supported at link time: ${pie_check}")
-    endif()
+if(NOT WIN32)
+    message(FATAL_ERROR "shadGT supports Windows builds only.")
 endif()
 
-include(CMakeDependentOption)
-cmake_dependent_option(ENABLE_SYSTEM_VULKAN "Enable the system Vulkan driver" OFF APPLE OFF)
+include(FetchContent)
 
 option(ENABLE_DISCORD_RPC "Enable the Discord RPC integration" ON)
 option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
 
-# First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
-if (APPLE AND CMAKE_OSX_ARCHITECTURES)
-    set(BASE_ARCHITECTURE "${CMAKE_OSX_ARCHITECTURES}")
-elseif (CMAKE_SYSTEM_PROCESSOR)
-    set(BASE_ARCHITECTURE "${CMAKE_SYSTEM_PROCESSOR}")
-else()
-    set(BASE_ARCHITECTURE "${CMAKE_HOST_SYSTEM_PROCESSOR}")
-endif()
+# Determine the target architecture.
+set(BASE_ARCHITECTURE "${CMAKE_SYSTEM_PROCESSOR}")
 
 # Next, match common architecture strings down to a known common value.
 if (BASE_ARCHITECTURE MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
@@ -68,17 +45,6 @@ endif()
 cmake_host_system_information(RESULT PROC_INFO QUERY PROCESSOR_DESCRIPTION)
 
 message(STATUS "${PROC_INFO}")
-
-if (APPLE AND ARCHITECTURE STREQUAL "x86_64" AND CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
-    # Exclude ARM homebrew path to avoid conflicts when cross compiling.
-    list(APPEND CMAKE_IGNORE_PREFIX_PATH "/opt/homebrew")
-
-    # Need to reconfigure pkg-config to use the right architecture library paths.
-    # It's not ideal to override these but otherwise the build breaks just by having pkg-config installed.
-    set(ENV{PKG_CONFIG_DIR} "")
-    set(ENV{PKG_CONFIG_LIBDIR} "${CMAKE_SYSROOT}/usr/lib/pkgconfig:${CMAKE_SYSROOT}/usr/share/pkgconfig:${CMAKE_SYSROOT}/usr/local/lib/pkgconfig:${CMAKE_SYSROOT}/usr/local/share/pkgconfig")
-    set(ENV{PKG_CONFIG_SYSROOT_DIR} ${CMAKE_SYSROOT})
-endif()
 
 # This function should be passed a list of all files in a target. It will automatically generate file groups
 # following the directory hierarchy, so that the layout of the files in IDEs matches the one in the filesystem.
@@ -261,10 +227,6 @@ if (ENABLE_SYSTEM_LIBRARIES)
     find_package(Zydis 5.0.0 MODULE)
     find_package(pugixml 1.14 CONFIG)
     find_package(absl 20250512.1 CONFIG)
-    if (APPLE)
-        find_package(date 3.0.1 CONFIG)
-        find_package(epoll-shim 3.14 CONFIG)
-    endif()
     list(POP_BACK CMAKE_MODULE_PATH)
 endif()
 
@@ -1273,9 +1235,6 @@ set(SHADNET src/shadnet/client.cpp
             src/shadnet/server_probe.h
             "${SHADNET_PROTO_OUT}/shadnet.pb.cc"
 )
-if (APPLE)
-    list(APPEND EMULATOR src/sdl_window_apple.mm)
-endif()
 
 if(NOT ENABLE_TESTS)
 
@@ -1309,64 +1268,13 @@ target_link_libraries(shadps4 PRIVATE libprotobuf)
 target_link_libraries(shadps4 PRIVATE ZArchive::zarchive)
 target_include_directories(shadps4 PRIVATE "${SHADNET_PROTO_OUT}")
 
-if (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
-    target_link_libraries(shadps4 PRIVATE "/usr/lib/libusb.so")
-    target_link_libraries(shadps4 PRIVATE "/usr/local/lib/libuuid.so")
-else()
-    target_link_libraries(shadps4 PRIVATE libusb::usb)
-endif()
+target_link_libraries(shadps4 PRIVATE libusb::usb)
 
 target_compile_definitions(shadps4 PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
 target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
 
 if (ENABLE_DISCORD_RPC)
     target_compile_definitions(shadps4 PRIVATE ENABLE_DISCORD_RPC)
-endif()
-
-if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
-    target_link_libraries(shadps4 PRIVATE uuid)
-endif()
-
-if (APPLE)
-    if (NOT ENABLE_SYSTEM_VULKAN)
-        # Bundle Vulkan loader and KosmicKrisp driver with the emulator.
-        set_property(TARGET shadps4 APPEND PROPERTY BUILD_RPATH "@executable_path")
-
-        set(LOADER_DEST "${CMAKE_CURRENT_BINARY_DIR}/libvulkan.dylib")
-        set(DRIVER_DEST "${CMAKE_CURRENT_BINARY_DIR}/libvulkan_kosmickrisp.dylib")
-        set(ICD_DEST "${CMAKE_CURRENT_BINARY_DIR}/kosmickrisp_mesa_icd.json")
-
-        add_custom_command(
-            OUTPUT ${LOADER_DEST}
-            DEPENDS ${VULKAN_LOADER_PATH} vulkan
-            COMMAND ${CMAKE_COMMAND} -E copy ${VULKAN_LOADER_PATH} ${LOADER_DEST})
-        add_custom_command(
-            OUTPUT ${DRIVER_DEST}
-            DEPENDS ${VULKAN_DRIVER_PATH} kosmickrisp
-            COMMAND ${CMAKE_COMMAND} -E copy ${VULKAN_DRIVER_PATH} ${DRIVER_DEST})
-        add_custom_command(
-            OUTPUT ${ICD_DEST}
-            DEPENDS ${VULKAN_ICD_PATH} kosmickrisp
-            COMMAND ${CMAKE_COMMAND} -E copy ${VULKAN_ICD_PATH} ${ICD_DEST})
-
-        add_custom_target(CopyVulkanDriver DEPENDS ${LOADER_DEST} ${DRIVER_DEST} ${ICD_DEST})
-        add_dependencies(shadps4 CopyVulkanDriver)
-    endif()
-
-    if (ARCHITECTURE STREQUAL "x86_64")
-        # Reserve system-managed memory space.
-        target_link_options(shadps4 PRIVATE -Wl,-ld_classic,-no_pie,-no_fixup_chains,-no_huge,-pagezero_size,0x4000,-segaddr,TCB_SPACE,0x4000,-segaddr,SYSTEM_MANAGED,0x400000,-segaddr,SYSTEM_RESERVED,0x7FFFFC000,-segaddr,USER_AREA,0x7000000000,-image_base,0x700000000000)
-    endif()
-
-    # Replacement for std::chrono::time_zone
-    target_link_libraries(shadps4 PRIVATE date::date-tz epoll-shim)
-
-    # Create and embed Info.plist
-    set(INFO_PLIST_PATH ${CMAKE_CURRENT_BINARY_DIR}/src/dist/Info.plist)
-    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/dist/MacOSBundleInfo.plist.in ${INFO_PLIST_PATH})
-    target_link_options(shadps4 PRIVATE LINKER:-sectcreate,__TEXT,__info_plist,${INFO_PLIST_PATH})
-elseif (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
-    target_link_libraries(shadps4 PRIVATE date::date-tz epoll-shim)
 endif()
 
 if (WIN32)
@@ -1459,14 +1367,13 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/imgui/renderer)
 add_dependencies(shadps4 ImGui_Resources)
 target_include_directories(shadps4 PRIVATE ${IMGUI_RESOURCES_INCLUDE})
 
-
 # Discord RPC
 if (ENABLE_DISCORD_RPC)
     target_link_libraries(shadps4 PRIVATE discord-rpc)
 endif()
 
 # Install rules
-install(TARGETS shadps4 BUNDLE DESTINATION .)
+install(TARGETS shadps4 RUNTIME DESTINATION .)
 
 else()
     enable_testing()

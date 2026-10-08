@@ -219,15 +219,8 @@ endif()
 
 # libusb
 if (NOT TARGET libusb::usb)
-    if (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
-        # YOU MUST USE NATIVE LIBUSB
-        # using anything else will crash instantly, also freebsd will NOT like it
-        # no you cant vendor this libusb, its builtin on freebsd
-        find_package(libusb)
-    else()
-        add_subdirectory(libusb)
-        add_library(libusb::usb ALIAS usb-1.0)
-    endif()
+    add_subdirectory(libusb)
+    add_library(libusb::usb ALIAS usb-1.0)
 endif()
 
 # Discord RPC
@@ -249,17 +242,6 @@ endif()
 set(HWINFO_STATIC ON)
 add_subdirectory(hwinfo)
 
-if (APPLE OR ${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
-    # date
-    if (NOT TARGET date::date-tz)
-        option(BUILD_TZ_LIB "" ON)
-        option(USE_SYSTEM_TZ_DB "" ON)
-        add_subdirectory(date)
-    endif()
-    if (NOT TARGET epoll-shim)
-        add_subdirectory(epoll-shim)
-    endif()
-endif()
 
 #windows only
 if (WIN32)
@@ -318,18 +300,10 @@ set(ALSOFT_TESTS OFF CACHE BOOL "" FORCE)
 set(ALSOFT_INSTALL OFF CACHE BOOL "" FORCE)
 set(ALSOFT_CONFIG OFF CACHE BOOL "" FORCE)
 
-# Backends (platform-specific)
-if (WIN32)
-    set(ALSOFT_BACKEND_WASAPI ON CACHE BOOL "" FORCE)
-    set(ALSOFT_BACKEND_DSOUND OFF CACHE BOOL "" FORCE)
-    set(ALSOFT_BACKEND_WINMM OFF CACHE BOOL "" FORCE)
-elseif (APPLE)
-    set(ALSOFT_BACKEND_COREAUDIO ON CACHE BOOL "" FORCE)
-else()
-    set(ALSOFT_BACKEND_ALSA ON CACHE BOOL "" FORCE)
-    set(ALSOFT_BACKEND_PULSEAUDIO ON CACHE BOOL "" FORCE)
-    set(ALSOFT_BACKEND_PIPEWIRE OFF CACHE BOOL "" FORCE)
-endif()
+# Windows audio backend
+set(ALSOFT_BACKEND_WASAPI ON CACHE BOOL "" FORCE)
+set(ALSOFT_BACKEND_DSOUND OFF CACHE BOOL "" FORCE)
+set(ALSOFT_BACKEND_WINMM OFF CACHE BOOL "" FORCE)
 # Headless-safe
 set(ALSOFT_BACKEND_NULL ON CACHE BOOL "" FORCE)
 
@@ -372,15 +346,6 @@ else()
     message(STATUS "cpp-httplib: OpenSSL/LibreSSL not available — libSceHttp HTTPS will fall back to mock at runtime.")
 endif()
 
-# macOS Vulkan driver
-if (APPLE AND NOT ENABLE_SYSTEM_VULKAN AND NOT ENABLE_TESTS)
-    add_subdirectory(vulkan-loader)
-    set(VULKAN_LOADER_PATH "${CMAKE_CURRENT_BINARY_DIR}/vulkan-loader/loader/libvulkan.dylib" PARENT_SCOPE)
-
-    add_subdirectory(mesa-kosmickrisp)
-    set(VULKAN_DRIVER_PATH "${CMAKE_CURRENT_BINARY_DIR}/mesa-kosmickrisp/outputs/libvulkan_kosmickrisp.dylib" PARENT_SCOPE)
-    set(VULKAN_ICD_PATH "${CMAKE_CURRENT_BINARY_DIR}/mesa-kosmickrisp/outputs/kosmickrisp_mesa_icd.json" PARENT_SCOPE)
-endif()
 
 # abseil (for protobuf)
 if (NOT TARGET absl::strings)

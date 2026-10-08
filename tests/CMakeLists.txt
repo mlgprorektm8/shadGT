@@ -9,6 +9,15 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
+if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND
+    CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 23)
+    foreach(t gtest gtest_main gmock gmock_main)
+        if (TARGET ${t})
+            target_compile_options(${t} PRIVATE -Wno-error=character-conversion)
+        endif()
+    endforeach()
+endif()
+
 add_executable(shadps4_stencil_test test_stencil_reference.cpp)
 target_include_directories(shadps4_stencil_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_stencil_test PRIVATE GTest::gtest_main fmt::fmt)
@@ -327,16 +336,6 @@ target_link_libraries(shadps4_gcn_test PRIVATE
     Zydis::Zydis
 )
 
-if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
-    CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
-    include(CheckCXXSymbolExists)
-    check_cxx_symbol_exists(_LIBCPP_VERSION version LIBCPP)
-    if (LIBCPP)
-        foreach(t ${TEST_TARGETS})
-            target_compile_options(${t} PRIVATE -fexperimental-library)
-        endforeach()
-    endif()
-endif()
 
 foreach(t ${TEST_TARGETS})
     if (WIN32)
@@ -429,14 +428,6 @@ target_link_libraries(shadps4_http_test PRIVATE
     ZLIB::ZLIB
 )
 
-if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
-    CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
-    include(CheckCXXSymbolExists)
-    check_cxx_symbol_exists(_LIBCPP_VERSION version LIBCPP)
-    if (LIBCPP)
-        target_compile_options(shadps4_http_test PRIVATE -fexperimental-library)
-    endif()
-endif()
 
 if (WIN32)
     target_link_libraries(shadps4_http_test PRIVATE onecore)

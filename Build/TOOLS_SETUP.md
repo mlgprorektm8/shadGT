@@ -1,5 +1,7 @@
 # Build tools setup
 
+shadGT builds on Windows only. The presets use the x64 Clang toolchain.
+
 The scripts in `Build/` expect a few tools under `Build/tools/`. They aren't in git
 because they're several GB. Install them yourself using the steps below. Everything
 under `Build/` that isn't a script, a doc or `tools/capture-inspect` source is ignored.
@@ -8,15 +10,15 @@ under `Build/` that isn't a script, a doc or `tools/capture-inspect` source is i
 
 - Visual Studio 2022 (or Build Tools) with the **Desktop development with C++** workload.
   Run all commands below from the **x64 Native Tools Command Prompt / Developer PowerShell**.
-- LLVM 22 (`clang-cl`), installed to `C:\Program Files\LLVM`: https://github.com/llvm/llvm-project/releases
+- LLVM (`clang-cl`), installed to `C:\Program Files\LLVM`: https://github.com/llvm/llvm-project/releases
 - CMake and Ninja (both ship with Visual Studio, or https://cmake.org and https://ninja-build.org).
 - Submodules: `git submodule update --init --recursive`
 
-Configure and build with the presets. The scripts look for `Build/x64-Clang-<Type>/shadps4.exe`:
+Configure and build with the presets. The executable is `Build/x64-Clang-<Type>/shadGT.exe`:
 
 ```powershell
 cmake --preset x64-Clang-Release
-cmake --build Build/x64-Clang-Release
+cmake --build Build/x64-Clang-Release --target shadps4 --parallel 6
 ```
 
 ## 2. Vulkan SDK 1.4.363.0 → `Build/tools/VulkanSDK`

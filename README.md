@@ -13,55 +13,95 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # About
 
-shadGT is a fork of the [shadPS4](https://github.com/shadps4-emu/shadPS4) PlayStation 4 emulator
-specifically for **Gran Turismo Sport** (CUSA03220, update 1.69), on **Windows**. The goal is
-for the game to run its normal code paths, render correctly and play smoothly, without graphical
-hacks.
+shadGT is a Windows-only fork of the [shadPS4](https://github.com/shadps4-emu/shadPS4)
+PlayStation 4 emulator, focused specifically on **Gran Turismo Sport**.
+The tested configuration is **CUSA03220 with update 1.69**. Other games and versions
+are outside the project's tested scope.
+
+The goal is accurate graphics, reliable race loading and smoother gameplay while
+preserving the game's normal behavior. This is an experimental emulator; performance
+and compatibility depend on your hardware, settings and game files.
 
 What shadGT adds on top of shadPS4:
 
 - **Graphics fixes** for GT Sport, including car thumbnails that used to stop the game with
   "BREAK! thumbnail_functions.ad:473".
-- **Faster races**: changes to GPU command processing and memory tracking, and new pipelines
-  built ahead of their draws on all CPU cores, so new scenes stall far less.
-- **The 1.69 boot patch built in**, so the game starts however it is launched.
-- **A portable install**: every setting, save, shader cache and log stays in the folder beside
-  the executable, never in AppData.
+- **Performance improvements** to GPU command processing, memory tracking and pipeline
+  compilation, including workers that prepare pipelines ahead of upcoming draws.
+- **A built-in 1.69 boot patch** that addresses a known GT Sport startup crash.
+- **Portable user data**: settings, saves, shader caches and logs stay in the `user`
+  folder. The packaged launcher keeps its own settings in `launcher`.
 
 Test results and the current baseline are in [GT_SPORT_BASELINE.md](GT_SPORT_BASELINE.md); every
 change and its measurements are in [GT_SPORT_OPTIMIZATION_LOG.md](GT_SPORT_OPTIMIZATION_LOG.md).
-
-
-
 # Getting started
 
-A shadGT folder (made with `scripts/Make-GTSportPortable.ps1`) contains `shadGT.exe` and
-`shadGT Launcher.exe`, the [shadPS4 Qt launcher](https://github.com/shadps4-emu/shadps4-qtlauncher)
-set up to run it.
+A portable package contains `shadGT.exe` and `shadGT Launcher.exe`, which is the
+shadPS4 Qt launcher configured to use this fork. A source checkout does not include
+these compiled applications or the game and firmware files.
 
-1. Copy the firmware modules listed below from your own PS4 into `user\sys_modules`.
+Before launching, you need your own GT Sport dump with update 1.69 and the required
+PS4 firmware modules. See [Firmware files](#firmware-files) below.
+
+1. Copy your firmware modules into `user\sys_modules` beside `shadGT.exe`.
 2. Start `shadGT Launcher.exe` and add the folder that contains your GT Sport game folder
-   (CUSA03220, dumped from your own console with update 1.69).
-3. Double-click Gran Turismo Sport.
+   (`CUSA03220`). Keep the update files available to the emulator; a separate
+   `CUSA03220-patch` folder belongs beside the base game folder.
+3. Double-click **Gran Turismo Sport** in the game list.
 
-The first time a scene is shown its shaders are compiled, so it can stutter briefly; after that
-they are cached in `user\cache` and load at startup.
+The first visit to a scene may stutter while shaders and pipelines compile. They are
+cached in `user\cache` for later runs; subsequent launches may spend time preparing
+cached pipelines. Keep that cache unless you are diagnosing a problem.
 
-Questions and reports: [shadGT Discord](https://discord.gg/De94trHtj5).
+If launching without the GUI, run the emulator from the folder containing your `user`
+directory:
+
+```powershell
+.\shadGT.exe "D:\Games\CUSA03220\eboot.bin" --show-fps
+```
+
+Replace the example path with your game executable.
 
 # Building
 
-shadGT builds like shadPS4: see the [Windows build instructions](documents/building-windows.md).
-The executable is `shadGT.exe`. `scripts/Run-GTSportPerformance.ps1` runs GT Sport with a test
-profile and prints a performance summary; `-DisablePerf <ids>` switches individual changes off
-for comparisons.
+Only Windows builds are supported. Linux, macOS, Docker and Nix build configurations
+are not included. CI builds the Windows executable and runs the Windows unit tests.
 
-# Keyboard and Mouse Mappings
+Install the prerequisites in the [Windows build instructions](documents/building-windows.md):
+Visual Studio C++ Build Tools, LLVM (`clang-cl`), CMake and Ninja. Use an x64 developer
+shell with LLVM on `PATH`, then run from the repository root:
+
+```powershell
+git submodule update --init --recursive
+cmake --preset x64-Clang-Release
+cmake --build Build/x64-Clang-Release --target shadps4 --parallel 6
+```
+
+The resulting executable is `Build\x64-Clang-Release\shadGT.exe`.
+The Windows preset enables LibreSSL's Windows endian compatibility path, including
+the workaround needed by Clang 23. The internal CMake target is still named `shadps4`;
+the application it produces is `shadGT.exe`.
+
+To create a portable package, use `scripts/Make-GTSportPortable.ps1`. It also requires
+an unpacked Qt launcher and an existing profile configuration; those local files
+are not included in Git. See [Build tools setup](Build/TOOLS_SETUP.md) for the
+development and capture tools.
+
+`scripts/Run-GTSportPerformance.ps1` uses an isolated test profile and prints a
+performance summary after exit. Supply your own `-GamePath`; the script's default
+path is machine-specific. It currently also expects the diagnostic Vulkan SDK
+directory to exist. `-DisablePerf <ids>` disables selected optimizations for comparisons.
+
+The recorded GT Sport baseline uses Windows red-zone patching, `readbacks_mode` 1,
+linear-image readback and pipeline caching. Fresh emulator profiles do not enable
+all of these automatically; preserve the tested settings when packaging a build.
+
+# Keyboard shortcuts
 
 > [!NOTE]
-> Some keyboards may also require you to hold the Fn key to use the F\* keys. Mac users should use the Command key instead of Control, and need to use Command+F11 for full screen to avoid conflicting with system key bindings.
+> Some keyboards require holding **Fn** to use the function keys.
 
-| Button | Function |
+| Shortcut | Function |
 |-------------|-------------|
 F10 | FPS Counter
 Ctrl+F10 | Video Debug Info
@@ -69,58 +109,16 @@ F11 | Fullscreen
 F12 | Trigger RenderDoc Capture (or game-only screenshot if RenderDoc is unavailable)
 Alt+F12 | Capture screenshot including HUD/dialog overlays
 
-> [!NOTE]
-> Xbox and DualShock controllers work out of the box.
-
-| Controller button | Keyboard equivalent |
-|-------------|-------------|
-LEFT AXIS UP | W |
-LEFT AXIS DOWN | S |
-LEFT AXIS LEFT | A |
-LEFT AXIS RIGHT | D |
-RIGHT AXIS UP | I |
-RIGHT AXIS DOWN | K |
-RIGHT AXIS LEFT | J |
-RIGHT AXIS RIGHT | L |
-TRIANGLE | Numpad 8 or C |
-CIRCLE | Numpad 6 or B |
-CROSS | Numpad 2 or N |
-SQUARE | Numpad 4 or V |
-PAD UP | UP |
-PAD DOWN | DOWN |
-PAD LEFT | LEFT |
-PAD RIGHT | RIGHT |
-OPTIONS | RETURN |
-BACK BUTTON / TOUCH PAD | SPACE |
-L1 | Q |
-R1 | U |
-L2 | E |
-R2 | O |
-L3 | X |
-R3 | M |
-
-Keyboard and mouse inputs can be customized in the settings menu by clicking the Controller button, and further details and help on controls are  also found there. Custom bindings are saved per-game. Inputs support up to three keys per binding, mouse buttons, mouse movement mapped to joystick input, and more.
 
 # Firmware files
 
-GT Sport needs these PlayStation 4 firmware modules, placed in the `user\sys_modules` folder:
+Place firmware modules dumped from your PS4 in `user\sys_modules` beside the emulator.
+GT Sport uses modules such as `libSceNgs2.sprx` for audio, `libSceJpegDec.sprx` for
+image decoding, and `libSceJson2.sprx` and `libSceFont.sprx` for other game services.
+These examples are not a complete firmware inventory. Missing modules can cause
+missing audio, unavailable features or startup failures.
 
-<div align="center">
-
-| Modules                        | Modules                        | Modules                        | Modules                        |
-|--------------------------------|--------------------------------|--------------------------------|--------------------------------|
-| libSceAt9Enc.sprx              | libSceAudiodec.sprx            | libSceAudiodecCpu.sprx         | libSceAudiodecCpuDdp.sprx      |
-| libSceAudiodecCpuDtsHdLbr.sprx | libSceAudiodecCpuHevag.sprx    | libSceAudiodecCpuM4aac.sprx    | libSceAvPlayer.sprx            |
-| libSceAvPlayerStreaming.sprx   | libSceBeisobmf.sprx            | libSceBemp2sys.sprx            | libSceCesCs.sprx               |
-| libSceFont.sprx                | libSceFontFt.sprx              | libSceFreeTypeOl.sprx          | libSceFreeTypeOptOl.sprx       |
-| libSceFreeTypeOt.sprx          | libSceJpegDec.sprx             | libSceJpegEnc.sprx             | libSceJson.sprx                |
-| libSceJson2.sprx               | libSceLibcInternal.sprx        | libSceNgs2.sprx                | libScePngEnc.sprx              |
-| libScePsmKitSystem.sprx        | libSceRtc.sprx                 | libSceRudp.sprx                | libSceSystemGesture.sprx       |
-| libSceUlt.sprx                 | libSceWkFontConfig.sprx        | libSceXml.sprx                 | libSceDepth.sprx               |
-| libScePadTracker.sprx          | libSceMoveTracker.sprx         |
-</div>
-
-> [!Caution]
+> [!IMPORTANT]
 > The firmware modules and the game must be dumped from your own PlayStation 4 console.
 
 # Credits
@@ -136,6 +134,12 @@ patch is by Kravickas, from the shadPS4 game patch repository.
 shadGT is not affiliated with the shadPS4 project, Sony Interactive Entertainment or Polyphony
 Digital. Gran Turismo is a trademark of Sony Interactive Entertainment.
 
+For shadGT-specific problems, report them in this repository's
+[issue tracker](https://github.com/mlgprorektm8/shadPS4/issues), rather than the upstream
+shadPS4 project. Include your build commit, game version, hardware, settings and a
+description of how to reproduce the problem. Logs can contain local paths or account
+information, so check them before sharing.
+
 # License
 
-- [**GPL-2.0 license**](LICENSE), like shadPS4.
+Licensed under [GPL-2.0-or-later](LICENSE), like shadPS4.
