@@ -8,6 +8,7 @@
 #include <source_location>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "common/enum.h"
 #include "common/incremental_id.h"
@@ -111,6 +112,17 @@ struct Image;
 /// car thumbnail source by default; SHADGT_WATCH_IMAGE=<hex address> picks another).
 bool IsWatchedImageAddress(VAddr address, u64 size);
 void NoteWatchedImageModification(const Image& image, std::source_location loc);
+
+/// DIAG-044: every image modification, in a ring, to explain how a picture got its contents.
+struct ImageModRecord {
+    u64 uid;
+    u64 version;
+    const char* file;
+    u32 line;
+};
+void NoteImageModification(u64 uid, u64 version, std::source_location loc);
+/// The newest modifications of an image, oldest first.
+std::vector<ImageModRecord> RecentImageModifications(u64 uid, size_t max_count);
 /// The watched address windows (DIAG-043 dumps the images in them).
 std::span<const VAddr> WatchedImageWindows();
 constexpr u64 WatchedImageWindowSize = 2_MB;
@@ -149,6 +161,7 @@ struct Image : public Common::LRUNode<> {
 
     void MarkModified(std::source_location loc = std::source_location::current()) {
         contents_version = global_contents_version.Next();
+        NoteImageModification(image_uid, contents_version, loc);
         if (IsWatchedImageAddress(info.guest_address, info.guest_size)) {
             NoteWatchedImageModification(*this, loc);
         }

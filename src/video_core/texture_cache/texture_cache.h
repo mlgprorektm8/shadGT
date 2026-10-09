@@ -378,6 +378,12 @@ private:
 public:
     /// True when GPU-written images are waiting to be read back to guest memory.
     bool HasPendingReadbacks();
+    /// DIAG-044: whether the slot still holds the image with this uid.
+    bool IsImageAlive(ImageId image_id, u64 uid) {
+        return image_id && slot_images.IsAllocated(image_id) &&
+               slot_images[image_id].image_uid == uid;
+    }
+
     /// DIAG-043: writes the first mip and layer of an image as raw bytes (waits for the GPU).
     void DumpImage(ImageId image_id, const std::filesystem::path& path);
 

@@ -230,6 +230,11 @@ private:
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
     /// DIAG-041: buffers and images of the current draw that were bound empty.
     std::string diag_empty_bindings;
+    /// DIAG-044: records the current draw or dispatch in the dependency history.
+    void RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 count);
+    /// DIAG-044: logs and dumps everything the image's current contents were made from.
+    void TraceImageDependencies(VideoCore::ImageId image_id);
+    VideoCore::ImageId diag_trace_source{};
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;

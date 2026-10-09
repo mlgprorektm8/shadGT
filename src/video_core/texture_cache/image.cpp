@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <deque>
@@ -80,6 +82,29 @@ void FlushDiagRecords(u32 then_live) {
     }
     g_diag_records.clear();
     g_diag_live = then_live;
+}
+
+static constexpr size_t ImageModRingSize = 1 << 18;
+static std::array<ImageModRecord, ImageModRingSize> g_image_mods{};
+static std::atomic<u64> g_image_mod_index{};
+
+void NoteImageModification(u64 uid, u64 version, std::source_location loc) {
+    const u64 index = g_image_mod_index.fetch_add(1, std::memory_order_relaxed);
+    g_image_mods[index % ImageModRingSize] = {uid, version, loc.file_name(), loc.line()};
+}
+
+std::vector<ImageModRecord> RecentImageModifications(u64 uid, size_t max_count) {
+    const u64 end = g_image_mod_index.load();
+    const u64 begin = end > ImageModRingSize ? end - ImageModRingSize : 0;
+    std::vector<ImageModRecord> found;
+    for (u64 i = end; i-- > begin && found.size() < max_count;) {
+        const auto& record = g_image_mods[i % ImageModRingSize];
+        if (record.uid == uid) {
+            found.push_back(record);
+        }
+    }
+    std::reverse(found.begin(), found.end());
+    return found;
 }
 
 void NoteWatchedImageModification(const Image& image, std::source_location loc) {
