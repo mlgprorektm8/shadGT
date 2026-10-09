@@ -778,6 +778,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/polyfill_thread.h
            src/common/rdtsc.cpp
            src/common/rdtsc.h
+           src/common/recoverable.h
            src/common/recursive_lock.cpp
            src/common/recursive_lock.h
            src/common/scope_exit.h
