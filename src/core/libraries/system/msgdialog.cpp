@@ -75,6 +75,20 @@ Error PS4_SYSV_ABI sceMsgDialogOpen(const OrbisParam* param) {
         return Error::ARG_NULL;
     }
     LOG_DEBUG(Lib_MsgDlg, "called param->mode: {}", magic_enum::enum_name(param->mode));
+    // A modal dialog stops games that wait for it (GT Sport polls UpdateStatus and stops
+    // flipping), so name it in Warning-level logs: otherwise it looks like a freeze.
+    if (param->mode == MsgDialogMode::USER_MSG && param->userMsgParam &&
+        param->userMsgParam->msg) {
+        LOG_WARNING(Lib_MsgDlg, "dialog opened (user message, buttons {}): {}",
+                    magic_enum::enum_name(param->userMsgParam->buttonType),
+                    param->userMsgParam->msg);
+    } else if (param->mode == MsgDialogMode::SYSTEM_MSG && param->sysMsgParam) {
+        LOG_WARNING(Lib_MsgDlg, "dialog opened (system message {})",
+                    magic_enum::enum_name(param->sysMsgParam->sysMsgType));
+    } else if (param->mode == MsgDialogMode::PROGRESS_BAR && param->progBarParam &&
+               param->progBarParam->msg) {
+        LOG_WARNING(Lib_MsgDlg, "dialog opened (progress bar): {}", param->progBarParam->msg);
+    }
     ASSERT(param->size == sizeof(OrbisParam));
     ASSERT(param->baseParam.size == sizeof(CommonDialog::BaseParam));
     g_result = {};

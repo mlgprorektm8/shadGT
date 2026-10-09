@@ -28,6 +28,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import analyze_bundle as ab  # noqa: E402
 from pm4_draws import CTX_BASE, DRAW_OPS, SH_BASE, packets  # noqa: E402
+from pm4_scan import OPCODES, destination  # noqa: E402
+
+# GPU work that writes memory the CPU can read back: labels/fences, data writes, DMA, copies,
+# and EVENT_WRITE (occlusion query ZPASS_DONE / sample counters write their results).
+GPU_TO_CPU = {0x37, 0x40, 0x47, 0x49, 0x50, 0x46}
 
 # Context registers holding guest addresses or per-run values: they differ between runs.
 ADDRESS_REGS = {0xA010, 0xA011, 0xA012, 0xA013, 0xA014, 0xA015, 0xA016, 0xA017, 0xA005, 0xA006}
@@ -142,6 +147,41 @@ def pm4_registers(bundle: ab.Bundle) -> list[tuple[dict[int, int], int]]:
     return out
 
 
+def gpu_to_cpu(bundle: ab.Bundle) -> list[tuple]:
+    """(queue, opcode name, bytes, data/event summary) for each packet writing memory the CPU
+    can read, in capture order. Addresses are left out: they differ between runs."""
+    index_path = bundle.dir / "pm4/index.jsonl"
+    if not index_path.exists():
+        return []
+    out = []
+    for entry in (json.loads(l) for l in index_path.read_text().splitlines() if l.strip()):
+        for part in ("first", "second"):
+            name = entry.get(part)
+            if not name:
+                continue
+            raw = (bundle.dir / "pm4" / name).read_bytes()
+            dwords = list(struct.unpack(f"<{len(raw) // 4}I", raw))
+            for opcode, body in packets(dwords):
+                if opcode not in GPU_TO_CPU or not body:
+                    continue
+                op = OPCODES.get(opcode, "EVENT_WRITE" if opcode == 0x46 else hex(opcode))
+                dest = destination(opcode, body)
+                if opcode == 0x47:  # EOP: event, addr lo, addr hi | data_sel, data lo, data hi
+                    detail = (f"event {body[0] & 0x3F:#x} data_sel {(body[2] >> 29) & 7} "
+                              f"value {body[3] if len(body) > 3 else 0:#x}")
+                elif opcode == 0x49:  # RELEASE_MEM
+                    detail = (f"event {body[0] & 0x3F:#x} data_sel {(body[1] >> 29) & 7} "
+                              f"value {body[4] if len(body) > 4 else 0:#x}")
+                elif opcode == 0x37:  # WRITE_DATA payload
+                    detail = "data " + " ".join(f"{d:#x}" for d in body[3:7])
+                elif opcode == 0x46:  # EVENT_WRITE: event type (0x1 = ZPASS_DONE ...)
+                    detail = f"event {body[0] & 0x3F:#x} index {(body[0] >> 8) & 0xF}"
+                else:
+                    detail = f"control {body[0]:#x}"
+                out.append((entry["queue"], op, dest[1] if dest else 0, detail))
+    return out
+
+
 def register_diff(good: dict[int, int], bad: dict[int, int]) -> list[str]:
     lines = []
     for reg in sorted(set(good) | set(bad)):
@@ -224,6 +264,23 @@ def main() -> int:
                     anchor = good_frame[min(i1, len(good_frame) - 1)]["seq"] if good_frame else 0
                     findings.append((anchor, f"only in bad: #{b['seq']} {b.get('type')} "
                                      f"{b.get('shaders')} count {b['count']}"))
+
+    # GPU-to-CPU results: the CPU decides what to draw next from these (labels, queries,
+    # readbacks). A packet the bad run lacks, or a different value, is a lead.
+    good_g2c, bad_g2c = gpu_to_cpu(good), gpu_to_cpu(bad)
+    print(f"\nGPU-to-CPU writes in the capture: good {len(good_g2c)}, bad {len(bad_g2c)}")
+    for label, items in (("good", good_g2c), ("bad", bad_g2c)):
+        kinds: dict[str, int] = {}
+        for q, op, _, _ in items:
+            kinds[f"{q} {op}"] = kinds.get(f"{q} {op}", 0) + 1
+        print(f"  {label}: " + ", ".join(f"{k} x{v}" for k, v in sorted(kinds.items())))
+    g2c = difflib.SequenceMatcher(a=good_g2c, b=bad_g2c, autojunk=False)
+    shown = 0
+    for tag, i1, i2, j1, j2 in g2c.get_opcodes():
+        if tag == "equal" or shown >= args.max:
+            continue
+        shown += 1
+        print(f"  {tag}: good {good_g2c[i1:i2][:4]} | bad {bad_g2c[j1:j2][:4]}")
 
     findings.sort(key=lambda f: f[0])
     print(f"\n{len(findings)} divergences along the chain (draw order):")

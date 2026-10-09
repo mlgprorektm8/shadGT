@@ -5,6 +5,7 @@
 #include <utility>
 
 #include <imgui.h>
+#include <magic_enum/magic_enum.hpp>
 #include "common/assert.h"
 #include "imgui/imgui_std.h"
 #include "msgdialog_ui.h"
@@ -237,6 +238,8 @@ void MsgDialogUi::Finish(ButtonId buttonId, Result r) {
         result->buttonId = buttonId;
     }
     if (status) {
+        LOG_WARNING(Lib_MsgDlg, "dialog closed: button {}, result {}",
+                    magic_enum::enum_name(buttonId), magic_enum::enum_name(r));
         *status = Status::FINISHED;
     }
     state = nullptr;
