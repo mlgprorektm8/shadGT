@@ -313,7 +313,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         break;
     }
     case HwStage::Compute: {
-        const auto& cs_pgm = liverpool->GetCsRegs();
+        const auto& cs_pgm = liverpool->DrawCsRegs();
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
         info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
@@ -528,7 +528,7 @@ void PipelineCache::MaybeSaveDriverCache() {
 }
 
 const AmdGpu::Regs& PipelineCache::Regs() const {
-    return regs_override ? *regs_override : liverpool->regs;
+    return regs_override ? *regs_override : liverpool->DrawRegs();
 }
 
 bool PipelineCache::HasSupportedColorTargets() const {
@@ -752,13 +752,15 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             build = pending->second;
             pending_builds.erase(pending);
             predicted = true;
-            if (Common::PerfFeatureEnabled(19) && draws_since_scan >= last_scan_draws) {
+            // PERF-031: the read-ahead reads the command thread's state; not with the draw pipe.
+            if (Common::PerfFeatureEnabled(19) && !liverpool->Pipelined() &&
+                draws_since_scan >= last_scan_draws) {
                 // Past the last read-ahead: keep reading from where it stopped.
                 const auto key = graphics_key;
                 ReadAhead(params);
                 ASSERT_MSG(graphics_key == key, "Read-ahead changed the current pipeline key");
             }
-        } else if (Common::PerfFeatureEnabled(19)) {
+        } else if (Common::PerfFeatureEnabled(19) && !liverpool->Pipelined()) {
             const auto key = graphics_key;
             build = StartPipelineBuild(true);
             ReadAhead(params);
@@ -1193,7 +1195,7 @@ bool PipelineCache::RefreshGraphicsStages() {
 
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
-    const auto& cs_pgm = liverpool->GetCsRegs();
+    const auto& cs_pgm = liverpool->DrawCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
     std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);

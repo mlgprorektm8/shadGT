@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <optional>
 
+#include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -13,7 +15,9 @@
 #include <mutex>
 #include <semaphore>
 #include <span>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <queue>
@@ -24,6 +28,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/regs.h"
+#include "video_core/amdgpu/regs_delta.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -34,6 +39,8 @@ struct VideoOutPort;
 }
 
 namespace AmdGpu {
+
+class DrawPipe;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -87,6 +94,34 @@ public:
         std::unique_lock lk{submit_mutex};
         submit_cv.wait(lk, [this] { return num_submits == 0; });
     }
+
+    /// PERF-031: the registers of the draw or dispatch being recorded. On the recorder thread
+    /// of the draw pipe these are its copy, up to date with that draw; otherwise the live ones.
+    const Regs& DrawRegs() const {
+        return recorder_state ? recorder_state->regs : regs;
+    }
+    const ComputeProgram& DrawCsRegs() {
+        return recorder_state ? recorder_state->cs : GetCsRegs();
+    }
+    const CbDbExtent& DrawCbExtent(u32 cb) const {
+        return recorder_state ? recorder_state->cb_extent[cb] : last_cb_extent[cb];
+    }
+    const CbDbExtent& DrawDbExtent() const {
+        return recorder_state ? recorder_state->db_extent : last_db_extent;
+    }
+
+    /// PERF-031: whether draws are recorded on a second thread (SHADGT_DRAW_PIPE=1).
+    bool Pipelined() const {
+        return pipelined.load(std::memory_order_acquire);
+    }
+    /// The command processor thread, or the draw pipe's recorder thread.
+    bool IsGpuThread(std::thread::id id) const;
+#ifdef __linux__
+    bool IsGpuThreadTid(u32 tid) const;
+#endif
+    /// A fault on the command processor thread: its handling uses the caches, so the recorder
+    /// finishes first.
+    void OnGpuThreadFault();
 
     bool IsGpuIdle() const {
         return num_submits == 0;
@@ -265,6 +300,51 @@ private:
     bool ScanPackets(std::span<const u32> dcb, const std::function<bool(const Regs&)>& on_draw,
                      u32 depth, u32& draws_left, u32& builds_left, const u32** stopped_at);
 
+    // PERF-031: the draw pipe. The command thread decodes and keeps `regs`; draws, dispatches
+    // and everything that touches the caches or writes guest memory run on the recorder thread
+    // in submission order, with the registers brought up to date from regs_dirty.
+    struct RecorderState {
+        Regs regs{};
+        ComputeProgram cs{};
+        std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
+        CbDbExtent db_extent{};
+    };
+    static inline thread_local RecorderState* recorder_state = nullptr;
+    std::unique_ptr<RecorderState> recorder;
+    std::unique_ptr<DrawPipe> draw_pipe;
+    std::atomic<bool> pipelined{};
+    RegsDelta<Regs::NumRegs> regs_dirty;
+    u32 verify_interval{};
+    u64 verify_count{};
+#ifdef __linux__
+    std::atomic<u32> recorder_tid{};
+#endif
+    // Command buffers being decoded, so writes into them are not reordered after their decoding.
+    std::vector<std::span<const u32>> live_cmd_buffers;
+    std::unordered_map<std::string_view, std::pair<u64, double>> sync_reasons;
+    std::chrono::steady_clock::time_point pipe_report_start{};
+
+    void StartDrawPipe();
+    void ReportDrawPipe();
+    void VerifyRecorderRegs(const Regs& expected);
+    /// Runs work on the recorder thread behind everything queued before it (inline without one).
+    void Record(Common::UniqueFunction<void>&& work);
+    /// Records a draw or dispatch together with the registers written since the previous one.
+    void RecordDraw(Common::UniqueFunction<void>&& draw, bool compute);
+    /// Waits for the recorder thread to finish, before the command thread uses the rasterizer.
+    void SyncRecorder(std::string_view reason);
+    /// Whether [address, address + size) overlaps a command buffer being decoded.
+    bool WritesLiveCommands(VAddr address, u64 size) const;
+    void MarkRegs(u32 first, u32 count) {
+        regs_dirty.Mark(first, count);
+    }
+    template <typename T>
+    void MarkReg(const T& field) {
+        const auto offset = static_cast<u32>(reinterpret_cast<const u8*>(&field) -
+                                             reinterpret_cast<const u8*>(regs.reg_array.data()));
+        regs_dirty.Mark(offset / sizeof(u32), static_cast<u32>((sizeof(T) + 3) / sizeof(u32)));
+    }
+
     std::array<ConstDumpRecord, 256> recent_const_dumps{};
     u64 const_dump_sequence{};
     std::array<ConstDumpRecord, 256> recent_cmd_buffers{};
@@ -319,7 +399,10 @@ private:
     Libraries::VideoOut::VideoOutPort* vo_port{};
     const bool guest_markers_enabled;
     std::jthread process_thread{};
+    // Submissions the guest made that are not finished: the recorder thread finishes them when
+    // the draw pipe runs. num_tasks counts the ones the command thread has not decoded yet.
     std::atomic<u32> num_submits{};
+    std::atomic<u32> num_tasks{};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;

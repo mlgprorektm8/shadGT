@@ -1163,3 +1163,82 @@ The shader database was disabled at Lance's request (precompile removal above), 
 translates every permutation again, including ones an earlier session already built for the same
 car. Re-enabling it (on demand, without the startup precompile) would remove those. That is
 Lance's decision.
+
+## PERF-031: draw pipe, decoding and recording on two threads (October 9, branch `perf-parallel-gpu`)
+
+Lance asked (October 9) for 60 FPS work following the Bloodborne PC port's parallel GPU design
+(bbport, GPL-2.0-or-later, `docs/parallel_gpu.md` at https://github.com/deadinside28/bloodborne_pc).
+Its two-stage pipeline gained 18-19% there. The design is borrowed; the code is written for shadGT.
+
+### Starting point (race, October 8, 39 FPS)
+
+- About 1,530 draws per frame. The GPU is about 34% busy; the command thread is the limit.
+- The command thread spends 17 ms per frame on draws: buffers 6.5 ms, pipeline 3.9, textures
+  2.3, vertex/index 1.8, and render passes, descriptors and recording about 2.3.
+- On top of that: PM4 decoding (about 22,600 packets per frame) and waits.
+
+### GT Sport's packet mix (two dealership bundles, 3 frames each)
+
+- No constant-engine packets.
+- About 650 DMA_DATA per frame, one per draw. They are memory writes, so they run in order on
+  the recorder rather than forcing drains.
+- 16 WAIT_REG_MEM per frame on the graphics queue and 11 on compute; about 18 EVENT_WRITE,
+  12 EOP and 5 EOS.
+- Between WAIT_REG_MEMs there are runs of about 37 draws in which the two threads overlap.
+
+### Design
+
+- **Stage A, the command thread:** keeps PM4 decoding and the register file. Every register
+  write marks its 32-dword block (`RegsDelta`).
+- **Hand-off:** each draw and dispatch sends the blocks written since the previous one, plus
+  the CB/DB extents and, for dispatches, the queue's compute registers.
+- **Stage B, the recorder thread (`shadGT:GpuRecorder`):** applies them to its own register
+  copy and runs the unchanged `Rasterizer::Draw`/`Dispatch*`. Rasterizer and pipeline-cache code
+  reads registers through `Liverpool::DrawRegs()`/`DrawCsRegs()`/`DrawCbExtent()`.
+- **In order on the recorder:**
+  - DMA_DATA and WRITE_DATA;
+  - EOP, EOS and RELEASE_MEM fences;
+  - MEM_SEMAPHORE signals and occlusion results;
+  - debug markers and flip IRQs;
+  - submit-done flushes, the GPU-idle IRQ, and the end of a submission (`num_submits`), so
+    "idle" still means recorded. The command thread counts its own decoding in `num_tasks`.
+- **Drain first, then run on the command thread:**
+  - WAIT_REG_MEM, COND_EXEC and MEM_SEMAPHORE waits, only when not already met;
+  - CE dumps;
+  - commands other threads send to the GPU thread (flips, CPU fault flushes, unmaps);
+  - a fault on the command thread;
+  - copies or writes into a command buffer still being decoded.
+- **Thread identity:** the recorder counts as a GPU thread for fault handling.
+- **Off while pipelined:** the pipeline read-ahead (PERF-019 to 023), because it reads the
+  command thread's state.
+- **FIX-044:** the recorder is marked as a GPU command thread, so its compiles hold the guest
+  clocks.
+
+### Switches and checks
+
+- `SHADGT_DRAW_PIPE=1` turns it on (off by default until measured). `-DisablePerf 46` forces it
+  off.
+- `SHADGT_DRAW_PIPE_VERIFY=N` sends the full register file with every Nth draw and logs any
+  register the recorder had stale (a write that was not marked).
+- Every 2 s, a `PERF-031 draw pipe` line reports:
+  - jobs, recorder busy % and maximum queue;
+  - drains by reason, with the time the command thread waited.
+- Unit tests (`shadps4_draw_pipe_test`):
+  - register deltas reproduce the register file over 2,000 random draws;
+  - work runs in order on the recorder thread;
+  - drains wait for running work;
+  - backpressure keeps order;
+  - results written before a drain are visible after it.
+
+### Expected and open
+
+- Recording stays the larger stage, so the first gain is the overlap of decoding, waits and
+  pipeline-cache hits with recording. That is roughly what bbport saw from this step (+18-19%).
+- bbport's later steps go further:
+  - pipeline selection and descriptor reads on stage A;
+  - texture and render-state memo caches.
+
+  They need stage A to read guest memory ahead of recorded writes, with pending-write tracking.
+- bbport reported a heap-corruption crash with its pipe enabled (open there).
+- Diagnostics that read the command thread's history from the recorder (DIAG-009/010 const-dump
+  and command-buffer lookups) can be inaccurate while pipelined.

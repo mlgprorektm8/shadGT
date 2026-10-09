@@ -139,6 +139,12 @@ public:
     }
 
     std::thread::id GetGpuCommandProcessorThread();
+    /// The command processor thread or the draw pipe's recorder thread (PERF-031).
+    bool IsGpuThread() const;
+    void OnGpuThreadFault();
+#ifdef __linux__
+    bool IsGpuThreadTid(u32 tid) const;
+#endif
 #ifdef __linux__
     u32 GetGpuCommandProcessorThreadId();
 #endif

@@ -398,8 +398,7 @@ public:
             // Notify rasterizer about the fault.
             const VAddr addr = msg.arg.pagefault.address;
             const auto ptid = msg.arg.pagefault.feat.ptid;
-            rasterizer->InvalidateMemory(addr, 1,
-                                         ptid == rasterizer->GetGpuCommandProcessorThreadId());
+            rasterizer->InvalidateMemory(addr, 1, rasterizer->IsGpuThreadTid(ptid));
 
             // Some calls to InvalidateMemory never reach the UFFDIO_WRITEPROTECT ioctl in
             // ::Protect, therefore we use MODE_DONTWAKE and wake the thread with UFFDIO_WAKE here
@@ -453,8 +452,7 @@ struct SignalImpl : public PageManager::Impl {
                                 start, length);
                 }
             }
-            impl.Protect(start, length,
-                         exec ? perms | Core::MemoryPermission::Execute : perms);
+            impl.Protect(start, length, exec ? perms | Core::MemoryPermission::Execute : perms);
         });
     }
 
@@ -505,8 +503,12 @@ struct SignalImpl : public PageManager::Impl {
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
-        const auto is_gpu_thread =
-            std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
+        // PERF-031: the draw pipe's recorder thread is a GPU thread too; a fault on the command
+        // thread lets the recorder finish first, since the handling uses the caches.
+        const auto is_gpu_thread = rasterizer->IsGpuThread();
+        if (is_gpu_thread) {
+            rasterizer->OnGpuThreadFault();
+        }
         if (Common::IsWriteError(context)) {
             return rasterizer->InvalidateMemory(addr, size, is_gpu_thread,
                                                 ExactWriteSize(context, addr));

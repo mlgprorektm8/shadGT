@@ -1065,6 +1065,8 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
 )
 
 set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
+               src/video_core/amdgpu/draw_pipe.cpp
+               src/video_core/amdgpu/draw_pipe.h
                src/video_core/amdgpu/liverpool.cpp
                src/video_core/amdgpu/liverpool.h
                src/video_core/amdgpu/pixel_format.cpp
@@ -1074,6 +1076,7 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/amdgpu/regs_color.h
                src/video_core/amdgpu/regs_depth.h
                src/video_core/amdgpu/regs.cpp
+               src/video_core/amdgpu/regs_delta.h
                src/video_core/amdgpu/regs.h
                src/video_core/amdgpu/regs_primitive.h
                src/video_core/amdgpu/regs_shader.h
