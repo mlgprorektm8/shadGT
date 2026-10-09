@@ -31,6 +31,31 @@ namespace Core {
 
 #if defined(_WIN32)
 
+// Which host (Windows) module an address is in, e.g. "nvoglv64.dll+0x12345", or "".
+static std::string HostModuleOf(u64 address) {
+    HMODULE module{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(address), &module)) {
+        return {};
+    }
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+    std::wstring_view name{path, length};
+    if (const auto slash = name.find_last_of(L"\\/"); slash != std::wstring_view::npos) {
+        name.remove_prefix(slash + 1);
+    }
+    std::string narrow;
+    for (const wchar_t c : name) {
+        narrow += c < 128 ? static_cast<char>(c) : '?';
+    }
+    return fmt::format("{}+{:#x}", narrow, address - reinterpret_cast<u64>(module));
+}
+
+std::string DescribeHostAddress(u64 address) {
+    return HostModuleOf(address);
+}
+
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
     const auto* signals = Signals::Instance();
@@ -189,6 +214,10 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                          memory->DescribeAddress(pExp->ExceptionRecord->ExceptionInformation[1]));
         }
         LOG_CRITICAL(Debug, "RIP {:#x}: {}", ctx.Rip, memory->DescribeAddress(ctx.Rip));
+        // A fault in host code (the emulator, a Vulkan layer or the driver): name the module.
+        if (const auto host = HostModuleOf(ctx.Rip); !host.empty()) {
+            LOG_CRITICAL(Debug, "RIP is host code: {}", host);
+        }
         const std::array<std::pair<const char*, u64>, 14> regs = {{{"RAX", ctx.Rax},
                                                                    {"RBX", ctx.Rbx},
                                                                    {"RCX", ctx.Rcx},
@@ -222,6 +251,16 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
             }
         }
         LOG_CRITICAL(Debug, "Code addresses on the stack:{}", frames.empty() ? " none" : frames);
+        std::string host_frames;
+        for (size_t i = 0; i < stack_read / sizeof(u64); ++i) {
+            if (stack[i] >= 0x10000) {
+                if (const auto host = HostModuleOf(stack[i]); !host.empty()) {
+                    host_frames += fmt::format(" | [rsp+{:#x}] {}", i * 8, host);
+                }
+            }
+        }
+        LOG_CRITICAL(Debug, "Host code addresses on the stack:{}",
+                     host_frames.empty() ? " none" : host_frames);
         // DIAG-035: emulator writes into guest memory near what the registers point at.
         for (const auto& [name, value] : regs) {
             if (value >= 0x10000 && memory->IsValidMapping(value)) {
@@ -238,6 +277,10 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
 }
 
 #else
+
+std::string DescribeHostAddress(u64) {
+    return {};
+}
 
 static std::string DisassembleInstruction(void* code_address) {
     char buffer[256] = "<unable to decode>";

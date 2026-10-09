@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <string>
+
 #include <set>
 #include <signal.h>
 #include "common/singleton.h"
@@ -65,5 +67,9 @@ private:
 };
 
 using Signals = Common::Singleton<SignalDispatch>;
+
+/// The host (Windows) module an address is in, as "name.dll+0xoffset", or "" (crash and hang
+/// reports).
+std::string DescribeHostAddress(u64 address);
 
 } // namespace Core

@@ -183,6 +183,25 @@ void OnCrash(std::string_view what) {
     }
 }
 
+void OnMonitorTick() {
+    static u32 last_frame = ~0u;
+    static u32 still_ticks = 0;
+    static bool reported = false;
+    const u32 frame = DebugState.GetFrameNum();
+    if (frame != last_frame || DebugState.IsGuestThreadsPaused()) {
+        last_frame = frame;
+        still_ticks = 0;
+        reported = false;
+        return;
+    }
+    if (++still_ticks < 3 || reported || frame == 0) {
+        return;
+    }
+    reported = true;
+    LOG_ERROR(Render_Vulkan, "HANG: no frame presented for {} s (frame {}); guest threads:{}",
+              still_ticks * 2, frame, DebugState.DescribeGuestThreads());
+}
+
 void OnStall(double frame_ms) {
     static const double threshold = [] {
         const char* env = std::getenv("SHADGT_BUNDLE_STALL_MS");

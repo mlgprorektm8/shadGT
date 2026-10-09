@@ -235,6 +235,10 @@ class Bundle:
                 if line.strip():
                     self.records.append(json.loads(line))
         self.by_seq = {r["seq"]: r for r in self.records}
+        # GPU buffer writes (address, end, seq) for aliasing checks.
+        self.buffer_writes = sorted(
+            (int(b["address"], 16), int(b["address"], 16) + b["size"], r["seq"])
+            for r in self.records for b in r["buffers"] if b["written"])
         # Per image, the sequence numbers of the draws and dispatches that wrote it.
         self.writer_seqs: dict[int, list[int]] = defaultdict(list)
         for record in self.records:
@@ -302,6 +306,16 @@ class Bundle:
         seqs = self.writer_seqs.get(uid, [])
         i = bisect.bisect_right(seqs, low)
         return i < len(seqs) and seqs[i] < high
+
+    def buffer_writers_of(self, uid: int) -> list[int]:
+        """Draws/dispatches that wrote the image's memory as a buffer."""
+        info = self.image_info.get(uid, {})
+        try:
+            address = int(info.get("address", "0"), 16)
+        except ValueError:
+            return []
+        size = max(info.get("width", 0), 1) * max(info.get("height", 0), 1) * 16
+        return [seq for a, e, seq in self.buffer_writes if a < address + size and address < e]
 
     def writers(self, uid: int, before: int | None = None):
         seqs = self.writer_seqs.get(uid, [])
@@ -393,33 +407,31 @@ def analyze(folder: Path, focus: list[str], warnings: bool = False) -> dict:
                     f"{stats.summary()}")
                 previews.append((snap, f"uid{uid}_s{snap.snapshot}_naninf"))
 
-    # 2. Reads of empty or never-written images, and empty bindings, in the capture window.
+    # 2. Reads of empty images, reads before an image's first write, and empty bindings, in
+    # the capture window. What a draw read is the nearest snapshot with no write in between.
     reported = set()
+    empty_reads: dict[int, list] = defaultdict(list)
     for record in window:
         for ref in record["images"]:
-            if ref["role"] != "read" and ref["role"] != "storage":
+            if ref["role"] != "read":
                 continue
             uid = ref["uid"]
-            before = bundle.snapshot_before(uid, record["seq"])
-            stats = bundle.load(before) if before else None
-            written = bool(bundle.writers(uid, record["seq"]))
             key = (uid, shader_text(record))
             if key in reported:
                 continue
-            if stats and stats.empty and ref["role"] == "read":
+            seen = (bundle.snapshot_before(uid, record["seq"]) or
+                    bundle.snapshot_after(uid, record["seq"]))
+            stats = bundle.load(seen) if seen else None
+            writers = bundle.writer_seqs.get(uid, [])
+            if stats and stats.empty:
                 reported.add(key)
-                findings["reads_empty"].append(
+                empty_reads[uid].append(record)
+            elif writers and writers[0] > record["seq"] and stats is None:
+                # Written by the GPU only later: read before its first recorded write.
+                reported.add(key)
+                findings["reads_before_write"].append(
                     f"#{record['seq']} {record['type']} ({shader_text(record)}) reads "
-                    f"{bundle.describe(uid)}, which is all zero (snapshot {before.snapshot}"
-                    f"{'' if written else ', never written by a recorded draw or dispatch'})")
-            elif not written and before is None and ref["role"] == "read":
-                mods = bundle.image_info.get(uid, {}).get("modifications", [])
-                if not mods:
-                    reported.add(key)
-                    findings["reads_unwritten"].append(
-                        f"#{record['seq']} {record['type']} ({shader_text(record)}) reads "
-                        f"{bundle.describe(uid)}: no draw, dispatch or modification of it was "
-                        f"recorded")
+                    f"{bundle.describe(uid)} before its first recorded write (#{writers[0]})")
         if record.get("empty_bindings"):
             key = ("empty", shader_text(record), record["empty_bindings"])
             if key not in reported:
@@ -427,6 +439,24 @@ def analyze(folder: Path, focus: list[str], warnings: bool = False) -> dict:
                 findings["empty_bindings"].append(
                     f"#{record['seq']} {record['type']} ({shader_text(record)}):"
                     f"{record['empty_bindings']}")
+
+    # One line per empty image: how often it is read, who makes it, and whether GPU work writes
+    # its memory as a buffer (then an upload from guest memory may be stale).
+    for uid, readers in sorted(empty_reads.items(), key=lambda kv: -len(kv[1])):
+        shaders = sorted({shader_text(r) for r in readers})
+        gpu_writers = bundle.writer_seqs.get(uid, [])
+        buffer_writers = bundle.buffer_writers_of(uid)
+        mods = bundle.image_info.get(uid, {}).get("modifications", [])
+        source = ("written by GPU draws/dispatches " + ", ".join(f"#{s}" for s in gpu_writers[-3:])
+                  if gpu_writers else
+                  "never written by a draw or dispatch" +
+                  (f"; last modifications: {', '.join(mods[-2:])}" if mods else ""))
+        alias = (f"; GPU work writes its memory as a buffer (#{buffer_writers[-1]}): uploads "
+                 f"from guest memory may be stale" if buffer_writers else "")
+        findings["reads_empty"].append(
+            f"{bundle.describe(uid)} is all zero and read by {len(readers)} draws/dispatches "
+            f"({len(shaders)} shader combinations, first #{readers[0]['seq']}: "
+            f"{shaders[0]}); {source}{alias}")
 
     # 3. Targets that ended black or constant.
     final_snapshot = bundle.manifest.get("snapshots", 0)
@@ -464,7 +494,7 @@ def analyze(folder: Path, focus: list[str], warnings: bool = False) -> dict:
         data = inventory.build([bundle.log], report_dir / "log-inventory", warnings)
         log_summary = data["summary"]
         for group in data["groups"]:
-            category = {"shader": "shader_failures", "gpu": "validation", "crash": "crashes",
+            category = {"contained": "contained", "gpu": "validation", "crash": "crashes",
                         "unimplemented": "unimplemented", "stub": "stubs"}.get(group["category"])
             if category:
                 findings[category].append(f"{group['count']}x {group['location']} "
@@ -490,13 +520,15 @@ def analyze(folder: Path, focus: list[str], warnings: bool = False) -> dict:
                 save_preview(snap.array, snap.is_float, path)
             written_previews.append(str(path.relative_to(folder)))
 
-    order = ["crashes", "shader_failures", "nan_inf", "validation", "reads_empty",
-             "reads_unwritten", "empty_bindings", "unimplemented", "recompiler_warnings",
+    order = ["crashes", "contained", "nan_inf", "validation", "reads_empty",
+             "reads_before_write", "empty_bindings", "unimplemented", "recompiler_warnings",
              "black_targets", "stubs"]
     titles = {
-        "crashes": "Crashes", "shader_failures": "Shaders not translated / exports dropped",
+        "crashes": "Crashes",
+        "contained": "Not handled, skipped (untranslated shaders, dropped exports, DMA)",
         "nan_inf": "Images with NaN or Inf", "validation": "Vulkan validation",
-        "reads_empty": "Reads of empty images", "reads_unwritten": "Reads of never-written images",
+        "reads_empty": "Reads of empty images",
+        "reads_before_write": "Reads before the image's first recorded write",
         "empty_bindings": "Draws with empty bindings",
         "unimplemented": "Unimplemented functions called",
         "recompiler_warnings": "Shader recompiler warnings",

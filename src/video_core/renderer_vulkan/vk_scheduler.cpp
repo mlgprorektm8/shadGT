@@ -11,6 +11,7 @@
 #include "common/perf_monitor.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/diag_bundle.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -322,6 +323,7 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
         LOG_WARNING(Render_Vulkan, "Frontend work in {:.1f} s: {}",
                     std::chrono::duration<double>(now - window_start).count(),
                     Common::TakeWorkCounters());
+        VideoCore::DiagBundle::OnMonitorTick();
         window_start = now;
         window_tick = tick;
         samples = 0;

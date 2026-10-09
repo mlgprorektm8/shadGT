@@ -63,6 +63,10 @@ void CapturePm4(std::string_view queue, std::span<const u32> first, std::span<co
 void SetCrashWriter(std::function<void(const std::filesystem::path&)> writer);
 void OnCrash(std::string_view what);
 
+/// Called by the perf monitor every 2 s: when no frame has been presented for 6 s (and the game
+/// is not paused), logs once per hang where every guest thread is (HANG: ...).
+void OnMonitorTick();
+
 /// Called for each long frame (DIAG-033): arms a "stall" bundle once when it exceeds
 /// SHADGT_BUNDLE_STALL_MS (diagnostic runs only).
 void OnStall(double frame_ms);

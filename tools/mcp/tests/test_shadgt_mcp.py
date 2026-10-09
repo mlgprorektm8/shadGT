@@ -211,7 +211,7 @@ class InventoryTest(ServerTestBase):
 
         stopped, inv = self.run_session(body)
         self.assertEqual(stopped["inventory_summary"]["crash"], 1)
-        self.assertEqual(inv["summary"], {"crash": 1, "shader": 0, "gpu": 0, "unimplemented": 1,
+        self.assertEqual(inv["summary"], {"crash": 1, "contained": 0, "gpu": 0, "unimplemented": 1,
                                           "stub": 1, "error": 0, "warning": 0})
         self.assertTrue(inv["top"]["stub"][0].startswith("2x"))
 
@@ -230,7 +230,7 @@ class UnitTest(unittest.TestCase):
                 encoding="utf-8")
             data = inventory.build([log], Path(tmp) / "inv")
         self.assertEqual(data["summary"]["crash"], 0)
-        self.assertEqual(data["summary"]["shader"], 1)
+        self.assertEqual(data["summary"]["contained"], 1)
         self.assertIn("ring_access_elimination.cpp:71", data["groups"][0]["example"])
 
     def test_parse_status(self):

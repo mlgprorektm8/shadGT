@@ -277,7 +277,10 @@ void Rasterizer::DiagSnapshot() {
         after_seq = g_seq;
         touched.swap(capture.touched);
     }
-    constexpr u64 MaxBundleImageBytes = 3ULL << 30;
+    static const u64 MaxBundleImageBytes = [] {
+        const char* env = std::getenv("SHADGT_BUNDLE_MAX_MB");
+        return (env && *env ? std::strtoull(env, nullptr, 10) : 6144ULL) << 20;
+    }();
     for (const auto& [uid, slot] : touched) {
         const VideoCore::ImageId id{slot};
         nlohmann::json line = {{"snapshot", snapshot},
@@ -311,8 +314,13 @@ void Rasterizer::DiagSnapshot() {
         }
         line["modifications"] = mods;
         const u64 bytes = texels * std::max(info.num_bits / 8, 1u);
-        if (info.props.is_block || texels > 4096ULL * 4096 ||
-            capture.image_bytes + bytes > MaxBundleImageBytes) {
+        if (const auto it = capture.dumped.find(uid);
+            it != capture.dumped.end() && it->second.first == image.contents_version) {
+            // Unchanged since its last dump (textures, untouched targets).
+            line["file"] = it->second.second;
+            line["unchanged"] = true;
+        } else if (info.props.is_block || texels > 4096ULL * 4096 ||
+                   capture.image_bytes + bytes > MaxBundleImageBytes) {
             line["state"] = "not dumped";
             ++capture.images_skipped;
         } else {
@@ -320,6 +328,7 @@ void Rasterizer::DiagSnapshot() {
                                           info.size.height, vk::to_string(info.pixel_format));
             if (texture_cache.DumpImage(id, capture.dir / "images" / name)) {
                 line["file"] = "images/" + name;
+                capture.dumped[uid] = {image.contents_version, "images/" + name};
                 capture.image_bytes += bytes;
                 ++capture.images_written;
             } else {

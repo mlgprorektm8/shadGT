@@ -42,6 +42,15 @@ if (ARCHITECTURE STREQUAL "x86_64")
     add_compile_options(-march=x86-64-v3)
 endif()
 
+if (MSVC)
+    # Release builds also write a PDB, so the host call stacks that crash, assertion and hang
+    # reports log can be resolved to functions and lines (tools/mcp/symbolize.py). This adds
+    # debug information only; optimization and the generated code are unchanged.
+    add_compile_options($<$<CONFIG:Release>:/Zi>)
+    add_link_options($<$<CONFIG:Release>:/DEBUG:FULL> $<$<CONFIG:Release>:/OPT:REF>
+                     $<$<CONFIG:Release>:/OPT:ICF>)
+endif()
+
 cmake_host_system_information(RESULT PROC_INFO QUERY PROCESSOR_DESCRIPTION)
 
 message(STATUS "${PROC_INFO}")

@@ -3,7 +3,9 @@
 Reads shad_log.txt-format lines ("[Class] <Level> (thread) file:line func: message"), groups
 messages that differ only in numbers/addresses/hashes, and classifies each group:
 
-  shader       shaders the translator could not handle (SHADER-FAIL; their draws are skipped)
+  contained    work the emulator could not handle and skipped instead of stopping: shaders
+               it could not translate (SHADER-FAIL), dropped exports (FIX-033), DMA_DATA to
+               register space (FIX-035)
   crash        unhandled exceptions, access violations, asserts, device loss, fatal exits
   gpu          Vulkan validation messages and other GPU-side errors
   unimplemented  guest calls into functions shadGT does not implement ("Stub: X called",
@@ -40,12 +42,12 @@ NORMALIZERS = [
     (re.compile(r"\s+"), " "),
 ]
 
-CATEGORY_ORDER = ["crash", "shader", "gpu", "unimplemented", "stub", "error", "warning"]
+CATEGORY_ORDER = ["crash", "contained", "gpu", "unimplemented", "stub", "error", "warning"]
 
 CRASH_PATTERNS = re.compile(
     r"Unhandled Exception|access violation|Assertion Failed|Unreachable code|"
     r"Unimplemented code|DeviceLost|device lost|ErrorDeviceLost|Fatal|"
-    r"DIAG-034|Exception code")
+    r"DIAG-034|Exception code|^HANG: |crash bundle")
 GPU_PATTERNS = re.compile(r"Validation|VUID-|vkvalidation|SYNC-HAZARD|Vulkan error",
                           re.IGNORECASE)
 UNIMPLEMENTED_PATTERNS = re.compile(r"^Stub: |Not Resolved|Unimplemented code",
@@ -72,6 +74,7 @@ class Group:
     first_line: int = 0
     example: str = ""
     examples: list[str] = field(default_factory=list)
+    stack: str = ""
     threads: set[str] = field(default_factory=set)
 
     def to_json(self) -> dict:
@@ -79,17 +82,19 @@ class Group:
             "category": self.category, "level": self.level, "class": self.cls,
             "location": self.loc, "function": self.func, "count": self.count,
             "first": f"{self.first_log}:{self.first_line}", "example": self.example,
-            "examples": self.examples,
+            "examples": self.examples, "stack": self.stack,
             "threads": sorted(self.threads)[:8],
         }
 
 
 def classify(level: str, cls: str, func: str, msg: str) -> str | None:
-    if msg.startswith("SHADER-FAIL") or msg.startswith("FIX-033"):
-        return "shader"
+    if msg.startswith(("SHADER-FAIL", "FIX-033", "FIX-035")):
+        return "contained"
     if msg.startswith("Linker: Stub resolved"):
         return "warning"  # resolved at load; "Stub: X called" is logged if the game calls it
     full = f"{func}: {msg}"
+    if msg.startswith("HANG: "):
+        return "crash"
     if level == "Critical" or CRASH_PATTERNS.search(full):
         if GPU_PATTERNS.search(full) and level != "Critical":
             return "gpu"
@@ -111,23 +116,32 @@ def scan(paths: list[Path]) -> dict[str, Group]:
     groups: dict[str, Group] = {}
     for path in paths:
         recent_crash: tuple[int, Group] | None = None
+        last_group: Group | None = None
         with open(path, encoding="utf-8", errors="replace") as f:
             for number, line in enumerate(f, 1):
                 m = LINE_RE.match(line.rstrip("\n"))
                 if not m:
                     continue
                 level, cls, func, msg = m["level"], m["cls"], m["func"], m["msg"]
+                if msg.startswith("Host stack:"):
+                    # The call stack of the failed check logged just before it.
+                    target = recent_crash[1] if recent_crash else last_group
+                    if target is not None and not target.stack:
+                        target.stack = msg[len("Host stack:"):].strip()
+                    continue
                 category = classify(level, cls, func, msg)
                 if category is None:
                     continue
-                if category == "shader" and recent_crash and number - recent_crash[0] <= 4:
+                if category == "contained" and recent_crash and number - recent_crash[0] <= 4:
                     # The assertion that made the shader fail is not a crash: it was contained.
                     failed = recent_crash[1]
+                    moved_stack = failed.stack
                     failed.count -= 1
                     if failed.count == 0:
                         groups.pop(failed.key, None)
                     msg = f"{msg} [failed check: {failed.loc} {failed.example[:120]}]"
                     recent_crash = None
+                    pending_stack = moved_stack
                 thread = re.sub(r"@@.*$", "", m["thread"])
                 key = f"{category}|{m['loc']}|{normalize(msg)}"
                 group = groups.get(key)
@@ -136,6 +150,10 @@ def scan(paths: list[Path]) -> dict[str, Group]:
                                                 first_log=path.name, first_line=number,
                                                 example=msg[:400])
                 group.count += 1
+                last_group = group
+                if category == "contained" and locals().get("pending_stack"):
+                    group.stack = group.stack or pending_stack
+                    pending_stack = ""
                 if category == "crash":
                     recent_crash = (number, group)
                 if len(group.examples) < 6 and msg[:200] not in group.examples:
@@ -151,6 +169,17 @@ def ranked(groups: dict[str, Group], warnings: bool) -> list[Group]:
 
 def write(groups: dict[str, Group], out: Path, logs: list[Path], warnings: bool) -> dict:
     items = ranked(groups, warnings)
+    stacks = [g for g in items if g.stack]
+    if stacks:
+        try:
+            import symbolize
+            exe = symbolize.default_exe()
+            if exe.with_suffix(".pdb").exists():
+                joined = symbolize.symbolize_text("\n".join(g.stack for g in stacks), exe)
+                for g, line in zip(stacks, joined.split("\n")):
+                    g.stack = line
+        except Exception:
+            pass
     summary = {c: sum(1 for g in items if g.category == c) for c in CATEGORY_ORDER}
     data = {"logs": [str(p) for p in logs], "summary": summary,
             "groups": [g.to_json() for g in items]}
@@ -171,6 +200,8 @@ def write(groups: dict[str, Group], out: Path, logs: list[Path], warnings: bool)
                 others = "; ".join(e[:90] for e in g.examples[1:4])
                 message += f" (+{len(g.examples) - 1} variants: {others})"
             message = message.replace("|", "\\|")
+            if g.stack:
+                message += f" STACK: {g.stack[:1500]}"
             lines.append(f"| {i} | {g.count} | `{g.loc}` {g.func} | {message} "
                          f"({g.first_log}:{g.first_line}) |")
     Path(f"{out}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

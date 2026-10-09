@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/recoverable.h"
@@ -23,7 +27,24 @@ int& RecoverableDepth() {
 }
 } // namespace Common
 
+// The host call stack of a failed check, as module+offset frames (tools/mcp/symbolize.py
+// resolves them with the PDB).
+static void LogHostStack() {
+#ifdef _WIN32
+    void* frames[32];
+    const USHORT count = RtlCaptureStackBackTrace(2, 32, frames, nullptr);
+    std::string text;
+    for (USHORT i = 0; i < count; ++i) {
+        const auto address = reinterpret_cast<u64>(frames[i]);
+        const auto host = Core::DescribeHostAddress(address);
+        text += fmt::format(" | {}", host.empty() ? fmt::format("{:#x}", address) : host);
+    }
+    LOG_CRITICAL(Debug, "Host stack:{}", text);
+#endif
+}
+
 void assert_fail_impl() {
+    LogHostStack();
     if (Common::RecoverableDepth() > 0) {
         // The failed check is already logged; the RecoverableScope's owner handles it.
         throw Common::RecoverableFailure("assertion failed (see the log line above)");

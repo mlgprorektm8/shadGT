@@ -87,6 +87,8 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
  *       (video_core/diag_bundle.h). trigger is "now", "target=WxH" or "shader=0xHASH".
  *       Replies ;DIAG_BUNDLE_ARMED or ;DIAG_BUNDLE_ERROR <message>. The log line
  *       "DIAG-BUNDLE: written to <dir>" follows when the bundle is complete.
+ *   - THREADS: log where every guest thread is (name, RIP, code addresses on its stack).
+ *       Replies ;THREADS_LOGGED
  *   - STATUS: replies one line
  *       ;STATUS frames=<n> fps=<x> paused=<0|1> serial=<id> app_ver=<v> title=<rest of line>
  *       fps is measured over 500 ms while the command runs.
@@ -212,6 +214,10 @@ void IPC::InputLoop() {
             } else {
                 std::cerr << ";DIAG_BUNDLE_ERROR bad trigger " << trigger << std::endl;
             }
+        } else if (cmd == "THREADS") {
+            LOG_ERROR(Debug, "THREADS: guest threads on request:{}",
+                      DebugState.DescribeGuestThreads());
+            std::cerr << ";THREADS_LOGGED" << std::endl;
         } else if (cmd == "STATUS") {
             using namespace std::chrono;
             const u32 frames_before = DebugState.GetFrameNum();

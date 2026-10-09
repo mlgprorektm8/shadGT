@@ -181,6 +181,10 @@ public:
         return showing_debug_menu_bar;
     }
 
+    /// Where every guest thread is: name, RIP and the code addresses on its stack (guest
+    /// modules or host DLLs), read while each is briefly suspended. For hang reports.
+    std::string DescribeGuestThreads();
+
     void AddCurrentThreadToGuestList();
 
     void RemoveCurrentThreadFromGuestList();

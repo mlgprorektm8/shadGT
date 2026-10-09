@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/native_clock.h"
 #include "common/singleton.h"
+#include "core/memory.h"
 #include "core/signals.h"
 #include "debug_state.h"
 #include "devtools/widget/common.h"
@@ -45,6 +46,79 @@ static void ResumeThread(ThreadID id) {
     CloseHandle(handle);
 #else
     pthread_kill(id, SIGSLEEP);
+#endif
+}
+
+std::string DebugStateImpl::DescribeGuestThreads() {
+#ifdef _WIN32
+    std::vector<ThreadID> ids;
+    {
+        std::lock_guard lock{guest_threads_mutex};
+        ids = guest_threads;
+    }
+    auto* memory = Core::Memory::Instance();
+    const auto describe = [&](u64 address) {
+        if (auto host = Core::DescribeHostAddress(address); !host.empty()) {
+            return "host " + host;
+        }
+        return memory->DescribeAddress(address);
+    };
+    std::string out;
+    for (const ThreadID id : ids) {
+        if (id == ThisThreadID()) {
+            continue;
+        }
+        const HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                             THREAD_QUERY_LIMITED_INFORMATION,
+                                         FALSE, id);
+        if (!handle) {
+            continue;
+        }
+        std::string name = std::to_string(id);
+        PWSTR description = nullptr;
+        if (SUCCEEDED(GetThreadDescription(handle, &description)) && description && *description) {
+            name.clear();
+            for (const wchar_t* c = description; *c; ++c) {
+                name += *c < 128 ? static_cast<char>(*c) : '?';
+            }
+        }
+        if (description) {
+            LocalFree(description);
+        }
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_FULL;
+        std::array<u64, 64> stack{};
+        SIZE_T stack_read = 0;
+        const bool suspended = SuspendThread(handle) != DWORD(-1);
+        const bool got = suspended && GetThreadContext(handle, &ctx);
+        if (got) {
+            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(ctx.Rsp), stack.data(),
+                              sizeof(stack), &stack_read);
+        }
+        if (suspended) {
+            ::ResumeThread(handle);
+        }
+        CloseHandle(handle);
+        if (!got) {
+            continue;
+        }
+        out +=
+            fmt::format("\n  thread {} ({}): RIP {:#x} {}", name, id, ctx.Rip, describe(ctx.Rip));
+        u32 frames = 0;
+        for (size_t i = 0; i < stack_read / sizeof(u64) && frames < 8; ++i) {
+            if (stack[i] < 0x10000) {
+                continue;
+            }
+            const auto text = describe(stack[i]);
+            if (text.starts_with("host ") || text.find(" Code ") != std::string::npos) {
+                out += fmt::format(" | [rsp+{:#x}] {:#x} {}", i * 8, stack[i], text);
+                ++frames;
+            }
+        }
+    }
+    return out;
+#else
+    return {};
 #endif
 }
 
