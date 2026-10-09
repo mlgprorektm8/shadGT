@@ -1314,7 +1314,28 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         } else {
             const auto vsharp = desc.GetSharp(stage);
-            if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+            // FIX-031: a V# that ends past the GPU's 40-bit address space is not a buffer. GT
+            // Sport's dealership shader 0xae32f77f has V#s made of float constants (base and
+            // records 0x3f800000, terabytes long); clamped to guest memory they became 1 GB
+            // buffers over module code, uploading GBs until the GPU ran out of memory (and the
+            // tracking froze libc). Bind no buffer, so reads give 0 and writes are dropped.
+            // -DisablePerf 39 binds the clamped range.
+            static const bool null_impossible = Common::PerfFeatureEnabled(39);
+            constexpr u64 GpuAddressLimit = 1ULL << 40;
+            const bool impossible = null_impossible && vsharp.num_records != UINT32_MAX &&
+                                    (vsharp.GetSize() >= GpuAddressLimit ||
+                                     u64(vsharp.base_address) + vsharp.GetSize() > GpuAddressLimit);
+            if (impossible) {
+                static std::atomic<u32> logged{};
+                if (const u32 n = ++logged; n <= 20 || n % 1000 == 0) {
+                    LOG_WARNING(Render,
+                                "FIX-031: buffer {} for stage {:#x} bound empty: base={:#x}, "
+                                "stride={}, records={:#x} ends past the GPU address space",
+                                n, stage.pgm_hash, u64(vsharp.base_address), vsharp.GetStride(),
+                                vsharp.num_records);
+                }
+            }
+            if (vsharp.base_address == 0 || vsharp.GetSize() == 0 || impossible) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
