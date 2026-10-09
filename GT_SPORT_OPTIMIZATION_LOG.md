@@ -1264,3 +1264,49 @@ Lance asked (October 9) for the shader cache back on without the startup precomp
 - **Switch and diagnostics:** `-DisablePerf 47` leaves the store closed. Only the directory form
   is used (`pipeline_cache_archived` off). `PERF-032` lines report programs looked up,
   permutations listed and modules loaded instead of translated.
+
+## Race measurements of PERF-031/032, and PERF-033 (October 9, branch `perf-parallel-gpu`)
+
+Lance's runs (16:44 pipe + cache, 16:54 cache) ran races at about 24 FPS in both.
+
+### Steady race windows (more than 1,200 draws per frame, no compiles)
+
+| Run | FPS | µs per draw | Buffers, µs per draw | Uploads per frame |
+|---|---|---|---|---|
+| October 8, fast race | 45 | 8.8 | 2.2 | 24 MB |
+| October 9, both builds | 24 | 15-16 | 7.4-8.2 | 127-134 MB |
+
+- Upload volume decides race FPS. Across all runs since October 7 it ranges from 1 to 155 MB
+  per frame with the same code, depending on the race, and FPS follows it.
+- In today's races: about 14 upload epochs per frame of about 9.5 MB each.
+- CPU write faults are only about 50 per second, so nearly all of it is PERF-012 hot pages
+  uploaded again whole in every epoch.
+
+### Draw pipe in the race
+
+- The recorder was 70-99% busy.
+- The command thread spent 1.3-2.0 s of every 2 s waiting at WAIT_REG_MEM: 3,000-9,000 drains
+  per 2 s. Those waits are on fence labels that the recorder writes later, so almost every one
+  found them unmet and drained.
+
+### PERF-031 follow-up: recorder-side waits
+
+- A fence or WRITE_DATA job queued to the recorder notes its address and value until it runs.
+- A WAIT_REG_MEM that such a pending value satisfies becomes an in-order recorder job:
+  - it waits as the command thread did (PERF-014's pending-deferred-fence check, then a flush
+    and polling until the scheduler's completion thread writes the label);
+  - decoding goes on instead of draining.
+- Waits on anything else still drain.
+
+### PERF-033 (perf id 48): unchanged hot pages are not uploaded again
+
+- Each hot page gets a generation that changes every time it becomes hot. Leaving the hot set,
+  which a GPU write causes, voids earlier records.
+- After an upload, the hash of the uploaded bytes is kept.
+- A hot page is left out of an upload when it is in the same generation and its bytes hash the
+  same.
+- Hashes are taken before and after the copy, and a page written during the copy gets no record.
+  Pages partly kept from guest bytes (PERF-011/015) are always uploaded.
+- XXH3 of 4 KB pages runs at 45-49 GB/s here, about 3 ms per frame for a 10 MB hot set
+  checked 14 times. The upload path costs about 13 ms per frame for 130 MB.
+- A 2 s `PERF-033 hot pages` line reports pages not uploaded and the MB saved.

@@ -40,6 +40,10 @@ public:
         cpu_addr = new_cpu_addr;
     }
 
+    VAddr GetCpuAddr() const {
+        return cpu_addr;
+    }
+
     static constexpr Bounds GetBounds(u64 offset, u64 size) {
         const u64 end_address = offset + size - 1;
         return Bounds{
@@ -192,6 +196,17 @@ public:
         ChangeRegionState<StateOp::Set, StateOp::None>(offset, size);
     }
 
+    /// PERF-033: calls func(page offset, hot generation) for each hot page in the range.
+    void ForEachHotPage(u64 offset, u64 size, auto&& func) {
+        std::scoped_lock lk{mutex};
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            for (u64 bits = hot[index] & mask; bits != 0; bits &= bits - 1) {
+                const u64 page = index * PAGES_PER_WORD + std::countr_zero(bits);
+                func(page * BYTES_PER_PAGE, hot_generation[page]);
+            }
+        });
+    }
+
     /// FIX-017: true when a page of the range is a PERF-012 hot page.
     bool IsRegionHot(u64 offset, u64 size) {
         std::scoped_lock lk{mutex};
@@ -209,6 +224,10 @@ public:
             if (hot_pages_enabled && write_faults[page] < HotPageFaults &&
                 ++write_faults[page] == HotPageFaults) {
                 hot[page / PAGES_PER_WORD] |= 1ULL << (page % PAGES_PER_WORD);
+                // PERF-033: a new stay in the hot set; earlier upload records are void.
+                if (++hot_generation[page] == 0) {
+                    hot_generation[page] = 1;
+                }
             }
         }
     }
@@ -367,6 +386,8 @@ private:
     RegionBits uploaded{};
     u32 uploaded_epoch{};
     std::array<u8, NUM_REGION_PAGES> write_faults{};
+    // PERF-033: changes each time a page becomes hot.
+    std::array<u16, NUM_REGION_PAGES> hot_generation{};
 
     void RefreshUploadEpoch() {
         const u32 epoch = g_upload_epoch.load(std::memory_order_acquire);

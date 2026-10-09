@@ -377,6 +377,15 @@ void BufferCache::LogHotPageStats() {
                 stats.cpu_overwrote.exchange(0), stats.new_pages, hot_page_order.size(),
                 stats.recorded, stats.recorded_bytes / 1024, stats.completed.exchange(0),
                 stats.invalidated.exchange(0), top);
+    // PERF-033: hot-page uploads avoided because the bytes had not changed.
+    const u64 unchanged = hot_pages_unchanged.exchange(0);
+    const u64 uploaded = hot_pages_uploaded.exchange(0);
+    if (unchanged + uploaded != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-033 hot pages in 2.0 s: {} unchanged and not uploaded ({} MB), {} "
+                    "uploaded",
+                    unchanged, unchanged * BYTES_PER_PAGE >> 20, uploaded);
+    }
     stats.page_only_faults = 0;
     stats.drain_reports = 0;
     stats.split_faults = 0;
@@ -931,7 +940,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         std::ranges::sort(gds_pending);
     }
-    memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
+    const auto upload_range = [&](u64 addr, u64 size) {
         // PERF-011: bytes the GPU wrote and guest memory does not have yet stay as they are in
         // the arena; uploading the stale guest copy would overwrite them.
         if (split_write_faults && gpu_modified_ranges.Intersects(addr, size)) {
@@ -960,7 +969,64 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         if (cursor < addr + size) {
             add_upload(cursor, addr + size);
         }
+    };
+    // PERF-033: hot pages whose bytes match what their last upload copied are left out. The
+    // ranges are collected first; hot pages are looked up without the region lock held.
+    static const bool skip_unchanged_hot_pages = Common::PerfFeatureEnabled(48);
+    struct HotUpload {
+        VAddr page;
+        u16 generation;
+        u64 hash;
+    };
+    boost::container::small_vector<HotUpload, 16> hot_uploads;
+    boost::container::small_vector<std::pair<VAddr, u64>, 8> ranges;
+    memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
+        if (skip_unchanged_hot_pages) {
+            ranges.emplace_back(addr, size);
+        } else {
+            upload_range(addr, size);
+        }
     });
+    const auto whole_page_from_guest = [&](VAddr page) {
+        if (split_write_faults && gpu_modified_ranges.Intersects(page, BYTES_PER_PAGE)) {
+            return false;
+        }
+        return std::ranges::none_of(gds_pending, [&](const auto& gds) {
+            return gds.first < page + BYTES_PER_PAGE && page < gds.second;
+        });
+    };
+    for (const auto& [addr, range_size] : ranges) {
+        boost::container::small_vector<std::pair<VAddr, u16>, 16> hot;
+        memory_tracker->ForEachHotPage(addr, range_size, [&](VAddr page, u16 generation) {
+            if (page >= addr && page + BYTES_PER_PAGE <= addr + range_size) {
+                hot.emplace_back(page, generation);
+            }
+        });
+        VAddr cursor = addr;
+        for (const auto& [page, generation] : hot) {
+            const u64 hash = XXH3_64bits(std::bit_cast<const void*>(page), BYTES_PER_PAGE);
+            bool unchanged;
+            {
+                std::scoped_lock lk{uploaded_pages_mutex};
+                unchanged = uploaded_page_contents.Unchanged(page, generation, hash);
+            }
+            if (unchanged) {
+                if (page > cursor) {
+                    upload_range(cursor, page - cursor);
+                }
+                cursor = page + BYTES_PER_PAGE;
+                ++hot_pages_unchanged;
+            } else if (whole_page_from_guest(page)) {
+                hot_uploads.push_back({page, generation, hash});
+            } else {
+                std::scoped_lock lk{uploaded_pages_mutex};
+                uploaded_page_contents.Forget(page);
+            }
+        }
+        if (cursor < addr + range_size) {
+            upload_range(cursor, addr + range_size - cursor);
+        }
+    }
     if (!copies.empty()) {
         for (const auto& copy : copies) {
             RecordWatchedUploads(copy.dstOffset, copy.dstOffset + copy.size);
@@ -1001,6 +1067,15 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         staging.Flush();
         runtime.CopyBuffer(staging.buffer, arena, copies);
+    }
+    if (!hot_uploads.empty()) {
+        // A page the CPU wrote while it was copied gets no record and is uploaded next time.
+        std::scoped_lock lk{uploaded_pages_mutex};
+        for (const auto& upload : hot_uploads) {
+            const u64 after = XXH3_64bits(std::bit_cast<const void*>(upload.page), BYTES_PER_PAGE);
+            uploaded_page_contents.Record(upload.page, upload.generation, upload.hash, after);
+        }
+        hot_pages_uploaded += hot_uploads.size();
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeMetadata(arena, device_addr, size);

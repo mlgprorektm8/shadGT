@@ -22,6 +22,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/uploaded_pages.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
@@ -240,6 +241,11 @@ private:
         std::atomic<u32> completed{};
         std::atomic<u32> invalidated{};
     } hot_page_stats;
+    // PERF-033: hot pages whose bytes match their last upload are not uploaded again.
+    UploadedPageContents uploaded_page_contents;
+    std::mutex uploaded_pages_mutex;
+    std::atomic<u64> hot_pages_unchanged{};
+    std::atomic<u64> hot_pages_uploaded{};
     std::atomic<u32> num_tracked_async_readbacks{};
 
     struct ArenaBinds {

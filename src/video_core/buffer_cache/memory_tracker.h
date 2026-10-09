@@ -64,6 +64,16 @@ public:
         });
     }
 
+    /// PERF-033: calls func(page address, hot generation) for each PERF-012 hot page.
+    void ForEachHotPage(VAddr cpu_addr, u64 size, auto&& func) noexcept {
+        IteratePages(cpu_addr, size, [&func](RegionManager* manager, u64 offset, u64 size) {
+            const VAddr base = manager->GetCpuAddr();
+            manager->ForEachHotPage(offset, size, [&](u64 page_offset, u16 generation) {
+                func(base + page_offset, generation);
+            });
+        });
+    }
+
     /// FIX-017: true when the region has a PERF-012 hot page.
     bool IsRegionHot(VAddr cpu_addr, u64 size) noexcept {
         return IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
