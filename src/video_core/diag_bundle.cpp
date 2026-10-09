@@ -77,13 +77,35 @@ std::optional<Request> ParseTrigger(std::string_view trigger, std::string reason
 
 void Arm(Request request) {
     std::scoped_lock lk{armed_mutex};
-    LOG_WARNING(Render_Vulkan, "DIAG-BUNDLE: armed '{}' (trigger {}, {} frames)", request.reason,
-                static_cast<u32>(request.trigger), request.frames);
+    LOG_WARNING(Render_Vulkan, "DIAG-BUNDLE: armed '{}' (trigger {}, {} frames, skip {})",
+                request.reason, static_cast<u32>(request.trigger), request.frames, request.skip);
     armed = std::move(request);
     has_armed = true;
 }
 
+// SHADGT_BUNDLE_TRIGGER arms a bundle at startup without the IPC/MCP controller, for runs
+// started by hand: "target=WxH" or "shader=0xHASH", with SHADGT_BUNDLE_SKIP (episodes to let
+// pass) and SHADGT_BUNDLE_FRAMES. Needs SHADGT_DIAG=1 for shader code in the bundle.
+static void ArmFromEnvironment() {
+    const char* trigger = std::getenv("SHADGT_BUNDLE_TRIGGER");
+    if (!trigger || !*trigger) {
+        return;
+    }
+    const char* frames = std::getenv("SHADGT_BUNDLE_FRAMES");
+    const char* skip = std::getenv("SHADGT_BUNDLE_SKIP");
+    auto request = ParseTrigger(trigger, fmt::format("env-{}", trigger),
+                                frames && *frames ? std::atoi(frames) : 2);
+    if (!request) {
+        LOG_ERROR(Render_Vulkan, "DIAG-BUNDLE: SHADGT_BUNDLE_TRIGGER '{}' not understood", trigger);
+        return;
+    }
+    request->skip = skip && *skip ? static_cast<u32>(std::atoi(skip)) : 0;
+    Arm(std::move(*request));
+}
+
 std::optional<Request> Armed() {
+    static std::once_flag from_environment;
+    std::call_once(from_environment, ArmFromEnvironment);
     if (!has_armed.load(std::memory_order_relaxed)) {
         return std::nullopt;
     }

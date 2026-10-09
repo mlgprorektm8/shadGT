@@ -208,6 +208,20 @@ void Rasterizer::RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 c
                            ref.height == armed->height;
                 });
             }
+            if (fire && armed->skip) {
+                // Count matching episodes: draws to the trigger within 120 frames of the last
+                // match belong to the same one (one thumbnail render spans several frames).
+                static u32 last_match_frame = ~0u;
+                static u32 episodes = 0;
+                const u32 frame = DebugState.GetFrameNum();
+                if (last_match_frame == ~0u || frame - last_match_frame > 120) {
+                    ++episodes;
+                    LOG_WARNING(Render_Vulkan, "DIAG-BUNDLE: '{}' matched at frame {} (episode {})",
+                                armed->reason, frame, episodes);
+                }
+                last_match_frame = frame;
+                fire = episodes > armed->skip;
+            }
             if (fire) {
                 VideoCore::DiagBundle::Disarm();
                 DiagStart(*armed);

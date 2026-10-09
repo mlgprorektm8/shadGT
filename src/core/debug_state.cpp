@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <imgui.h>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/native_clock.h"
@@ -87,13 +88,15 @@ std::string DebugStateImpl::DescribeGuestThreads() {
         }
         CONTEXT ctx{};
         ctx.ContextFlags = CONTEXT_FULL;
-        std::array<u64, 64> stack{};
+        // Guest frames sit below the host wrappers (semaphores, condition variables), so read
+        // enough of the stack to reach the game's own callers.
+        std::vector<u64> stack(4096);
         SIZE_T stack_read = 0;
         const bool suspended = SuspendThread(handle) != DWORD(-1);
         const bool got = suspended && GetThreadContext(handle, &ctx);
         if (got) {
             ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(ctx.Rsp), stack.data(),
-                              sizeof(stack), &stack_read);
+                              stack.size() * sizeof(u64), &stack_read);
         }
         if (suspended) {
             ::ResumeThread(handle);
@@ -104,15 +107,19 @@ std::string DebugStateImpl::DescribeGuestThreads() {
         }
         out +=
             fmt::format("\n  thread {} ({}): RIP {:#x} {}", name, id, ctx.Rip, describe(ctx.Rip));
-        u32 frames = 0;
-        for (size_t i = 0; i < stack_read / sizeof(u64) && frames < 8; ++i) {
+        u32 host_frames = 0;
+        u32 guest_frames = 0;
+        for (size_t i = 0; i < stack_read / sizeof(u64) && guest_frames < 16; ++i) {
             if (stack[i] < 0x10000) {
                 continue;
             }
             const auto text = describe(stack[i]);
-            if (text.starts_with("host ") || text.find(" Code ") != std::string::npos) {
+            const bool host = text.starts_with("host ");
+            const bool guest = !host && text.find(" Code ") != std::string::npos;
+            if ((host && host_frames < 8) || guest) {
                 out += fmt::format(" | [rsp+{:#x}] {:#x} {}", i * 8, stack[i], text);
-                ++frames;
+                host_frames += host ? 1 : 0;
+                guest_frames += guest ? 1 : 0;
             }
         }
     }

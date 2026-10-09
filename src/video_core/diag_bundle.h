@@ -35,6 +35,9 @@ struct Request {
     /// Frames recorded after the trigger; image snapshots are taken at each frame boundary, so
     /// with 2 the second frame's draws have their images both before and after them.
     u32 frames{2};
+    /// Target/shader triggers: matching episodes to let pass before capturing (an episode ends
+    /// after 120 frames without a match), e.g. 1 to capture the second car thumbnail.
+    u32 skip{};
 };
 
 /// SHADGT_DIAG=1: keep each shader's guest code and SPIR-V so bundles can include them.
