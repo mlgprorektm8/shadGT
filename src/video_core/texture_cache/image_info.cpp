@@ -194,10 +194,6 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
         return -1;
     }
 
-    if (info.array_mode != array_mode) {
-        return -1;
-    }
-
     // Currently we expect only one level to be copied.
     if (resources.levels != 1) {
         return -1;
@@ -223,6 +219,25 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
 
     if (mip < 0) {
         return -1;
+    }
+
+    // FIX-039: a macro-tiled image stores its mips that are smaller than a macro tile
+    // micro-tiled (ComputeImageSize marks them in micro_tiled_mips), and the game programs a
+    // render target for such a mip with the 1D tile mode of the same micro tile mode. GT Sport
+    // renders the mip chains of its environment maps that way (2048x1024 B10G11R11: mips 1-4
+    // with tile index 14, mips 5-11 with tile index 13); requiring equal array modes made mips
+    // 5-11 separate images, so sampling the map at those levels read zeros (the black car in
+    // the purchase thumbnail).
+    if (info.array_mode != array_mode) {
+        const bool micro_tiled_mip = (info.micro_tiled_mips >> mip) & 1;
+        const bool same_micro_tiling =
+            !AmdGpu::IsMacroTiled(array_mode) &&
+            AmdGpu::GetMicroTileThickness(array_mode) ==
+                std::min(AmdGpu::GetMicroTileThickness(info.array_mode), 4u) &&
+            AmdGpu::GetMicroTileMode(tile_mode) == AmdGpu::GetMicroTileMode(info.tile_mode);
+        if (!micro_tiled_mip || !same_micro_tiling) {
+            return -1;
+        }
     }
 
     // 2D block dimensions of both images should be the same.

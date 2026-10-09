@@ -85,6 +85,17 @@ target_link_libraries(shadps4_image_aliasing_test PRIVATE
     GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
 gtest_discover_tests(shadps4_image_aliasing_test)
 
+add_executable(shadps4_image_mips_test test_image_mips.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/texture_cache/image_info.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/texture_cache/host_compatibility.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/tiling.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp)
+target_include_directories(shadps4_image_mips_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_image_mips_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_image_mips_test PRIVATE
+    GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers magic_enum::magic_enum)
+gtest_discover_tests(shadps4_image_mips_test)
+
 add_executable(shadps4_image_barriers_test test_image_barriers.cpp)
 target_include_directories(shadps4_image_barriers_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_image_barriers_test PRIVATE cxx_std_23)
