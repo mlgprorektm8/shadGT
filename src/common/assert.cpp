@@ -3,6 +3,7 @@
 
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/recoverable.h"
 #include "core/signals.h"
 #include "emulator.h"
 
@@ -14,7 +15,18 @@
 #error "Missing Crash() implementation for target CPU architecture."
 #endif
 
+namespace Common {
+int& RecoverableDepth() {
+    static thread_local int depth = 0;
+    return depth;
+}
+} // namespace Common
+
 void assert_fail_impl() {
+    if (Common::RecoverableDepth() > 0) {
+        // The failed check is already logged; the RecoverableScope's owner handles it.
+        throw Common::RecoverableFailure("assertion failed (see the log line above)");
+    }
     Core::Signals::Instance()->RemoveHandlers();
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     Crash();

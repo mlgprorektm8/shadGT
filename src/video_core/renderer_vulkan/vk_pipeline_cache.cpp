@@ -16,6 +16,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
+#include "common/recoverable.h"
 #include "common/singleton.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -1051,6 +1052,7 @@ bool PipelineCache::RefreshGraphicsStages() {
     }
 
     Shader::Backend::Bindings binding{};
+    bool stage_failed = false;
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
@@ -1070,6 +1072,9 @@ bool PipelineCache::RefreshGraphicsStages() {
         const auto params = AmdGpu::GetParams(*pgm);
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
+        if (!modules[stage_out_idx]) {
+            stage_failed = true; // FIX-034: the shader could not be translated
+        }
         return true;
     };
 
@@ -1149,6 +1154,9 @@ bool PipelineCache::RefreshGraphicsStages() {
         LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
         return false;
     }
+    if (stage_failed) {
+        return false;
+    }
 
     const auto* vs_info = infos[static_cast<u32>(SwStage::Vertex)];
     if (vs_info && fetch_shader && !instance.IsVertexInputDynamicState()) {
@@ -1184,7 +1192,7 @@ bool PipelineCache::RefreshComputeKey() {
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
     std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
-    return true;
+    return modules[0] != nullptr; // FIX-034: false when the shader could not be translated
 }
 
 } // namespace Vulkan
@@ -1205,8 +1213,21 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     Shader::Optimization::g_diag_compiling_code = code;
     Shader::Optimization::g_diag_compiling_hash = info.pgm_hash;
     const auto translate_start = std::chrono::steady_clock::now();
-    const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
-    auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    std::vector<u32> spv;
+    try {
+        // FIX-034: a shader the translator cannot handle no longer stops the emulator. Its
+        // draws are skipped and it is reported once, so one run lists every such shader.
+        Common::RecoverableScope recoverable;
+        const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+        spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    } catch (const Common::RecoverableFailure& e) {
+        LOG_ERROR(Render_Vulkan,
+                  "SHADER-FAIL: {} shader {:#x} (permutation {}, {} dwords) could not be "
+                  "translated: {}; draws that use it are skipped",
+                  info.hw_stage, info.pgm_hash, perm_idx, code.size(), e.what());
+        DumpFailedShader(code, info.pgm_hash, info.hw_stage);
+        return {};
+    }
     const auto translate_end = std::chrono::steady_clock::now();
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
@@ -1238,6 +1259,20 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
                                  patch ? *patch : std::span<const u32>{}, is_patched);
     }
     return module;
+}
+
+void PipelineCache::DumpFailedShader(std::span<const u32> code, u64 hash, Shader::HwStage stage) {
+    // FIX-034: the guest code of a shader that could not be translated, raw and as a listing,
+    // in the log folder (once per program), so it can be studied and tested offline.
+    if (!failed_shaders.insert(hash).second) {
+        return;
+    }
+    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "failed_shaders";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const auto name = fmt::format("{}_{:#x}", stage, hash);
+    Common::FS::IOFile{dir / (name + ".bin"), Common::FS::FileAccessMode::Create}.WriteSpan(code);
+    std::ofstream{dir / (name + ".txt")} << Shader::ListGcnCode(code);
 }
 
 bool IsWatchedShader(u64 hash) {
