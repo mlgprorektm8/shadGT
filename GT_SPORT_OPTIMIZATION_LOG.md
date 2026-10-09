@@ -1098,3 +1098,68 @@ first time a draw needs it.
 Kept: the driver pipeline cache (`<serial>.vkpipelinecache`, loaded at start and saved
 during play and on exit), the read-ahead builds (PERF-019 to 023) and the shader cache's
 serialization code.
+
+## Car thumbnail BREAK! (October 9, branch `diag-rework`)
+
+### Finding: a shader-compile stall loses the thumbnail script's only wait
+
+`THUMBNAIL.ADC` calls `iconShotImage`, sleeps 0.1 s (`Thread::Sleep`, measured with
+`sceKernelGetProcessTimeCounter` / `Frequency`), then asks `checkTickEntry` whether the shot is
+pending. The request only becomes pending at the game loop's next scene update, and the game loop
+runs three frames ahead of the flips. When the GPU thread stalls for 100 ms or more right then,
+the check sees nothing pending. `waitTickEntry` returns at once and the mask commands go out
+before the colour capture, so the PNG is about 4 KB and the debug build shows BREAK!.
+
+On a PS4, where shaders are precompiled, 0.1 s is about six game-loop updates. All 9 bad thumbnails
+on October 9 have a 583–4900 ms frame 5–7 frames after the 800x450 render starts. That stall is
+mostly about 127 shaders translated again as new permutations (only translation counted; the
+time base itself is correct). The good one (13:06) has no frame of 100 ms or more there.
+
+### FIX-043 (perf id 44): permutations keyed only on what translation read
+
+The resource patching pass records, per translated shader:
+- which buffers' strides entered an address (indexed, thread-id or swizzled addressing);
+- which images' sRGB format decided a forced degamma (the only use of `is_srgb`).
+
+`StageSpecialization` then:
+- leaves the other strides and sRGB flags out of the key;
+- records the V# translation saw for an unbound buffer instead of zeros;
+- adds thread-id addressing and coherence (mtype 3), which the code reads but the key missed.
+
+Shaders loaded from storage carry no usage flags and keep the full key. An in-session diagnostic
+counts new permutations whose SPIR-V repeats an existing one.
+
+Offline check against the October 6–9 shader store (58,707 permutations): 8,237 repeat another
+permutation's SPIR-V, and 100 pairs differ only in sRGB without a degamma sampler, all identical.
+For the 127 shaders of the thumbnail stall, 178 of their 924 stored permutations would have
+matched an older one. The in-session repeats are not measurable offline (the store is no longer
+written), so the new log line measures them in the next run.
+
+### FIX-044 (perf id 45): guest clocks held while the GPU thread compiles
+
+These stand still while the GPU command thread translates a shader, builds a pipeline or waits
+for a pipeline build:
+- `sceKernelReadTsc`, `sceKernelGetProcessTimeCounter` and `sceKernelGetProcessTime`;
+- the monotonic and uptime `clock_gettime` clocks;
+- the vblank count, vblank events and flips.
+
+Real time is unchanged (`gettimeofday`, REALTIME, the network clock), and so are host waits
+(`usleep`, `nanosleep`, timed condition waits, equeue timeouts).
+
+Replaying the logged stalls through the held clock: 8 of the 9 bad thumbnails fall to 28–91 ms in
+the critical window and the good one stays good. The 13:08 one still has a 102 ms frame. That
+frame comes right after its 4.9 s compile and is spent waiting for the host GPU, which is not held.
+
+Risks checked:
+- The SDL/OpenAL audio backends paced the host device with `sceKernelGetProcessTime`. They now
+  pace with host time (`GetHostProcessTime`); the output time the game reads stays guest time.
+- AvPlayer runs on host time, so a movie keeps playing through a hold, as before. Its video and
+  audio stay together.
+- Guest threads that sleep in host time and then read a held clock see no time pass. That is
+  harmless for polling loops, but code dividing by elapsed time would see zero.
+- `DisablePerf 45` restores the old clocks.
+
+The shader database was disabled at Lance's request (precompile removal above), so every session
+translates every permutation again, including ones an earlier session already built for the same
+car. Re-enabling it (on demand, without the startup precompile) would remove those. That is
+Lance's decision.

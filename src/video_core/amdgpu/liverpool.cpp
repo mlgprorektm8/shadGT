@@ -12,6 +12,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/guest_clock.h"
 #include "common/perf_monitor.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -269,6 +270,7 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadGT:GpuCommandProcessor");
+    Common::GuestClock::MarkGpuCommandThread(); // FIX-044
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();

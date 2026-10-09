@@ -75,6 +75,9 @@ u64 PS4_SYSV_ABI sceKernelGetProcessTime();
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter();
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency();
 u64 PS4_SYSV_ABI sceKernelReadTsc();
+/// Host process time in microseconds, which keeps running while the guest clocks are held
+/// (FIX-044); for emulator pacing against host devices, not for values the game reads.
+u64 GetHostProcessTime();
 s32 PS4_SYSV_ABI sceKernelClockGettime(u32 clock_id, OrbisKernelTimespec* tp);
 s32 PS4_SYSV_ABI sceKernelGettimezone(OrbisKernelTimezone* tz);
 s32 PS4_SYSV_ABI sceKernelConvertLocaltimeToUtc(time_t param_1, int64_t param_2, time_t* seconds,

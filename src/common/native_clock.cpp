@@ -25,6 +25,14 @@ u64 NativeClock::GetTimeMS(u64 base_ptc /*= 0*/) const {
     return MultiplyHigh(GetUptime() - base_ptc, ms_rdtsc_factor);
 }
 
+u64 NativeClock::TicksToNS(u64 ticks) const {
+    return MultiplyHigh(ticks, ns_rdtsc_factor);
+}
+
+u64 NativeClock::TicksToUS(u64 ticks) const {
+    return MultiplyHigh(ticks, us_rdtsc_factor);
+}
+
 u64 NativeClock::GetUptime() const {
     return FencedRDTSC();
 }

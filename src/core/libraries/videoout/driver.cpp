@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/guest_clock.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -409,6 +410,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
+            timer.End();
+            continue;
+        }
+        if (Common::GuestClock::IsPaused()) {
+            // FIX-044: no vblank passes while the guest clocks are held for a shader or
+            // pipeline compile, as no time passes for the game.
             timer.End();
             continue;
         }

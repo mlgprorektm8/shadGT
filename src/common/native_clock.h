@@ -20,6 +20,9 @@ public:
     u64 GetTimeUS(u64 base_ptc = 0) const;
     u64 GetTimeMS(u64 base_ptc = 0) const;
     u64 GetUptime() const;
+    /// Converts a span of TSC ticks.
+    u64 TicksToNS(u64 ticks) const;
+    u64 TicksToUS(u64 ticks) const;
 
 private:
     u64 rdtsc_frequency;

@@ -310,7 +310,7 @@ static void ResetObjectSpatialLocked(Port& port, ObjectState& obj) {
 }
 
 static void SpatialUpdateVolumeLocked(Port& port) {
-    const u64 now = Kernel::sceKernelGetProcessTime();
+    const u64 now = Kernel::GetHostProcessTime();
     if (now - port.last_volume_check_us < SPATIAL_VOLUME_CHECK_INTERVAL_US) {
         return;
     }
