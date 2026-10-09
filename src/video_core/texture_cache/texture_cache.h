@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include <mutex>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
@@ -377,6 +378,9 @@ private:
 public:
     /// True when GPU-written images are waiting to be read back to guest memory.
     bool HasPendingReadbacks();
+    /// DIAG-043: writes the first mip and layer of an image as raw bytes (waits for the GPU).
+    void DumpImage(ImageId image_id, const std::filesystem::path& path);
+
     /// FIX-032: a read-back image of 64 KB or more (GT Sport's car thumbnail) is waiting.
     bool HasLargePendingReadbacks();
     bool ReadbackLinearImages() const {

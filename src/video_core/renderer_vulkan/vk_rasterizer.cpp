@@ -329,22 +329,24 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 
-    // DIAG-041: draws into GT Sport's car thumbnail (448x126 linear targets): the shaders and
-    // every image they touch, to find where the car's colour is lost.
+    // DIAG-041: draws into GT Sport's car thumbnail (448x126 linear targets) and into the watched
+    // images of its chain: the shaders, every image and buffer they touch, and empty bindings.
+    // DIAG-043: kept in memory and written out (with image dumps) when the thumbnail is drawn.
+    bool dump_thumbnail_chain = false;
     {
-        static u32 traced = 0;
         bool thumbnail = false;
+        bool watched = false;
         for (u32 cb = 0; cb < std::bit_width(pipeline->GetGraphicsKey().mrt_mask); ++cb) {
             const auto image_id = cb_descs[cb].image_id;
             if (image_id) {
                 const auto& info = texture_cache.GetImage(image_id).info;
-                thumbnail |= (info.size.width == 448 && info.size.height == 126 &&
-                              !info.props.is_tiled) ||
-                             VideoCore::IsWatchedImageAddress(info.guest_address, info.guest_size);
+                thumbnail |=
+                    info.size.width == 448 && info.size.height == 126 && !info.props.is_tiled;
+                watched |= VideoCore::IsWatchedImageAddress(info.guest_address, info.guest_size);
             }
         }
-        if (thumbnail && traced < 600) {
-            ++traced;
+        if (thumbnail || watched) {
+            static u64 records = 0;
             std::string images;
             for (const auto image_id : bound_images) {
                 const auto& image = texture_cache.GetImage(image_id);
@@ -358,9 +360,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             for (u32 cb = 0; cb < std::bit_width(pipeline->GetGraphicsKey().mrt_mask); ++cb) {
                 if (const auto image_id = cb_descs[cb].image_id) {
                     const auto& image = texture_cache.GetImage(image_id);
-                    images += fmt::format(" | rt{} {} {:#x} {}", cb, image_id.index,
-                                          image.info.guest_address,
-                                          vk::to_string(image.info.pixel_format));
+                    images += fmt::format(" | rt{} {} {:#x} {}x{} {} mask {:#x}", cb,
+                                          image_id.index, image.info.guest_address,
+                                          image.info.size.width, image.info.size.height,
+                                          vk::to_string(image.info.pixel_format),
+                                          regs.color_target_mask.GetMask(cb));
                 }
             }
             for (const auto& bound : bound_buffers) {
@@ -369,23 +373,63 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                                           bound.size, bound.is_written ? " w" : "");
                 }
             }
+            images += diag_empty_bindings;
             images += fmt::format(" | {} {}", is_indexed ? "indexed" : "draw", regs.num_indices);
-            for (const auto* info : pipeline->GetStages()) {
-                if (info) {
-                    images += fmt::format(" | stage {:#x} declares {} buffers {} images",
-                                          info->pgm_hash, info->buffers.size(), info->images.size());
-                }
-            }
             const auto hash = [&](Shader::SwStage stage) -> u64 {
                 const auto* info = pipeline->GetStages()[u32(stage)];
                 return info ? info->pgm_hash : 0;
             };
-            LOG_WARNING(Render_Vulkan, "DIAG-041: thumbnail draw {} vs {:#x} fs {:#x}{}", traced,
-                        hash(Shader::SwStage::Vertex), hash(Shader::SwStage::Fragment), images);
+            VideoCore::PushDiagRecord(fmt::format(
+                "DIAG-041: {} draw {} vs {:#x} fs {:#x}{}", thumbnail ? "thumbnail" : "watched",
+                ++records, hash(Shader::SwStage::Vertex), hash(Shader::SwStage::Fragment), images));
+            if (thumbnail) {
+                VideoCore::FlushDiagRecords(400);
+                // DIAG-043: once per thumbnail source picture, the pictures of the whole chain.
+                static u64 dumped_version = ~0ULL;
+                for (const auto image_id : bound_images) {
+                    const auto& image = texture_cache.GetImage(image_id);
+                    if (!image.binding.is_target && image.contents_version != dumped_version) {
+                        dumped_version = image.contents_version;
+                        dump_thumbnail_chain = true;
+                        break;
+                    }
+                }
+            }
         }
     }
 
     ResetBindings(false);
+
+    if (dump_thumbnail_chain) {
+        static u32 dumps = 0;
+        if (dumps < 3) {
+            ++dumps;
+            const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+            std::vector<VideoCore::ImageId> seen;
+            for (const VAddr base : VideoCore::WatchedImageWindows()) {
+                texture_cache.ForEachImageInRegion(
+                    base, VideoCore::WatchedImageWindowSize,
+                    [&](VideoCore::ImageId id, VideoCore::Image&) {
+                        if (std::ranges::find(seen, id) == seen.end()) {
+                            seen.push_back(id);
+                        }
+                    });
+            }
+            u32 index = 0;
+            for (const auto id : seen) {
+                const auto& image = texture_cache.GetImage(id);
+                const auto path =
+                    dir / fmt::format("chain{}_{:02}_{:#x}_{}x{}_{}_ver{}.bin", dumps, index++,
+                                      image.info.guest_address, image.info.size.width,
+                                      image.info.size.height,
+                                      vk::to_string(image.info.pixel_format),
+                                      image.contents_version);
+                texture_cache.DumpImage(id, path);
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-043: dumped {} images of the thumbnail chain to {}",
+                        index, dir.string());
+        }
+    }
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -1119,6 +1163,7 @@ void Rasterizer::ResetBindings(bool is_compute) {
     }
     bound_images.clear();
     bound_buffers.clear();
+    diag_empty_bindings.clear();
     needs_barrier = false;
 }
 
@@ -1422,6 +1467,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
             }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0 || impossible) {
+                // DIAG-041: empty buffer bindings of the draw.
+                diag_empty_bindings += fmt::format(
+                    " | EMPTY buf {} of {:#x}: base={:#x} stride={} records={:#x}",
+                    buffer_infos.size(), stage.pgm_hash, u64(vsharp.base_address),
+                    vsharp.GetStride(), vsharp.num_records);
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
@@ -1811,6 +1861,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         auto& [image_id, desc] = image_bindings[i];
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
+            diag_empty_bindings += fmt::format(" | EMPTY img {} of {:#x}", i, stage.pgm_hash);
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);

@@ -6,6 +6,8 @@
 #include <mutex>
 #include <optional>
 #include <source_location>
+#include <span>
+#include <string>
 
 #include "common/enum.h"
 #include "common/incremental_id.h"
@@ -109,6 +111,14 @@ struct Image;
 /// car thumbnail source by default; SHADGT_WATCH_IMAGE=<hex address> picks another).
 bool IsWatchedImageAddress(VAddr address, u64 size);
 void NoteWatchedImageModification(const Image& image, std::source_location loc);
+/// The watched address windows (DIAG-043 dumps the images in them).
+std::span<const VAddr> WatchedImageWindows();
+constexpr u64 WatchedImageWindowSize = 2_MB;
+
+/// DIAG-043: recent records of watched images, kept in memory and written to the log when the car
+/// thumbnail is drawn, so the log shows the history that led to it without flooding.
+void PushDiagRecord(std::string record);
+void FlushDiagRecords(u32 then_live);
 
 struct Image : public Common::LRUNode<> {
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,

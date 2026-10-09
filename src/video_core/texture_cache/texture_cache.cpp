@@ -88,6 +88,39 @@ void TextureCache::ProcessDownloadImages() {
     ReleaseFinishedReadbacks();
 }
 
+void TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path) {
+    Image& image = slot_images[image_id];
+    const u32 bytes_per_texel = image.info.num_bits / 8;
+    if (image.info.props.is_depth || image.info.props.is_block || bytes_per_texel == 0) {
+        return;
+    }
+    const u32 width = image.info.size.width;
+    const u32 height = image.info.size.height;
+    const u32 size = width * height * bytes_per_texel;
+    const auto download = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16);
+    const vk::BufferImageCopy copy = {
+        .bufferOffset = download.offset,
+        .bufferRowLength = width,
+        .bufferImageHeight = height,
+        .imageSubresource =
+            {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {width, height, 1},
+    };
+    runtime.DownloadImage(&image, download.buffer, std::span{&copy, 1});
+    scheduler.Finish();
+    download.Invalidate();
+    if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
+        std::fwrite(download.mapped, 1, size, file);
+        std::fclose(file);
+    }
+}
+
 bool TextureCache::HasLargePendingReadbacks() {
     std::unique_lock lk{download_images_mutex};
     return std::ranges::any_of(download_images, [this](ImageId id) {

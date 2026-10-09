@@ -228,6 +228,8 @@ private:
     };
     boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+    /// DIAG-041: buffers and images of the current draw that were bound empty.
+    std::string diag_empty_bindings;
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
