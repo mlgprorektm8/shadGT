@@ -611,7 +611,16 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     // (14-18 FPS vs 20-35), as did deferring compute-queue fences for image readbacks
     // (PERF-009 v1). Compute-queue fences are only deferred to keep an address's order.
     buffer_cache.RecordHotPageReadbacks();
-    const bool readbacks_pending = !compute_queue && texture_cache.HasPendingReadbacks();
+    // FIX-032: GT Sport's car thumbnail is drawn in passes (a silhouette, then the car) and
+    // read by the CPU after a compute-queue fence. Signaled before the later passes were read
+    // back, the CPU encoded the silhouette and the game stopped with "BREAK!
+    // thumbnail_functions.ad:473". Compute-queue fences wait for large image readbacks too
+    // (they are rare, unlike the small ones PERF-009 v1 slowed races with).
+    // -DisablePerf 40 signals them right away.
+    static const bool wait_large = Common::PerfFeatureEnabled(40);
+    const bool readbacks_pending =
+        compute_queue ? wait_large && texture_cache.HasLargePendingReadbacks()
+                      : texture_cache.HasPendingReadbacks();
     bool address_pending;
     {
         std::scoped_lock lk{deferred_fences_mutex};

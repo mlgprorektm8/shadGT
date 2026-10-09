@@ -88,6 +88,14 @@ void TextureCache::ProcessDownloadImages() {
     ReleaseFinishedReadbacks();
 }
 
+bool TextureCache::HasLargePendingReadbacks() {
+    std::unique_lock lk{download_images_mutex};
+    return std::ranges::any_of(download_images, [this](ImageId id) {
+        const auto& info = slot_images[id].info;
+        return info.pitch * info.size.height * (info.num_bits / 8) >= 64_KB;
+    });
+}
+
 bool TextureCache::HasPendingReadbacks() {
     std::unique_lock lk{download_images_mutex};
     return !download_images.empty();
@@ -1021,7 +1029,11 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
         static constexpr u32 NoData = 0;
         Core::MemoryManager::NoteEmulatorWrite(image.info.guest_address, 0, &NoData);
         std::unique_lock lk{download_images_mutex};
-        download_images.emplace(image_id);
+        if (download_images.emplace(image_id).second && ImageDownloadSize(image) >= 64_KB) {
+            // DIAG-038: each time a large read-back target is drawn into again.
+            LOG_WARNING(Render_Vulkan, "DIAG-038: image {} at {:#x} drawn, readback queued",
+                        image_id.index, image.info.guest_address);
+        }
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);

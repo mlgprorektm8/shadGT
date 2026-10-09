@@ -377,6 +377,8 @@ private:
 public:
     /// True when GPU-written images are waiting to be read back to guest memory.
     bool HasPendingReadbacks();
+    /// FIX-032: a read-back image of 64 KB or more (GT Sport's car thumbnail) is waiting.
+    bool HasLargePendingReadbacks();
     bool ReadbackLinearImages() const {
         return readback_linear_images;
     }
