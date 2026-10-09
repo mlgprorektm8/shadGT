@@ -212,6 +212,53 @@ public:
         return virtual_addr + size < max_gpu_address;
     }
 
+    /// FIX-027: whether the address is inside a mapped area (not free or only reserved).
+    bool IsMappedAddress(VAddr virtual_addr) {
+        if (vma_map.empty() || virtual_addr < vma_map.begin()->first) {
+            return false;
+        }
+        const auto& vma = FindVMA(virtual_addr)->second;
+        return vma.Contains(virtual_addr, 1) && vma.IsMapped();
+    }
+
+    /// FIX-028: calls func(address, size, executable) for each part of the range, split where
+    /// the guest's CPU execute permission changes. Lock-free like IsValidMapping.
+    template <typename Func>
+    void ForEachExecRange(VAddr virtual_addr, u64 size, Func&& func) {
+        const VAddr end = virtual_addr + size;
+        VAddr run_start = virtual_addr;
+        bool run_exec = false;
+        bool have_run = false;
+        auto it = vma_map.empty() || virtual_addr < vma_map.begin()->first
+                      ? vma_map.begin()
+                      : FindVMA(virtual_addr);
+        for (VAddr addr = virtual_addr; addr < end;) {
+            bool exec = false;
+            VAddr next = end;
+            if (it != vma_map.end() && it->second.base <= addr) {
+                const auto& vma = it->second;
+                exec = vma.IsMapped() && True(vma.prot & MemoryProt::CpuExec);
+                next = std::min<VAddr>(end, vma.base + vma.size);
+                ++it;
+            } else if (it != vma_map.end()) {
+                next = std::min<VAddr>(end, it->second.base);
+            }
+            if (next <= addr) {
+                next = end;
+            }
+            if (have_run && exec != run_exec) {
+                func(run_start, addr - run_start, run_exec);
+                run_start = addr;
+            }
+            run_exec = exec;
+            have_run = true;
+            addr = next;
+        }
+        if (have_run) {
+            func(run_start, end - run_start, run_exec);
+        }
+    }
+
     bool IsValidMapping(const VAddr virtual_addr, const u64 size = 0) {
         const auto end_it = std::prev(vma_map.end());
         const VAddr end_addr = end_it->first + end_it->second.size;

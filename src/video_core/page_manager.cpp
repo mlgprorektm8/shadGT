@@ -432,7 +432,30 @@ struct SignalImpl : public PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
-        impl.Protect(address, size, perms);
+        // FIX-028: keep the execute permission of guest code. A GPU buffer over module code
+        // (GT Sport's dealership bound one over libc) turned its pages non-executable; every
+        // instruction fetch then faulted as a "read" of GPU-mapped memory, was reported handled,
+        // and the game threads looped on the fault forever (the dealership freeze). On x86 an
+        // executable page stays readable, so only CPU writes to code are tracked there.
+        // -DisablePerf 37 protects without it.
+        static const bool keep_exec = Common::PerfFeatureEnabled(37);
+        if (!keep_exec) {
+            impl.Protect(address, size, perms);
+            return;
+        }
+        memory->ForEachExecRange(address, size, [&](VAddr start, u64 length, bool exec) {
+            if (exec) {
+                static std::atomic<u32> logged{};
+                if (logged++ < 10) {
+                    LOG_WARNING(Render,
+                                "FIX-028: GPU tracking of guest code at {:#x}+{:#x} keeps it "
+                                "executable",
+                                start, length);
+                }
+            }
+            impl.Protect(start, length,
+                         exec ? perms | Core::MemoryPermission::Execute : perms);
+        });
     }
 
     /// PERF-011b: bytes written by the faulting instruction when they are known exactly: one

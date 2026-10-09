@@ -1097,7 +1097,8 @@ bool PipelineCache::RefreshGraphicsStages() {
                 address == checked[stage]) {
                 continue;
             }
-            if (!Core::Memory::Instance()->IsValidMapping(address, 8)) {
+            auto* memory = Core::Memory::Instance();
+            if (!memory->IsValidMapping(address, 8) || !memory->IsMappedAddress(address)) {
                 static std::atomic<u32> skipped{};
                 if (const u32 n = ++skipped; n <= 20 || n % 500 == 0) {
                     LOG_WARNING(Render_Vulkan,
