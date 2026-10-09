@@ -338,11 +338,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             const auto image_id = cb_descs[cb].image_id;
             if (image_id) {
                 const auto& info = texture_cache.GetImage(image_id).info;
-                thumbnail |= info.size.width == 448 && info.size.height == 126 &&
-                             !info.props.is_tiled;
+                thumbnail |= (info.size.width == 448 && info.size.height == 126 &&
+                              !info.props.is_tiled) ||
+                             VideoCore::IsWatchedImageAddress(info.guest_address, info.guest_size);
             }
         }
-        if (thumbnail && traced < 300) {
+        if (thumbnail && traced < 600) {
             ++traced;
             std::string images;
             for (const auto image_id : bound_images) {
@@ -360,6 +361,19 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     images += fmt::format(" | rt{} {} {:#x} {}", cb, image_id.index,
                                           image.info.guest_address,
                                           vk::to_string(image.info.pixel_format));
+                }
+            }
+            for (const auto& bound : bound_buffers) {
+                if (bound.guest_address != 0) {
+                    images += fmt::format(" | buf {:#x}+{:#x}{}", bound.guest_address,
+                                          bound.size, bound.is_written ? " w" : "");
+                }
+            }
+            images += fmt::format(" | {} {}", is_indexed ? "indexed" : "draw", regs.num_indices);
+            for (const auto* info : pipeline->GetStages()) {
+                if (info) {
+                    images += fmt::format(" | stage {:#x} declares {} buffers {} images",
+                                          info->pgm_hash, info->buffers.size(), info->images.size());
                 }
             }
             const auto hash = [&](Shader::SwStage stage) -> u64 {

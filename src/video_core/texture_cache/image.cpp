@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -18,6 +22,35 @@ using namespace Vulkan;
 
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
 Common::IncrementalIdProvider<u64> Image::global_contents_version{};
+
+static VAddr WatchedImageBase() {
+    static const VAddr base = [] {
+        const char* env = std::getenv("SHADGT_WATCH_IMAGE");
+        return env && *env ? VAddr(std::stoull(env, nullptr, 16)) : VAddr(0x1027800000);
+    }();
+    return base;
+}
+
+bool IsWatchedImageAddress(VAddr address, u64 size) {
+    constexpr u64 WindowSize = 1_MB;
+    const VAddr base = WatchedImageBase();
+    return address < base + WindowSize && base < address + size;
+}
+
+void NoteWatchedImageModification(const Image& image, std::source_location loc) {
+    static std::atomic<u32> logged{};
+    if (logged++ >= 400) {
+        return;
+    }
+    std::string_view file = loc.file_name();
+    if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+        file.remove_prefix(slash + 1);
+    }
+    LOG_WARNING(Render_Vulkan, "DIAG-042: image at {:#x} {}x{} {} {} modified to ver {} by {}:{}",
+                image.info.guest_address, image.info.size.width, image.info.size.height,
+                vk::to_string(image.info.pixel_format), AmdGpu::NameOf(image.info.tile_mode),
+                image.contents_version, file, loc.line());
+}
 
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
                                            const ImageInfo& info) {

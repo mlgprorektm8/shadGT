@@ -5,6 +5,7 @@
 
 #include <mutex>
 #include <optional>
+#include <source_location>
 
 #include "common/enum.h"
 #include "common/incremental_id.h"
@@ -102,6 +103,13 @@ public:
     vk::DeviceSize size_bytes{};
 };
 
+struct Image;
+
+/// DIAG-042: an address window whose image modifications are logged with their caller (GT Sport's
+/// car thumbnail source by default; SHADGT_WATCH_IMAGE=<hex address> picks another).
+bool IsWatchedImageAddress(VAddr address, u64 size);
+void NoteWatchedImageModification(const Image& image, std::source_location loc);
+
 struct Image : public Common::LRUNode<> {
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
                    Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
@@ -129,12 +137,16 @@ struct Image : public Common::LRUNode<> {
         return True(flags & ImageFlagBits::GpuModified) && False(flags & ImageFlagBits::Dirty);
     }
 
-    void MarkModified() {
+    void MarkModified(std::source_location loc = std::source_location::current()) {
         contents_version = global_contents_version.Next();
+        if (IsWatchedImageAddress(info.guest_address, info.guest_size)) {
+            NoteWatchedImageModification(*this, loc);
+        }
     }
 
-    void MarkGpuModified(ImageFlagBits modified = ImageFlagBits::GpuModified) {
-        MarkModified();
+    void MarkGpuModified(ImageFlagBits modified = ImageFlagBits::GpuModified,
+                         std::source_location loc = std::source_location::current()) {
+        MarkModified(loc);
         flags = ImageFlagsAfterGpuWrite(flags, modified);
     }
 
