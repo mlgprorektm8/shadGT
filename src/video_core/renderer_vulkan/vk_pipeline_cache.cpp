@@ -30,6 +30,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/spirv_check.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -423,6 +424,20 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     };
     CreateDriverCache();
     LoadElseScopeFixed();
+    // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
+    // a program's stored translations are read when a draw first uses it, and new translations
+    // are stored. -DisablePerf 47 leaves the store closed.
+    if (EmulatorSettings.IsPipelineCacheEnabled() && Common::PerfFeatureEnabled(47)) {
+        if (EmulatorSettings.IsPipelineCacheArchived()) {
+            LOG_WARNING(Render_Vulkan, "PERF-032: the shader store is not used with an archived "
+                                       "pipeline cache (pipeline_cache_archived)");
+        } else {
+            Storage::DataBase::Instance().Open();
+            use_stored_shaders = true;
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-032: shader translations are loaded from the store on first use");
+        }
+    }
 }
 
 PipelineCache::~PipelineCache() {
@@ -1277,6 +1292,87 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
+void PipelineCache::ListStoredPermutations(u64 pgm_hash, Program& program) {
+    // Each permutation is stored as <perm hash>.meta (key and shader info) and
+    // <program hash>_<index>.spv; indices are dense from 0 (PERF-013 numbers runtime ones after
+    // the stored ones), so the listing stops after a run of missing indices.
+    static u64 programs = 0;
+    static u64 listed = 0;
+    static u64 stale = 0;
+    auto& store = Storage::DataBase::Instance();
+    u32 missing = 0;
+    for (size_t perm_idx = 0; perm_idx < 512 && missing < 8; ++perm_idx) {
+        const auto name = fmt::format("{:#018x}", HashCombine(pgm_hash, perm_idx));
+        if (!store.Exists(Storage::BlobType::ShaderMeta, name)) {
+            ++missing;
+            continue;
+        }
+        missing = 0;
+        std::vector<u8> blob;
+        store.Load(Storage::BlobType::ShaderMeta, name, blob);
+        auto info = std::make_unique<Shader::Info>();
+        Shader::StageSpecialization spec{};
+        spec.info = info.get();
+        size_t stored_idx{};
+        Serialization::Archive ar{std::move(blob)};
+        // Entries of another format version, cut short, or for another program are skipped.
+        bool valid = false;
+        try {
+            Common::RecoverableScope recoverable;
+            valid = ar.SizeBytes() >= 24 && LoadShaderMeta(ar, *info, spec, stored_idx);
+        } catch (const Common::RecoverableFailure&) {
+            valid = false;
+        }
+        if (!valid || stored_idx != perm_idx || info->pgm_hash != pgm_hash) {
+            ++stale;
+            continue;
+        }
+        auto& end = stored_perm_end[pgm_hash];
+        end = std::max(end, perm_idx + 1);
+        // FIX-018/020: translated before a translator fix this program needs.
+        if (const auto fixed = else_scope_fixed.find(pgm_hash);
+            fixed != else_scope_fixed.end() && perm_idx < fixed->second.boundary) {
+            continue;
+        }
+        if (!store.Exists(Storage::BlobType::ShaderBinary,
+                          fmt::format("{:#018x}_{}", pgm_hash, perm_idx))) {
+            continue;
+        }
+        program.InsertPermut({}, std::move(spec), std::move(info), perm_idx);
+        program.modules[perm_idx].stored = true;
+        ++listed;
+    }
+    if (++programs % 500 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-032: shader store: {} programs looked up, {} stored permutations "
+                    "listed, {} entries of another version skipped",
+                    programs, listed, stale);
+    }
+}
+
+vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx) {
+    static u64 loaded = 0;
+    std::vector<u32> spv;
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
+                                       fmt::format("{:#018x}_{}", pgm_hash, perm_idx), spv);
+    if (!IsCompleteSpirv(spv)) {
+        static u32 reports = 0;
+        if (reports++ < 20) {
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-032: stored shader {:#x} permutation {} is incomplete; translating "
+                        "it again",
+                        pgm_hash, perm_idx);
+        }
+        return {};
+    }
+    if (++loaded % 500 == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-032: {} shader modules loaded from the store instead of translated",
+                    loaded);
+    }
+    return CompileSPV(spv, instance.GetDevice());
+}
+
 void PipelineCache::DumpFailedShader(std::span<const u32> code, u64 hash, Shader::HwStage stage) {
     // FIX-034: the guest code of a shader that could not be translated, raw and as a listing,
     // in the log folder (once per program), so it can be studied and tested offline.
@@ -1350,6 +1446,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>();
+        if (use_stored_shaders) {
+            ListStoredPermutations(params.hash, *it_pgm.value());
+        }
     }
     // FIX-018: stored permutations of a program with an else after an empty if were translated
     // with the else running for every invocation. Translate those programs again, once; the new
@@ -1419,6 +1518,15 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                     fmt::format(" {}:{}[{}]", perm_idx, reason ? reason : "none", index);
             }
             continue;
+        }
+        if (permutation.stored) {
+            // PERF-032: a stored translation matched; its SPIR-V is read now.
+            permutation.stored = false;
+            permutation.module = LoadStoredModule(params.hash, perm_idx);
+            if (!permutation.module) {
+                permutation.info.reset();
+                continue;
+            }
         }
         if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
             RecoverAttributeFlags(info, permutation.spec, params, runtime_info, perm_idx);

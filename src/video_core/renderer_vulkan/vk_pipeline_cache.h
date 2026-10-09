@@ -160,6 +160,11 @@ private:
     std::filesystem::path else_scope_fixed_path;
     void LoadElseScopeFixed();
     void SaveElseScopeFixed() const;
+    /// PERF-032: stored translations are loaded when their program is first used (no startup
+    /// precompile), and new ones are stored.
+    bool use_stored_shaders{};
+    void ListStoredPermutations(u64 pgm_hash, Program& program);
+    vk::ShaderModule LoadStoredModule(u64 pgm_hash, size_t perm_idx);
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};

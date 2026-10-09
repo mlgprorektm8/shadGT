@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "common/serdes.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -17,5 +18,7 @@ void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
+bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
+                    Shader::StageSpecialization& spec, size_t& perm_idx);
 
 } // namespace Vulkan

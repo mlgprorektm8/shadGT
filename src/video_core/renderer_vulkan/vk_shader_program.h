@@ -19,6 +19,8 @@ struct Program {
         std::unique_ptr<Shader::Info> info;
         /// FIX-043 diagnostic: hash of the SPIR-V, to count permutations that repeat another.
         u64 spv_hash{};
+        /// PERF-032: listed from the shader store; its module is loaded the first time it matches.
+        bool stored{};
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;

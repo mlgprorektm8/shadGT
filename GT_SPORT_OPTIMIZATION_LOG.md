@@ -1242,3 +1242,25 @@ Its two-stage pipeline gained 18-19% there. The design is borrowed; the code is 
 - bbport reported a heap-corruption crash with its pipe enabled (open there).
 - Diagnostics that read the command thread's history from the recorder (DIAG-009/010 const-dump
   and command-buffer lookups) can be inaccurate while pipelined.
+
+## PERF-032: shader store used again, without the startup precompile (October 9, branch `shader-cache`)
+
+Lance asked (October 9) for the shader cache back on without the startup precompile he had removed.
+
+- **Loading on demand:** the store (`user/cache/CUSA03220`) is opened when the pipeline cache
+  starts, and nothing else happens at startup. The first time a draw uses a program, its stored
+  permutations are listed from their `.meta` files at their original indices; stale versions and
+  ones translated before a needed FIX-018/020 fix are skipped. A listed permutation's SPIR-V is
+  read and its module created only when a draw matches its key.
+- **Storing:** new translations are stored as before (`.meta`, `.spv`, pipeline `.key`).
+- **Meta version 16:** adds FIX-043's resource usage after the shader info. Without it a stored
+  permutation, whose key leaves unused strides and sRGB flags out, would never match the key
+  rebuilt from the loaded shader. Versions 14 and 15 still load as translations of unknown usage,
+  keyed on every property, as they were stored.
+- **Damaged files:** stored SPIR-V must be whole (magic, instruction word counts ending exactly
+  at the end, OpFunctionEnd last). A cut-short `.meta` is read under FIX-034's recoverable scope.
+  Either kind is translated again instead. All 58,707 stored modules of October 9 pass; their
+  metas are versions 14 (13,447) and 15 (45,260).
+- **Switch and diagnostics:** `-DisablePerf 47` leaves the store closed. Only the directory form
+  is used (`pipeline_cache_archived` off). `PERF-032` lines report programs looked up,
+  permutations listed and modules loaded instead of translated.

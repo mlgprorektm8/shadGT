@@ -3,6 +3,8 @@
 
 #include <cstdlib>
 #include <gtest/gtest.h>
+#include "video_core/renderer_vulkan/shader_usage_serde.h"
+#include "video_core/renderer_vulkan/spirv_check.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
 namespace {
@@ -261,6 +263,82 @@ TEST(ShaderSpecialization, SrgbFormatSplitsPermutationsOnlyWhenItDecidesADegamma
     const auto degamma = KeyFor(info);
     Bind(info.images[0], srgb);
     EXPECT_FALSE(degamma == KeyFor(info));
+}
+
+TEST(ShaderStore, ReloadedTranslationMatchesItsStoredKeyOnlyWithItsResourceUsage) {
+    // PERF-032: a translation stored with FIX-043's narrower key, loaded in a later session.
+    auto translated = TranslatedFragmentWithBuffer(true);
+    Bind(translated.buffers[0], BoundBuffer(16));
+    const auto stored_key = KeyFor(translated);
+
+    Serialization::Archive ar;
+    Serialization::Writer out{ar};
+    Vulkan::WriteResourceUsage(out, translated);
+    auto bytes = ar.TakeOff();
+
+    auto loaded = TranslatedFragmentWithBuffer(false);
+    Serialization::Archive in_ar{std::vector<u8>{bytes}};
+    Serialization::Reader in{in_ar};
+    Vulkan::ReadResourceUsage(in, loaded);
+    EXPECT_TRUE(loaded.resource_usage_known);
+    // A draw binding the same buffer with another stride reuses the stored translation.
+    Bind(loaded.buffers[0], BoundBuffer(48));
+    EXPECT_TRUE(stored_key == KeyFor(loaded));
+
+    // Without the usage (meta versions before 16) the rebuilt key keeps the stride and the
+    // stored narrower key could never match.
+    auto old_format = TranslatedFragmentWithBuffer(false);
+    Bind(old_format.buffers[0], BoundBuffer(48));
+    EXPECT_FALSE(stored_key == KeyFor(old_format));
+}
+
+TEST(ShaderStore, ResourceUsageRoundTripsEveryBufferAndImageFlag) {
+    Shader::Info info;
+    info.resource_usage_known = true;
+    info.buffer_stride_used.set(0).set(17).set(Shader::NUM_BUFFERS - 1);
+    info.image_srgb_used.set(3).set(Shader::NUM_IMAGES - 1);
+    Serialization::Archive ar;
+    Serialization::Writer out{ar};
+    Vulkan::WriteResourceUsage(out, info);
+    Serialization::Archive in_ar{ar.TakeOff()};
+    Serialization::Reader in{in_ar};
+    Shader::Info loaded;
+    Vulkan::ReadResourceUsage(in, loaded);
+    EXPECT_EQ(loaded.resource_usage_known, true);
+    EXPECT_EQ(loaded.buffer_stride_used, info.buffer_stride_used);
+    EXPECT_EQ(loaded.image_srgb_used, info.image_srgb_used);
+}
+
+TEST(ShaderStore, AcceptsOnlyWholeSpirvModules) {
+    // Header, OpCapability Shader, OpFunction / OpLabel / OpReturn / OpFunctionEnd.
+    const std::vector<u32> module{0x07230203,
+                                  0x00010600,
+                                  0,
+                                  16,
+                                  0,
+                                  (2u << 16) | 17,
+                                  1,
+                                  (5u << 16) | 54,
+                                  1,
+                                  2,
+                                  0,
+                                  3,
+                                  (2u << 16) | 248,
+                                  4,
+                                  (1u << 16) | 253,
+                                  (1u << 16) | 56};
+    EXPECT_TRUE(Vulkan::IsCompleteSpirv(module));
+    // Cut short inside an instruction, or at an instruction boundary before the function ends.
+    EXPECT_FALSE(Vulkan::IsCompleteSpirv(std::span{module}.first(module.size() - 3)));
+    EXPECT_FALSE(Vulkan::IsCompleteSpirv(std::span{module}.first(module.size() - 1)));
+    EXPECT_FALSE(Vulkan::IsCompleteSpirv(std::span{module}.first(10)));
+    auto not_spirv = module;
+    not_spirv[0] = 0;
+    EXPECT_FALSE(Vulkan::IsCompleteSpirv(not_spirv));
+    auto zero_count = module;
+    zero_count[5] = 17;
+    EXPECT_FALSE(Vulkan::IsCompleteSpirv(zero_count));
+    EXPECT_FALSE(Vulkan::IsCompleteSpirv({}));
 }
 
 // These focused header tests do not initialize the emulator's logging or fatal-error backend.
