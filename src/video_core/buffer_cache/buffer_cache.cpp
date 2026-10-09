@@ -1089,7 +1089,7 @@ std::string BufferCache::DescribeRange(VAddr address, u64 size) {
     for (VAddr page = Common::AlignDown(address, WatchedPageSize);
          page < address + std::min(size, Limit); page += WatchedPageSize) {
         ++pages;
-        if (memory->ClampRangeSize(page, WatchedPageSize) < WatchedPageSize) {
+        if (!memory->IsValidMapping(page, WatchedPageSize) || !memory->IsMappedAddress(page)) {
             ++unmapped;
             continue;
         }
@@ -1152,7 +1152,10 @@ void BufferCache::RefreshReadPages(VAddr address, u64 size, u64 shader_hash, boo
     }
     for (VAddr page = Common::AlignDown(address, WatchedPageSize); page < address + size;
          page += WatchedPageSize) {
-        if (memory->ClampRangeSize(page, WatchedPageSize) < WatchedPageSize ||
+        // FIX-038: ClampRangeSize does not look up mappings below 1 GB, and IsValidMapping
+        // accepts free areas, so an unmapped page (a buffer of the dealership shader's garbage
+        // V#s) was hashed and faulted.
+        if (!memory->IsValidMapping(page, WatchedPageSize) || !memory->IsMappedAddress(page) ||
             memory_tracker->IsRegionGpuModified(page, WatchedPageSize)) {
             continue;
         }
