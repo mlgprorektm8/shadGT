@@ -11,6 +11,7 @@
 #include <SDL3/SDL.h>
 
 #include "common/logging/log.h"
+#include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/system/userservice.h"
@@ -62,7 +63,10 @@ GameController::GameController() : m_states_queue(64) {}
 
 State GameController::ReadState() {
     std::lock_guard lock{m_state_mutex};
-    return m_state;
+    ExpireInjectionLocked();
+    State state = m_state;
+    ApplyInjectionLocked(state);
+    return state;
 }
 
 int GameController::ReadStates(State* states, int states_num) {
@@ -70,6 +74,7 @@ int GameController::ReadStates(State* states, int states_num) {
     if (states_num <= 0) {
         return 0;
     }
+    ExpireInjectionLocked();
 
     if (!m_state.connected) {
         states[0] = m_state;
@@ -80,6 +85,7 @@ int GameController::ReadStates(State* states, int states_num) {
         // Retained history can make a later multi-sample read return up to 64 stale reports, so
         // mixed single- and multi-sample reads require dedicated tests.
         states[0] = m_state;
+        ApplyInjectionLocked(states[0]);
         return 1;
     }
 
@@ -89,9 +95,52 @@ int GameController::ReadStates(State* states, int states_num) {
         if (!state) {
             break;
         }
+        ApplyInjectionLocked(*state);
         states[read_count++] = std::move(*state);
     }
     return read_count;
+}
+
+void GameController::Inject(u32 buttons, const std::array<s32, 6>& axes, u32 hold_frames) {
+    std::lock_guard lock{m_state_mutex};
+    m_injection.active = hold_frames > 0;
+    m_injection.buttons = buttons;
+    for (size_t i = 0; i < axes.size(); ++i) {
+        m_injection.axes[i] = std::clamp(axes[i], 0, 255);
+    }
+    m_injection.until_frame = DebugState.GetFrameNum() + hold_frames;
+    // Queue a sample so multi-sample readers see the change (and the release when cleared).
+    PushStateLocked();
+}
+
+void GameController::ExpireInjectionLocked() {
+    if (m_injection.active &&
+        static_cast<s32>(DebugState.GetFrameNum() - m_injection.until_frame) >= 0) {
+        m_injection.active = false;
+        PushStateLocked();
+    }
+}
+
+void GameController::ApplyInjectionLocked(State& state) const {
+    if (!m_injection.active) {
+        return;
+    }
+    using Libraries::Pad::OrbisPadButtonDataOffset;
+    state.buttonsState |= static_cast<OrbisPadButtonDataOffset>(m_injection.buttons);
+    for (size_t i = 0; i < 4; ++i) {
+        if (m_injection.axes[i] != 128) {
+            state.axes[i] = m_injection.axes[i];
+        }
+    }
+    for (size_t i = 4; i < 6; ++i) {
+        state.axes[i] = std::max(state.axes[i], m_injection.axes[i]);
+    }
+    if (state.axes[std::to_underlying(Axis::TriggerLeft)] > 0) {
+        state.buttonsState |= OrbisPadButtonDataOffset::L2;
+    }
+    if (state.axes[std::to_underlying(Axis::TriggerRight)] > 0) {
+        state.buttonsState |= OrbisPadButtonDataOffset::R2;
+    }
 }
 
 void GameController::Button(OrbisPadButtonDataOffset button, bool is_pressed) {

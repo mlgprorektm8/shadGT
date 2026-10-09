@@ -6,7 +6,9 @@
 #include "core/emulator_settings.h"
 #include "video_core/renderdoc.h"
 
+#include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <renderdoc_app.h>
 
 #ifdef _WIN32
@@ -27,6 +29,8 @@ enum class CaptureState {
 static CaptureState capture_state{CaptureState::Idle};
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
+static std::mutex requested_screenshot_paths_mutex;
+static std::vector<std::filesystem::path> requested_screenshot_paths;
 
 RENDERDOC_API_1_6_0* rdoc_api{};
 
@@ -145,6 +149,24 @@ void RequestScreenshot(const ScreenshotRequest request) {
     default:
         break;
     }
+}
+
+void RequestScreenshotToPath(const std::filesystem::path& path) {
+    {
+        std::scoped_lock lock{requested_screenshot_paths_mutex};
+        requested_screenshot_paths.push_back(path);
+    }
+    RequestScreenshot(ScreenshotRequest::GameOnly);
+}
+
+std::vector<std::filesystem::path> TakeRequestedScreenshotPaths(const u32 max_count) {
+    std::scoped_lock lock{requested_screenshot_paths_mutex};
+    const auto count = std::min<size_t>(max_count, requested_screenshot_paths.size());
+    std::vector<std::filesystem::path> paths(requested_screenshot_paths.begin(),
+                                             requested_screenshot_paths.begin() + count);
+    requested_screenshot_paths.erase(requested_screenshot_paths.begin(),
+                                     requested_screenshot_paths.begin() + count);
+    return paths;
 }
 
 u32 ConsumeGameOnlyScreenshotRequests() {

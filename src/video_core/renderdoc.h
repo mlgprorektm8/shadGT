@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 #include "common/types.h"
 
 namespace VideoCore {
@@ -40,6 +41,12 @@ struct ScreenshotRequests {
 
 /// Queues an in-emulator screenshot request to be consumed by the presenter.
 void RequestScreenshot(ScreenshotRequest request);
+
+/// Queues a "game only" screenshot written to the given path (used by IPC SCREENSHOT).
+void RequestScreenshotToPath(const std::filesystem::path& path);
+
+/// Takes up to max_count paths queued by RequestScreenshotToPath, oldest first.
+std::vector<std::filesystem::path> TakeRequestedScreenshotPaths(u32 max_count);
 
 /// Atomically consumes and returns pending "game only" screenshot request counter.
 u32 ConsumeGameOnlyScreenshotRequests();
