@@ -1386,6 +1386,26 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 static std::atomic<u32> logged{};
                 if (const u32 n = ++logged; n <= 20 || n % 1000 == 0) {
                     const auto source = sharp_source();
+                    // Diagnostic runs: the memory around where the V# was read, to tell a
+                    // wrong descriptor address from reused memory.
+                    if (VideoCore::DiagBundle::Enabled()) {
+                        const auto& fetch = desc.sharp_fetch;
+                        const u32 off = u32(fetch.offsets[0]);
+                        if (off < stage.flattened_ud_src.size() && stage.flattened_ud_src[off]) {
+                            const VAddr src = stage.flattened_ud_src[off];
+                            const VAddr start = (src & ~VAddr(3)) - 64;
+                            if (memory->IsValidMapping(start, 128) &&
+                                memory->IsMappedAddress(start)) {
+                                std::string window;
+                                for (u32 i = 0; i < 32; ++i) {
+                                    window += fmt::format(
+                                        " {:08x}", *std::bit_cast<const u32*>(start + i * 4));
+                                }
+                                LOG_WARNING(Render, "DIAG-039 window {:#x} (V# at +0x40):{}", start,
+                                            window);
+                            }
+                        }
+                    }
                     LOG_WARNING(Render,
                                 "FIX-031: buffer {} (binding {}) for stage {:#x} bound empty: "
                                 "base={:#x}, stride={}, records={:#x} ends past the GPU address "

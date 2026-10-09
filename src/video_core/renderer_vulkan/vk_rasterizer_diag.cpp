@@ -49,6 +49,9 @@ struct DiagDrawRecord {
     };
     boost::container::small_vector<BufferRef, 4> buffers;
     std::string empty;
+    /// While a bundle is captured: each stage's user data registers and the dwords loaded
+    /// through them (the shader's flattened user data), as hex.
+    std::string user_data;
 };
 
 std::mutex g_history_mutex;
@@ -107,6 +110,9 @@ nlohmann::json RecordJson(const DiagDrawRecord& record) {
                            {"buffers", buffers}};
     if (!record.empty.empty()) {
         line["empty_bindings"] = record.empty;
+    }
+    if (!record.user_data.empty()) {
+        line["user_data"] = record.user_data;
     }
     return line;
 }
@@ -172,6 +178,22 @@ void Rasterizer::RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 c
         }
     }
     record.empty = diag_empty_bindings;
+    if (diag_capture) {
+        for (const auto* info : pipeline->GetStages()) {
+            if (!info) {
+                continue;
+            }
+            record.user_data += fmt::format("{}{}:", record.user_data.empty() ? "" : " ",
+                                            StageNames[static_cast<u32>(info->sw_stage)]);
+            for (const u32 dword : info->user_data) {
+                record.user_data += fmt::format(" {:08x}", dword);
+            }
+            record.user_data += " |";
+            for (const u32 dword : info->flattened_ud_buf) {
+                record.user_data += fmt::format(" {:08x}", dword);
+            }
+        }
+    }
 
     // A bundle armed on a target size or a shader starts at the draw that matches it.
     if (!diag_capture) {
