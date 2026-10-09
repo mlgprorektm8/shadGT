@@ -20,6 +20,7 @@
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
@@ -1081,6 +1082,34 @@ bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = Regs();
     auto& key = graphics_key;
     fetch_shader = nullptr;
+
+    // FIX-027: a shader program register pointing outside guest memory (GT Sport's dealership had
+    // a pixel shader at 0x100) crashed the emulator reading the program. Skip such a draw, like
+    // the GPU would fault on it rather than take the system down. Checked again only when an
+    // address changes. -DisablePerf 36 reads it anyway.
+    static const bool check_programs = Common::PerfFeatureEnabled(36);
+    if (check_programs) {
+        static std::array<VAddr, 6> checked{};
+        for (u32 stage = 0; stage < checked.size(); ++stage) {
+            const auto* pgm = regs.ProgramForStage(stage);
+            const VAddr address = pgm ? pgm->Address<VAddr>() : 0;
+            if (!regs.stage_enable.IsStageEnabled(stage) || address == 0 ||
+                address == checked[stage]) {
+                continue;
+            }
+            if (!Core::Memory::Instance()->IsValidMapping(address, 8)) {
+                static std::atomic<u32> skipped{};
+                if (const u32 n = ++skipped; n <= 20 || n % 500 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-027: draw {} skipped: hardware stage {} program at {:#x} is "
+                                "not in guest memory ({})",
+                                n, stage, address, regs_override ? "read-ahead" : "draw");
+                }
+                return false;
+            }
+            checked[stage] = address;
+        }
+    }
 
     Shader::Backend::Bindings binding{};
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
