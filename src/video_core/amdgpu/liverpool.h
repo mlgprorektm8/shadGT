@@ -41,6 +41,7 @@ struct VideoOutPort;
 namespace AmdGpu {
 
 class DrawPipe;
+struct PM4CmdWaitRegMem;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -323,6 +324,24 @@ private:
     std::vector<std::span<const u32>> live_cmd_buffers;
     std::unordered_map<std::string_view, std::pair<u64, double>> sync_reasons;
     std::chrono::steady_clock::time_point pipe_report_start{};
+
+    // PERF-031: labels that fence jobs queued to the recorder will write, so a wait on one does
+    // not drain the pipe: the recorder waits for it in order instead.
+    struct PendingLabel {
+        std::vector<u8> bytes;
+        u64 job;
+    };
+    std::mutex pending_labels_mutex;
+    std::unordered_map<VAddr, PendingLabel> pending_labels;
+    u64 label_jobs{};
+    u64 waits_moved{};
+    /// Records a job that writes `value` at `address` (a fence or WRITE_DATA).
+    void RecordLabelWrite(VAddr address, std::vector<u8> value,
+                          Common::UniqueFunction<void>&& work);
+    /// Whether a queued job will write a value that satisfies the memory wait.
+    bool PendingLabelSatisfies(const PM4CmdWaitRegMem& wait);
+    /// Runs on the recorder, in order: waits as the command thread would have.
+    void RecorderWaitRegMem(const PM4CmdWaitRegMem& wait);
 
     void StartDrawPipe();
     void ReportDrawPipe();

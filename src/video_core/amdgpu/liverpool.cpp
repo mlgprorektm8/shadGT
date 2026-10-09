@@ -345,6 +345,67 @@ void Liverpool::SyncRecorder(std::string_view reason) {
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
+void Liverpool::RecordLabelWrite(VAddr address, std::vector<u8> value,
+                                 Common::UniqueFunction<void>&& work) {
+    if (!draw_pipe || value.empty() || address == 0) {
+        Record(std::move(work));
+        return;
+    }
+    const u64 job = ++label_jobs;
+    {
+        std::scoped_lock lk{pending_labels_mutex};
+        pending_labels[address] = PendingLabel{std::move(value), job};
+    }
+    draw_pipe->Push([this, address, job, work = std::move(work)] {
+        work();
+        std::scoped_lock lk{pending_labels_mutex};
+        if (const auto it = pending_labels.find(address);
+            it != pending_labels.end() && it->second.job == job) {
+            pending_labels.erase(it);
+        }
+    });
+}
+
+bool Liverpool::PendingLabelSatisfies(const PM4CmdWaitRegMem& wait) {
+    if (!draw_pipe || wait.mem_space != PM4CmdWaitRegMem::MemSpace::Memory) {
+        return false;
+    }
+    const auto address = reinterpret_cast<VAddr>(wait.Address<u32*>());
+    std::scoped_lock lk{pending_labels_mutex};
+    for (const VAddr start : {address, address - sizeof(u32)}) {
+        const auto it = pending_labels.find(start);
+        if (it == pending_labels.end() || address + sizeof(u32) > start + it->second.bytes.size()) {
+            continue;
+        }
+        u32 value;
+        std::memcpy(&value, it->second.bytes.data() + (address - start), sizeof(u32));
+        return wait.TestValue(value);
+    }
+    return false;
+}
+
+void Liverpool::RecorderWaitRegMem(const PM4CmdWaitRegMem& wait) {
+    // The job that writes the label ran before this one. If its fence was deferred, the value
+    // reaches memory when the GPU finishes, written by the scheduler's completion thread.
+    const auto& state_regs = recorder->regs.reg_array;
+    if (wait.Test(state_regs) || SatisfiedByPendingFence(rasterizer, &wait)) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    rasterizer->FlushForDeferredFences();
+    while (!wait.Test(state_regs) && !SatisfiedByPendingFence(rasterizer, &wait)) {
+        std::this_thread::yield();
+    }
+    VideoCore::BumpUploadEpoch();
+    static u32 reports = 0;
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (ms > 100.0 && reports++ < 10) {
+        LOG_WARNING(Render, "PERF-031: the recorder waited {:.0f} ms for label {:#x}", ms,
+                    reinterpret_cast<uintptr_t>(wait.Address<u32*>()));
+    }
+}
+
 void Liverpool::VerifyRecorderRegs(const Regs& expected) {
     // SHADGT_DRAW_PIPE_VERIFY=N: a register write the command thread did not mark would leave
     // the recorder's copy stale; name the first dword that differs.
@@ -377,10 +438,12 @@ void Liverpool::ReportDrawPipe() {
     sync_reasons.clear();
     LOG_WARNING(Render,
                 "PERF-031 draw pipe in {:.1f} s: {} jobs, recorder busy {:.0f}%, max queued {}, "
-                "{} full-queue waits; drains {} ({} waited, {:.1f} ms):{}",
+                "{} full-queue waits; {} waits moved to the recorder; drains {} ({} waited, "
+                "{:.1f} ms):{}",
                 seconds, stats.pushed, stats.recorder_busy_us / (seconds * 1e4), stats.max_queued,
-                stats.push_waits, stats.drains, stats.drains_that_waited,
+                stats.push_waits, waits_moved, stats.drains, stats.drains_that_waited,
                 stats.drain_wait_us / 1000.0, reasons);
+    waits_moved = 0;
 }
 
 bool Liverpool::WritesLiveCommands(VAddr address, u64 size) const {
@@ -1168,76 +1231,83 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::EventWriteEos: {
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEos*>(header);
                 // PERF-031: fences are signaled in order behind the recorded work.
-                Record([this, event] {
-                    const auto* event_eos = &event;
-                    const bool deferred =
-                        rasterizer &&
-                        event_eos->command != PM4CmdEventWriteEos::Command::GdsStore &&
-                        rasterizer->DeferFenceSignal(
-                            event_eos->Address<VAddr>(),
-                            [event] {
-                                event.SignalFence([](void* address, u64 data, u32 num_bytes) {
-                                    WriteDeferredFence(address, &data, num_bytes);
-                                });
-                            },
-                            false,
-                            FenceValueBytes(DataSelect::Data32Low, event_eos->DataDWord(), 0));
-                    if (!deferred) {
-                        if (rasterizer) {
-                            rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEos);
+                RecordLabelWrite(
+                    event.command != PM4CmdEventWriteEos::Command::GdsStore ? event.Address<VAddr>()
+                                                                            : 0,
+                    FenceValueBytes(DataSelect::Data32Low, event.DataDWord(), 0), [this, event] {
+                        const auto* event_eos = &event;
+                        const bool deferred =
+                            rasterizer &&
+                            event_eos->command != PM4CmdEventWriteEos::Command::GdsStore &&
+                            rasterizer->DeferFenceSignal(
+                                event_eos->Address<VAddr>(),
+                                [event] {
+                                    event.SignalFence([](void* address, u64 data, u32 num_bytes) {
+                                        WriteDeferredFence(address, &data, num_bytes);
+                                    });
+                                },
+                                false,
+                                FenceValueBytes(DataSelect::Data32Low, event_eos->DataDWord(), 0));
+                        if (!deferred) {
+                            if (rasterizer) {
+                                rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEos);
+                            }
+                            event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+                                auto* memory = Core::Memory::Instance();
+                                ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                            });
                         }
-                        event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
-                            auto* memory = Core::Memory::Instance();
-                            ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                        });
-                    }
-                    if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
-                        ASSERT(event_eos->size == 1);
-                        if (rasterizer) {
-                            rasterizer->FinishForGds();
-                            const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
-                            *event_eos->Address() = value;
+                        if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
+                            ASSERT(event_eos->size == 1);
+                            if (rasterizer) {
+                                rasterizer->FinishForGds();
+                                const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
+                                *event_eos->Address() = value;
+                            }
                         }
-                    }
-                });
+                    });
                 break;
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 // PERF-031: fences are signaled in order behind the recorded work.
-                Record([this, event] {
-                    const auto* event_eop = &event;
-                    const bool deferred =
-                        rasterizer &&
-                        rasterizer->DeferFenceSignal(
-                            reinterpret_cast<VAddr>(event_eop->Address<u32>()),
-                            [event] {
-                                event.SignalFence(
-                                    [](void* address, u64 data, u32 num_bytes) {
-                                        WriteDeferredFence(address, &data, num_bytes);
-                                    },
-                                    [] {
-                                        Platform::IrqC::Instance()->Signal(
-                                            Platform::InterruptId::GfxEop);
-                                    });
-                            },
-                            false,
-                            FenceValueBytes(event_eop->data_sel.Value(), event_eop->DataDWord(),
-                                            event_eop->DataQWord()));
-                    if (!deferred) {
-                        if (rasterizer) {
-                            rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEop);
+                RecordLabelWrite(
+                    reinterpret_cast<VAddr>(event.Address<u32>()),
+                    FenceValueBytes(event.data_sel.Value(), event.DataDWord(), event.DataQWord()),
+                    [this, event] {
+                        const auto* event_eop = &event;
+                        const bool deferred =
+                            rasterizer &&
+                            rasterizer->DeferFenceSignal(
+                                reinterpret_cast<VAddr>(event_eop->Address<u32>()),
+                                [event] {
+                                    event.SignalFence(
+                                        [](void* address, u64 data, u32 num_bytes) {
+                                            WriteDeferredFence(address, &data, num_bytes);
+                                        },
+                                        [] {
+                                            Platform::IrqC::Instance()->Signal(
+                                                Platform::InterruptId::GfxEop);
+                                        });
+                                },
+                                false,
+                                FenceValueBytes(event_eop->data_sel.Value(), event_eop->DataDWord(),
+                                                event_eop->DataQWord()));
+                        if (!deferred) {
+                            if (rasterizer) {
+                                rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEop);
+                            }
+                            event_eop->SignalFence(
+                                [](void* address, u64 data, u32 num_bytes) {
+                                    auto* memory = Core::Memory::Instance();
+                                    ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                                },
+                                [] {
+                                    Platform::IrqC::Instance()->Signal(
+                                        Platform::InterruptId::GfxEop);
+                                });
                         }
-                        event_eop->SignalFence(
-                            [](void* address, u64 data, u32 num_bytes) {
-                                auto* memory = Core::Memory::Instance();
-                                ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                            },
-                            [] {
-                                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
-                            });
-                    }
-                });
+                    });
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -1304,30 +1374,34 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // writes a command buffer being decoded.
                     const bool into_commands =
                         WritesLiveCommands(reinterpret_cast<VAddr>(address), data_size);
-                    Record([this, address, data = std::move(data)]() mutable {
-                        const u32 data_size = static_cast<u32>(data.size());
-                        const std::vector<u8> value = data;
-                        const bool deferred =
-                            rasterizer &&
-                            rasterizer->DeferFenceSignal(
-                                reinterpret_cast<VAddr>(address),
-                                [address, data = std::move(data)] {
-                                    WriteDeferredFence(address, data.data(), u32(data.size()));
-                                },
-                                false, value);
-                        if (!deferred) {
-                            if (rasterizer) {
-                                rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxWriteData);
+                    std::vector<u8> label = data;
+                    RecordLabelWrite(
+                        reinterpret_cast<VAddr>(address), std::move(label),
+                        [this, address, data = std::move(data)]() mutable {
+                            const u32 data_size = static_cast<u32>(data.size());
+                            const std::vector<u8> value = data;
+                            const bool deferred =
+                                rasterizer &&
+                                rasterizer->DeferFenceSignal(
+                                    reinterpret_cast<VAddr>(address),
+                                    [address, data = std::move(data)] {
+                                        WriteDeferredFence(address, data.data(), u32(data.size()));
+                                    },
+                                    false, value);
+                            if (!deferred) {
+                                if (rasterizer) {
+                                    rasterizer->OnFence(
+                                        Vulkan::Rasterizer::DrainSource::GfxWriteData);
+                                }
+                                Core::MemoryManager::NoteEmulatorWrite(
+                                    reinterpret_cast<VAddr>(address), data_size, value.data());
+                                std::memcpy(address, value.data(), data_size);
+                                VideoCore::BumpUploadEpoch();
+                            } else {
+                                rasterizer->InlineDeferredWrite(reinterpret_cast<VAddr>(address),
+                                                                value);
                             }
-                            Core::MemoryManager::NoteEmulatorWrite(reinterpret_cast<VAddr>(address),
-                                                                   data_size, value.data());
-                            std::memcpy(address, value.data(), data_size);
-                            VideoCore::BumpUploadEpoch();
-                        } else {
-                            rasterizer->InlineDeferredWrite(reinterpret_cast<VAddr>(address),
-                                                            value);
-                        }
-                    });
+                        });
                     if (into_commands) {
                         SyncRecorder("write into commands");
                     }
@@ -1430,6 +1504,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // PERF-031: what is waited on may be written by recorded work (a fence, a copy, a
                 // flip); let the recorder finish before waiting.
                 if (!wait_reg_mem->Test(regs.reg_array)) {
+                    if (PendingLabelSatisfies(*wait_reg_mem)) {
+                        // A queued fence writes the label: the recorder waits for it in order
+                        // and decoding goes on.
+                        ++waits_moved;
+                        Record([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
+                        break;
+                    }
                     SyncRecorder("wait reg mem");
                 }
                 const bool waited = !wait_reg_mem->Test(regs.reg_array);
@@ -1953,14 +2034,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!write_data->wr_one_addr.Value()) {
                 std::vector<u8> data(data_size);
                 std::memcpy(data.data(), write_data->data, data_size);
-                Record([this, address = write_data->Address<VAddr>(), data = std::move(data)] {
-                    if (rasterizer) {
-                        rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::AscWriteData);
-                    }
-                    Core::MemoryManager::NoteEmulatorWrite(address, data.size(), data.data());
-                    std::memcpy(reinterpret_cast<void*>(address), data.data(), data.size());
-                    VideoCore::BumpUploadEpoch();
-                });
+                std::vector<u8> label = data;
+                RecordLabelWrite(
+                    write_data->Address<VAddr>(), std::move(label),
+                    [this, address = write_data->Address<VAddr>(), data = std::move(data)] {
+                        if (rasterizer) {
+                            rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::AscWriteData);
+                        }
+                        Core::MemoryManager::NoteEmulatorWrite(address, data.size(), data.data());
+                        std::memcpy(reinterpret_cast<void*>(address), data.data(), data.size());
+                        VideoCore::BumpUploadEpoch();
+                    });
             } else {
                 UNREACHABLE();
             }
@@ -1991,6 +2075,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             const auto wait_start = std::chrono::steady_clock::now();
+            if (!wait_reg_mem->Test(regs.reg_array) && PendingLabelSatisfies(*wait_reg_mem)) {
+                // PERF-031: a queued fence writes the label; the recorder waits for it in order.
+                ++waits_moved;
+                Record([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
+                break;
+            }
             // PERF-031: what is waited on may be written by recorded work; the pending-fence
             // check reads the rasterizer, which only the drained recorder lets the command use.
             const auto unmet = [&] {
@@ -2020,62 +2110,65 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             // instead of letting the CPU access drain the GPU.
             const auto pipe_id = queue.pipe_id;
             // PERF-031: signaled in order behind the recorded work.
-            Record([this, release, pipe_id] {
-                const auto* release_mem = &release;
-                const bool deferred =
-                    rasterizer && release.data_sel != DataSelect::GdsMemStore &&
-                    rasterizer->DeferFenceSignal(
-                        release.Address<VAddr>(),
-                        [release, pipe_id] {
-                            u64 value{};
-                            u32 num_bytes = sizeof(u64);
-                            switch (release.data_sel.Value()) {
-                            case DataSelect::None:
-                                num_bytes = 0;
-                                break;
-                            case DataSelect::Data32Low:
-                                value = release.DataDWord();
-                                num_bytes = sizeof(u32);
-                                break;
-                            case DataSelect::Data64:
-                                value = release.DataQWord();
-                                break;
-                            case DataSelect::GpuClock64:
-                                value = GetGpuClock64();
-                                break;
-                            case DataSelect::PerfCounter:
-                                value = GetGpuPerfCounter();
-                                break;
-                            default:
-                                UNREACHABLE();
-                            }
-                            if (num_bytes != 0) {
-                                WriteDeferredFence(release.Address<void*>(), &value, num_bytes);
-                            }
-                            if (release.int_sel != InterruptSelect::None) {
-                                Platform::IrqC::Instance()->Signal(
-                                    static_cast<Platform::InterruptId>(pipe_id));
-                            }
+            RecordLabelWrite(
+                release.data_sel != DataSelect::GdsMemStore ? release.Address<VAddr>() : 0,
+                FenceValueBytes(release.data_sel.Value(), release.DataDWord(), release.DataQWord()),
+                [this, release, pipe_id] {
+                    const auto* release_mem = &release;
+                    const bool deferred =
+                        rasterizer && release.data_sel != DataSelect::GdsMemStore &&
+                        rasterizer->DeferFenceSignal(
+                            release.Address<VAddr>(),
+                            [release, pipe_id] {
+                                u64 value{};
+                                u32 num_bytes = sizeof(u64);
+                                switch (release.data_sel.Value()) {
+                                case DataSelect::None:
+                                    num_bytes = 0;
+                                    break;
+                                case DataSelect::Data32Low:
+                                    value = release.DataDWord();
+                                    num_bytes = sizeof(u32);
+                                    break;
+                                case DataSelect::Data64:
+                                    value = release.DataQWord();
+                                    break;
+                                case DataSelect::GpuClock64:
+                                    value = GetGpuClock64();
+                                    break;
+                                case DataSelect::PerfCounter:
+                                    value = GetGpuPerfCounter();
+                                    break;
+                                default:
+                                    UNREACHABLE();
+                                }
+                                if (num_bytes != 0) {
+                                    WriteDeferredFence(release.Address<void*>(), &value, num_bytes);
+                                }
+                                if (release.int_sel != InterruptSelect::None) {
+                                    Platform::IrqC::Instance()->Signal(
+                                        static_cast<Platform::InterruptId>(pipe_id));
+                                }
+                            },
+                            true,
+                            FenceValueBytes(release.data_sel.Value(), release.DataDWord(),
+                                            release.DataQWord()));
+                    if (deferred) {
+                        return;
+                    }
+                    if (rasterizer) {
+                        rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::AscReleaseMem);
+                    }
+                    release_mem->SignalFence(
+                        [pipe_id] {
+                            Platform::IrqC::Instance()->Signal(
+                                static_cast<Platform::InterruptId>(pipe_id));
                         },
-                        true,
-                        FenceValueBytes(release.data_sel.Value(), release.DataDWord(),
-                                        release.DataQWord()));
-                if (deferred) {
-                    return;
-                }
-                if (rasterizer) {
-                    rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::AscReleaseMem);
-                }
-                release_mem->SignalFence(
-                    [pipe_id] {
-                        Platform::IrqC::Instance()->Signal(
-                            static_cast<Platform::InterruptId>(pipe_id));
-                    },
-                    [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                        rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
-                                               true);
-                    });
-            });
+                        [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                            rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
+                                                   true);
+                        });
+                });
             break;
         }
         case PM4ItOpcode::EventWrite: {
