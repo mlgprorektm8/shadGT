@@ -331,7 +331,9 @@ void Rasterizer::RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 c
         if (image.binding.is_target) {
             continue;
         }
-        add(id, image.binding.force_general ? DiagRole::Storage : DiagRole::Sampled);
+        const bool storage = image.binding.force_general ||
+                             std::ranges::find(diag_storage_images, id) != diag_storage_images.end();
+        add(id, storage ? DiagRole::Storage : DiagRole::Sampled);
     }
     for (const auto& bound : bound_buffers) {
         if (bound.guest_address != 0) {
@@ -390,10 +392,11 @@ void Rasterizer::TraceImageDependencies(VideoCore::ImageId source_id) {
     }
     std::ranges::sort(producers);
     LOG_WARNING(Render_Vulkan,
-                "DIAG-044: the thumbnail source (image {} at {:#x}) was made by {} draws and "
-                "dispatches from {} images; history holds {} records",
-                source_id.index, source.info.guest_address, producers.size(), visited.size(),
-                g_diag_history.size());
+                "DIAG-044: [{}] image {} at {:#x} ({}x{} {}) was made by {} draws and dispatches "
+                "from {} images; history holds {} records",
+                diag_trace_tag, source_id.index, source.info.guest_address, source.info.size.width,
+                source.info.size.height, vk::to_string(source.info.pixel_format), producers.size(),
+                visited.size(), g_diag_history.size());
     for (const size_t i : producers) {
         const auto& record = g_diag_history[i];
         std::string text;
@@ -406,9 +409,9 @@ void Rasterizer::TraceImageDependencies(VideoCore::ImageId source_id) {
             text += fmt::format(" | buf {:#x}+{:#x}{}", buffer.address, buffer.size,
                                 buffer.written ? " written" : "");
         }
-        LOG_WARNING(Render_Vulkan, "DIAG-044: #{} {} vs {:#x} fs {:#x} count {}{}{}", record.seq,
-                    record.compute ? "dispatch" : "draw", record.vs, record.fs, record.count, text,
-                    record.empty);
+        LOG_WARNING(Render_Vulkan, "DIAG-044: [{}] #{} {} vs {:#x} fs {:#x} count {}{}{}",
+                    diag_trace_tag, record.seq, record.compute ? "dispatch" : "draw", record.vs,
+                    record.fs, record.count, text, record.empty);
     }
     // How each image got its contents (uploads from guest memory, draws, copies).
     for (const u64 uid : visited) {
@@ -420,8 +423,8 @@ void Rasterizer::TraceImageDependencies(VideoCore::ImageId source_id) {
             }
             text += fmt::format(" | ver {} by {}:{}", mod.version, file, mod.line);
         }
-        LOG_WARNING(Render_Vulkan, "DIAG-044: uid {} depth {} modifications:{}", uid,
-                    image_depth[uid], text);
+        LOG_WARNING(Render_Vulkan, "DIAG-044: [{}] uid {} depth {} modifications:{}",
+                    diag_trace_tag, uid, image_depth[uid], text);
     }
     // The current pictures of every image still alive, nearest to the thumbnail first.
     std::vector<std::pair<u32, u64>> order;
@@ -437,18 +440,20 @@ void Rasterizer::TraceImageDependencies(VideoCore::ImageId source_id) {
             uid == source.image_uid ? source_id
                                     : (it != images.end() ? VideoCore::ImageId{it->second.slot}
                                                           : VideoCore::ImageId{});
-        if (!texture_cache.IsImageAlive(id, uid) || dumped >= 160) {
+        if (!texture_cache.IsImageAlive(id, uid) || dumped >= 200) {
             continue;
         }
         const auto& image = texture_cache.GetImage(id);
         if (u64(image.info.size.width) * image.info.size.height > 4096ULL * 4096) {
             continue;
         }
-        texture_cache.DumpImage(
-            id, dir / fmt::format("dep_d{:02}_uid{}_{:#x}_{}x{}_{}.bin", depth, uid,
-                                  image.info.guest_address, image.info.size.width,
-                                  image.info.size.height, vk::to_string(image.info.pixel_format)));
-        ++dumped;
+        if (texture_cache.DumpImage(
+                id, dir / fmt::format("dep{}_d{:02}_uid{}_{:#x}_{}x{}_{}.bin", diag_trace_tag, depth,
+                                      uid, image.info.guest_address, image.info.size.width,
+                                      image.info.size.height,
+                                      vk::to_string(image.info.pixel_format)))) {
+            ++dumped;
+        }
     }
     LOG_WARNING(Render_Vulkan, "DIAG-044: dumped {} of those images to {}", dumped, dir.string());
 }
@@ -554,6 +559,27 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // DIAG-043: kept in memory and written out (with image dumps) when the thumbnail is drawn.
     bool dump_thumbnail_chain = false;
     RecordDiagHistory(pipeline, false, regs.num_indices);
+    // DIAG-045: GT Sport accumulates the thumbnail's car frames into a 1600x900 target; trace the
+    // frame being added while the images it was made from are still alive.
+    {
+        const auto rt = cb_descs[0].image_id;
+        const auto& stages = pipeline->GetStages();
+        const auto* fs = stages[u32(Shader::SwStage::Fragment)];
+        if (rt && fs && fs->pgm_hash == 0x5589ec47) {
+            const auto& info = texture_cache.GetImage(rt).info;
+            static u32 accumulation_traces = 0;
+            if (info.size.width == 1600 && info.size.height == 900 && accumulation_traces < 2) {
+                for (const auto image_id : bound_images) {
+                    if (!texture_cache.GetImage(image_id).binding.is_target) {
+                        ++accumulation_traces;
+                        diag_trace_source = image_id;
+                        diag_trace_tag = fmt::format("acc{}", accumulation_traces);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     {
         bool thumbnail = false;
         bool watched = false;
@@ -622,7 +648,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     ResetBindings(false);
 
+    if (diag_trace_source && !dump_thumbnail_chain) {
+        TraceImageDependencies(diag_trace_source);
+        diag_trace_source = {};
+    }
     if (dump_thumbnail_chain) {
+        diag_trace_tag = "thumb";
         static u32 dumps = 0;
         if (dumps < 3) {
             ++dumps;
@@ -1393,6 +1424,7 @@ void Rasterizer::ResetBindings(bool is_compute) {
     bound_images.clear();
     bound_buffers.clear();
     diag_empty_bindings.clear();
+    diag_storage_images.clear();
     needs_barrier = false;
 }
 
@@ -2099,6 +2131,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             bound_images.emplace_back(image_id);
+            if (is_storage) {
+                diag_storage_images.push_back(image_id);
+            }
 
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(image_id, desc);

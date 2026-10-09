@@ -235,6 +235,9 @@ private:
     /// DIAG-044: logs and dumps everything the image's current contents were made from.
     void TraceImageDependencies(VideoCore::ImageId image_id);
     VideoCore::ImageId diag_trace_source{};
+    std::string diag_trace_tag{"thumb"};
+    /// DIAG-045: images of the current draw or dispatch bound for writing (storage).
+    boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> diag_storage_images;
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;

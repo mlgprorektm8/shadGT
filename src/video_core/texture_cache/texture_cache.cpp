@@ -88,11 +88,11 @@ void TextureCache::ProcessDownloadImages() {
     ReleaseFinishedReadbacks();
 }
 
-void TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path) {
+bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path) {
     Image& image = slot_images[image_id];
     const u32 bytes_per_texel = image.info.num_bits / 8;
     if (image.info.props.is_depth || image.info.props.is_block || bytes_per_texel == 0) {
-        return;
+        return false;
     }
     const u32 width = image.info.size.width;
     const u32 height = image.info.size.height;
@@ -119,6 +119,7 @@ void TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path
         std::fwrite(download.mapped, 1, size, file);
         std::fclose(file);
     }
+    return true;
 }
 
 bool TextureCache::HasLargePendingReadbacks() {

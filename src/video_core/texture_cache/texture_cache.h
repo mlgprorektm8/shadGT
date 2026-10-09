@@ -385,7 +385,7 @@ public:
     }
 
     /// DIAG-043: writes the first mip and layer of an image as raw bytes (waits for the GPU).
-    void DumpImage(ImageId image_id, const std::filesystem::path& path);
+    bool DumpImage(ImageId image_id, const std::filesystem::path& path);
 
     /// FIX-032: a read-back image of 64 KB or more (GT Sport's car thumbnail) is waiting.
     bool HasLargePendingReadbacks();
