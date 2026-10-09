@@ -159,6 +159,19 @@ void TextureCache::CompleteReadbacks(std::span<const PendingReadback> readbacks)
                                 n, readback.address, readback.size, kept);
                 }
             }
+            if (readback.size >= 64_KB) {
+                // DIAG-038: large readbacks (GT Sport's car thumbnail) and what they carried.
+                u32 nonzero = 0;
+                for (u32 offset = 0; offset + 4 <= readback.size; offset += 4) {
+                    u32 word;
+                    std::memcpy(&word, gpu + offset, 4);
+                    nonzero += word != 0;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-038: readback to {:#x}+{:#x} completed: {} of {} GPU words "
+                            "nonzero, {} words kept from the guest",
+                            readback.address, readback.size, nonzero, readback.size / 4, kept);
+            }
             memory->TryWriteBacking(std::bit_cast<u8*>(readback.address), merged.data(),
                                     readback.size);
             continue;
@@ -197,6 +210,13 @@ void TextureCache::ReleaseFinishedReadbacks() {
 
 std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(ImageId image_id) {
     Image& image = slot_images[image_id];
+    const bool large = image.info.pitch * image.info.size.height * (image.info.num_bits / 8) >= 64_KB;
+    if (large && (False(image.flags & ImageFlagBits::GpuModified) ||
+                  True(image.flags & ImageFlagBits::Dirty))) {
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-038: readback of image {} at {:#x} not recorded: flags {:#x}",
+                    image_id.index, image.info.guest_address, u32(image.flags));
+    }
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return std::nullopt;
     }
@@ -240,6 +260,10 @@ std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(I
     static constexpr u32 NoData = 0;
     Core::MemoryManager::NoteEmulatorWrite(image.info.guest_address, 0, &NoData);
     image.readback_version = image.contents_version;
+    if (download_size >= 64_KB) {
+        LOG_WARNING(Render_Vulkan, "DIAG-038: readback of image {} at {:#x}+{:#x} recorded",
+                    image_id.index, image.info.guest_address, download_size);
+    }
     static const bool merge_words = Common::PerfFeatureEnabled(38);
     return PendingReadback{image.info.guest_address, download, download_size,
                            HashGuestBytes(image.info.guest_address, download_size),
@@ -1387,6 +1411,12 @@ void TextureCache::DeleteImage(ImageId image_id) {
     {
         std::unique_lock lk{download_images_mutex};
         if (download_images.contains(image_id)) {
+            const auto& image = slot_images[image_id];
+            if (ImageDownloadSize(image) >= 64_KB) {
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-038: image {} at {:#x} freed before its readback was recorded",
+                            image_id.index, image.info.guest_address);
+            }
             download_images.erase(image_id);
         }
     }
