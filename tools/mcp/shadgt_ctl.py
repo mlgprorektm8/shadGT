@@ -4,7 +4,6 @@
     python tools/mcp/shadgt_ctl.py launch
     python tools/mcp/shadgt_ctl.py press button=cross
     python tools/mcp/shadgt_ctl.py screenshot            # prints the saved PNG path
-    python tools/mcp/shadgt_ctl.py checkpoint_save name=dealership "description=before buying"
     python tools/mcp/shadgt_ctl.py input_sequence 'steps=[{"press": "down"}, {"wait_ms": 500}]'
     python tools/mcp/shadgt_ctl.py stop
 
@@ -32,8 +31,7 @@ def serve() -> None:
 
     tools = {name: getattr(server, name) for name in (
         "launch", "stop", "pause", "resume", "status", "read_log", "wait_for_log", "list_dumps",
-        "press", "input_sequence", "capture_frame", "checkpoint_save", "checkpoint_list",
-        "checkpoint_delete", "checkpoint_edit", "checkpoint_load", "error_inventory", "tour")}
+        "press", "input_sequence", "capture_frame", "error_inventory")}
     lock = threading.Lock()
 
     def screenshot(save_path: str | None = None, **_):

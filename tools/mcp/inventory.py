@@ -3,6 +3,7 @@
 Reads shad_log.txt-format lines ("[Class] <Level> (thread) file:line func: message"), groups
 messages that differ only in numbers/addresses/hashes, and classifies each group:
 
+  shader       shaders the translator could not handle (SHADER-FAIL; their draws are skipped)
   crash        unhandled exceptions, access violations, asserts, device loss, fatal exits
   gpu          Vulkan validation messages and other GPU-side errors
   unimplemented  guest calls into functions shadGT does not implement ("Stub: X called",
@@ -39,7 +40,7 @@ NORMALIZERS = [
     (re.compile(r"\s+"), " "),
 ]
 
-CATEGORY_ORDER = ["crash", "gpu", "unimplemented", "stub", "error", "warning"]
+CATEGORY_ORDER = ["crash", "shader", "gpu", "unimplemented", "stub", "error", "warning"]
 
 CRASH_PATTERNS = re.compile(
     r"Unhandled Exception|access violation|Assertion Failed|Unreachable code|"
@@ -84,6 +85,8 @@ class Group:
 
 
 def classify(level: str, cls: str, func: str, msg: str) -> str | None:
+    if msg.startswith("SHADER-FAIL") or msg.startswith("FIX-033"):
+        return "shader"
     if msg.startswith("Linker: Stub resolved"):
         return "warning"  # resolved at load; "Stub: X called" is logged if the game calls it
     full = f"{func}: {msg}"
@@ -107,6 +110,7 @@ def classify(level: str, cls: str, func: str, msg: str) -> str | None:
 def scan(paths: list[Path]) -> dict[str, Group]:
     groups: dict[str, Group] = {}
     for path in paths:
+        recent_crash: tuple[int, Group] | None = None
         with open(path, encoding="utf-8", errors="replace") as f:
             for number, line in enumerate(f, 1):
                 m = LINE_RE.match(line.rstrip("\n"))
@@ -116,6 +120,14 @@ def scan(paths: list[Path]) -> dict[str, Group]:
                 category = classify(level, cls, func, msg)
                 if category is None:
                     continue
+                if category == "shader" and recent_crash and number - recent_crash[0] <= 4:
+                    # The assertion that made the shader fail is not a crash: it was contained.
+                    failed = recent_crash[1]
+                    failed.count -= 1
+                    if failed.count == 0:
+                        groups.pop(failed.key, None)
+                    msg = f"{msg} [failed check: {failed.loc} {failed.example[:120]}]"
+                    recent_crash = None
                 thread = re.sub(r"@@.*$", "", m["thread"])
                 key = f"{category}|{m['loc']}|{normalize(msg)}"
                 group = groups.get(key)
@@ -124,6 +136,8 @@ def scan(paths: list[Path]) -> dict[str, Group]:
                                                 first_log=path.name, first_line=number,
                                                 example=msg[:400])
                 group.count += 1
+                if category == "crash":
+                    recent_crash = (number, group)
                 if len(group.examples) < 6 and msg[:200] not in group.examples:
                     group.examples.append(msg[:200])
                 group.threads.add(thread)
@@ -140,7 +154,7 @@ def write(groups: dict[str, Group], out: Path, logs: list[Path], warnings: bool)
     summary = {c: sum(1 for g in items if g.category == c) for c in CATEGORY_ORDER}
     data = {"logs": [str(p) for p in logs], "summary": summary,
             "groups": [g.to_json() for g in items]}
-    out.with_suffix(".json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+    Path(f"{out}.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     lines = [f"# Error inventory", "", "Logs: " + ", ".join(p.name for p in logs), "",
              "| Category | Distinct |", "| --- | --- |"]
@@ -159,7 +173,7 @@ def write(groups: dict[str, Group], out: Path, logs: list[Path], warnings: bool)
             message = message.replace("|", "\\|")
             lines.append(f"| {i} | {g.count} | `{g.loc}` {g.func} | {message} "
                          f"({g.first_log}:{g.first_line}) |")
-    out.with_suffix(".md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    Path(f"{out}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return data
 
 
@@ -177,7 +191,7 @@ def main() -> int:
     out = args.out or args.logs[0].with_name(args.logs[0].stem + ".inventory")
     data = build(args.logs, out, args.warnings)
     print(json.dumps(data["summary"]))
-    print(f"wrote {out.with_suffix('.md')} and {out.with_suffix('.json')}")
+    print(f"wrote {out}.md and {out}.json")
     return 0
 
 

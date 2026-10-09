@@ -89,8 +89,7 @@ class McpServerTest(ServerTestBase):
         self.assertEqual(names, sorted([
             "launch", "stop", "pause", "resume", "status", "read_log", "wait_for_log",
             "list_dumps", "screenshot", "press", "input_sequence", "capture_frame",
-            "checkpoint_save", "checkpoint_list", "checkpoint_delete", "checkpoint_edit",
-            "checkpoint_load", "error_inventory", "tour"]))
+            "error_inventory"]))
 
     def test_smoke_launch_screenshot_press_stop(self):
         """The smoke test Lance runs on the real game, against the stub."""
@@ -193,61 +192,7 @@ class McpServerTest(ServerTestBase):
         self.assertNotIn(["STATUS"], self.commands())
 
 
-class CheckpointTest(ServerTestBase):
-    def setUp(self):
-        super().setUp()
-        self.savedata = self.profile / "user/home/1000/savedata/CUSA03220"
-        self.savedata.mkdir(parents=True)
-        (self.savedata / "memory.dat").write_text("garage A", encoding="utf-8")
-
-    def test_record_and_replay(self):
-        async def body(s):
-            await s.call_tool("launch", {})
-            for button in ("cross", "down", "cross"):
-                self.data(await s.call_tool("press", {"button": button, "hold_ms": 30}))
-            saved = self.data(await s.call_tool(
-                "checkpoint_save", {"name": "dealership", "description": "test route"}))
-            await s.call_tool("stop", {})
-            # The run changed the save data; loading must put back what it started from.
-            (self.savedata / "memory.dat").write_text("garage B", encoding="utf-8")
-            listed = self.data(await s.call_tool("checkpoint_list", {}))
-            loaded = self.data(await s.call_tool("checkpoint_load", {"name": "dealership"}))
-            await s.call_tool("stop", {})
-            return saved, listed, loaded
-
-        saved, listed, loaded = self.run_session(body)
-        self.assertEqual(saved["steps"], 3)
-        self.assertEqual(listed[0]["presses"], "cross down cross")
-        self.assertTrue(loaded["arrived"], loaded)
-        self.assertEqual([s["similarity"] for s in loaded["steps"]], [1.0, 1.0, 1.0])
-        self.assertEqual(loaded["final_similarity"], 1.0)
-        self.assertEqual((self.savedata / "memory.dat").read_text(encoding="utf-8"), "garage A")
-        backup = self.profile / "savedata-backups/last-before-checkpoint/memory.dat"
-        self.assertEqual(backup.read_text(encoding="utf-8"), "garage B")
-        pads = [c for c in self.commands() if c[0] == "PAD" and c[1] != "0x0"]
-        self.assertEqual([p[1] for p in pads], ["0x4000", "0x40", "0x4000"] * 2)
-
-    def test_replay_stops_at_first_divergence(self):
-        async def body(s):
-            await s.call_tool("launch", {})
-            await s.call_tool("press", {"button": "cross", "hold_ms": 30})
-            await s.call_tool("checkpoint_save", {"name": "menu"})
-            await s.call_tool("stop", {})
-            return None
-
-        self.run_session(body)
-
-        async def replay(s):
-            loaded = self.data(await s.call_tool(
-                "checkpoint_load", {"name": "menu", "first_timeout_s": 2}))
-            await s.call_tool("stop", {})
-            return loaded
-
-        loaded = self.run_session(replay, {"FAKE_SHADGT_SCREEN_OFFSET": "3"})
-        self.assertFalse(loaded["arrived"])
-        self.assertIn("step 0 (cross)", loaded["error"])
-        # A box around a region that matches anyway lets the route through.
-
+class InventoryTest(ServerTestBase):
     def test_inventory_after_run(self):
         log = self.profile / "user/log/shad_log.txt"
         log.write_text(
@@ -266,12 +211,28 @@ class CheckpointTest(ServerTestBase):
 
         stopped, inv = self.run_session(body)
         self.assertEqual(stopped["inventory_summary"]["crash"], 1)
-        self.assertEqual(inv["summary"], {"crash": 1, "gpu": 0, "unimplemented": 1, "stub": 1,
-                                          "error": 0, "warning": 0})
+        self.assertEqual(inv["summary"], {"crash": 1, "shader": 0, "gpu": 0, "unimplemented": 1,
+                                          "stub": 1, "error": 0, "warning": 0})
         self.assertTrue(inv["top"]["stub"][0].startswith("2x"))
 
 
 class UnitTest(unittest.TestCase):
+    def test_inventory_contained_shader_failure(self):
+        import inventory
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "run.log"
+            log.write_text(
+                "[Debug] <Critical> (shadGT:GpuCommandProcessor) ring_access_elimination.cpp:71 "
+                "lambda: Assertion Failed!\n"
+                "[Render_Vulkan] <Error> (shadGT:GpuCommandProcessor) vk_pipeline_cache.cpp:1220 "
+                "CompileModule: SHADER-FAIL: es shader 0xc51581b6 (permutation 0, 900 dwords) "
+                "could not be translated: assertion failed; draws that use it are skipped\n",
+                encoding="utf-8")
+            data = inventory.build([log], Path(tmp) / "inv")
+        self.assertEqual(data["summary"]["crash"], 0)
+        self.assertEqual(data["summary"]["shader"], 1)
+        self.assertIn("ring_access_elimination.cpp:71", data["groups"][0]["example"])
+
     def test_parse_status(self):
         parsed = shadgt_mcp.parse_status(
             "STATUS frames=12 fps=59.8 paused=0 serial=CUSA03220 app_ver=01.69 "

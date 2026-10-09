@@ -37,7 +37,6 @@ except ImportError:  # mcp 1.x
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import inventory  # noqa: E402
-import routes  # noqa: E402
 
 # ---------------------------------------------------------------------------------------------
 # Paths and defaults (mirroring scripts/Run-GTSportPerformance.ps1)
@@ -510,12 +509,6 @@ class Session:
         self.lock = threading.RLock()
         self.watcher: threading.Thread | None = None
         self.last_exit: dict[str, Any] | None = None
-        self.recorder: routes.Recorder | None = None
-        self.replaying = False
-
-    @property
-    def checkpoints_dir(self) -> Path:
-        return self.profile_dir / "checkpoints"
 
     @property
     def log_path(self) -> Path:
@@ -600,7 +593,7 @@ class Session:
                            self.profile_dir / "runs" / f"{self.stamp}.inventory")
                     out.parent.mkdir(exist_ok=True)
                     inventory_summary = inventory.build([log_for_inventory], out)["summary"]
-                    inventory_md = str(out.with_suffix(".md"))
+                    inventory_md = f"{out}.md"
                 except Exception as e:
                     inventory_summary = f"inventory failed: {e}"
             self.last_exit = {
@@ -642,8 +635,7 @@ def _is_shadgt_running() -> bool:
 def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
            env: dict[str, str] | None = None, disable_perf: str = "",
            perf_overrides: bool = True, game_path: str | None = None,
-           log_filter: str | None = None, validation: bool = False,
-           record: bool = True) -> dict:
+           log_filter: str | None = None, validation: bool = False) -> dict:
     """Start GT Sport under shadGT with IPC control, like scripts/Run-GTSportPerformance.ps1.
 
     build_dir: folder containing shadGT.exe (default Build/x64-Clang-Release).
@@ -654,7 +646,6 @@ def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
     log_filter: log filter for this run instead of "*:Warning" (e.g. "*:Info").
     validation: enable the Vulkan validation layers (core + sync) from Build/tools/VulkanSDK;
       their messages go to the log and into the run's inventory. Much slower.
-    record: record the inputs from now on, so checkpoint_save can save them as a route.
     Returns pid, IPC capabilities and paths. The built-in GT Sport 1.69 boot patch is applied
     by the emulator itself, so IPC disabling automatic patch loading does not affect it.
     """
@@ -716,12 +707,6 @@ def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
         SESSION.emu = emu
         SESSION.watcher = threading.Thread(target=SESSION.on_exit, args=(emu,), daemon=True)
         SESSION.watcher.start()
-        SESSION.recorder = None
-        if record:
-            SESSION.recorder = routes.Recorder(
-                SESSION.checkpoints_dir / ".recording", SESSION.profile_dir,
-                {"build_dir": build_dir, "extra_args": extra_args, "env": env,
-                 "disable_perf": disable_perf, "game_path": game_path})
         return {
             "pid": emu.pid,
             "command": command,
@@ -910,7 +895,8 @@ def _grab_png(path: Path) -> None:
     emu = SESSION.require()
     path.parent.mkdir(parents=True, exist_ok=True)
     if emu.has("ENABLE_TEST_AUTOMATION"):
-        path.unlink(missing_ok=True)
+        if path.exists():
+            path.unlink()
         emu.screenshot(path.resolve())
         deadline = time.monotonic() + 15
         while not png_complete(path):
@@ -924,16 +910,6 @@ def _grab_png(path: Path) -> None:
         if not hwnd:
             raise RuntimeError("shadGT window not found")
         capture_window(hwnd).save(path)
-
-
-def _grab_image():
-    from PIL import Image as PILImage
-
-    path = SESSION.profile_dir / "user/screenshots/mcp/.grab.png"
-    _grab_png(path)
-    image = PILImage.open(path)
-    image.load()
-    return image
 
 
 @mcp.tool()
@@ -1002,8 +978,6 @@ def _press(buttons: str | list[str], hold_ms: int, hold_frames: int | None) -> d
     names = [buttons] if isinstance(buttons, str) else list(buttons)
     keys = [normalize_button(n) for part in names for n in part.split("+")]
     emu = SESSION.require()
-    if SESSION.recorder and not SESSION.replaying:
-        SESSION.recorder.add("+".join(keys), hold_ms, hold_frames, _grab_png)
     if emu.has("ENABLE_TEST_AUTOMATION"):
         return _press_ipc(emu, keys, hold_ms, hold_frames)
     return _press_keyboard(emu, keys, hold_ms)
@@ -1089,129 +1063,7 @@ def capture_frame(timeout_s: float = 60.0) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------
-# Tools: checkpoints (save data + recorded input route) and the error inventory
-
-
-def _checkpoint_dir(name: str) -> Path:
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name.startswith("."):
-        raise ValueError("Checkpoint names use letters, digits, '_', '-' and '.'")
-    return SESSION.checkpoints_dir / name
-
-
-@mcp.tool()
-def checkpoint_save(name: str, description: str = "") -> dict:
-    """Save the current point as a checkpoint: the save data the run was launched with, every
-    input pressed since launch (with the screen each was pressed on) and the current screen.
-    checkpoint_load(name) gets back here from a fresh launch."""
-    SESSION.require()
-    if not SESSION.recorder:
-        raise RuntimeError("This run was launched with record=false; nothing to save.")
-    folder = _checkpoint_dir(name)
-    route = SESSION.recorder.save(folder, name, description, _grab_png)
-    return {"checkpoint": str(folder), "steps": len(route.steps),
-            "note": "Use checkpoint_edit to set a box on steps whose background varies."}
-
-
-@mcp.tool()
-def checkpoint_list() -> list[dict]:
-    """The saved checkpoints with their step counts and descriptions."""
-    result = []
-    if SESSION.checkpoints_dir.exists():
-        for folder in sorted(SESSION.checkpoints_dir.iterdir()):
-            if folder.is_dir() and not folder.name.startswith(".") and \
-                    (folder / "route.json").exists():
-                route = routes.load_route(folder)
-                result.append({"name": route.name, "steps": len(route.steps),
-                               "description": route.description,
-                               "presses": " ".join(s.press for s in route.steps)})
-    return result
-
-
-@mcp.tool()
-def checkpoint_delete(name: str) -> str:
-    """Delete a checkpoint."""
-    folder = _checkpoint_dir(name)
-    if not folder.exists():
-        raise FileNotFoundError(f"No checkpoint {name}")
-    shutil.rmtree(folder)
-    return f"deleted {name}"
-
-
-@mcp.tool()
-def checkpoint_edit(name: str, step: int | None = None, box: list[float] | None = None,
-                    min_similarity: float | None = None, wait: bool | None = None,
-                    description: str | None = None) -> dict:
-    """Tune how replay recognizes screens. step: the input index (None = the final screen).
-    box: [x0, y0, x1, y1] as fractions (0..1) of the screen to compare, e.g. the menu panel
-    when the background changes between runs. min_similarity: 0..1 (route default 0.90).
-    wait=false presses after the recorded delay without checking the screen."""
-    folder = _checkpoint_dir(name)
-    route = routes.load_route(folder)
-    if description is not None:
-        route.description = description
-    if step is None:
-        if box is not None:
-            route.final_box = box
-        if min_similarity is not None:
-            route.min_similarity = min_similarity
-    else:
-        target = route.steps[step]
-        if box is not None:
-            target.box = box
-        if min_similarity is not None:
-            target.min_similarity = min_similarity
-        if wait is not None:
-            target.wait = wait
-    routes.save_route(folder, route)
-    return route.to_json()
-
-
-@mcp.tool()
-def checkpoint_load(name: str, build_dir: str | None = None, log_filter: str | None = None,
-                    validation: bool = False, first_timeout_s: float = 180.0,
-                    step_timeout_s: float = 60.0) -> dict:
-    """Jump to a checkpoint: stop the emulator if it runs, restore the checkpoint's save data
-    (the current one is kept in savedata-backups/last-before-checkpoint), launch, and replay
-    the inputs, waiting for each recorded screen before pressing. Stops with an error naming
-    the first step whose screen never matched, with both pictures. Recording continues, so a
-    longer checkpoint can be saved from here."""
-    folder = _checkpoint_dir(name)
-    route = routes.load_route(folder)
-    if SESSION.emu and SESSION.emu.alive():
-        stop()
-    routes.restore_savedata(folder, SESSION.profile_dir, SESSION.profile_dir / "savedata-backups")
-    params = dict(route.launch)
-    if build_dir:
-        params["build_dir"] = build_dir
-    launched = launch(build_dir=params.get("build_dir"), extra_args=params.get("extra_args"),
-                      env=params.get("env"), disable_perf=params.get("disable_perf") or "",
-                      game_path=params.get("game_path"), log_filter=log_filter,
-                      validation=validation, record=True)
-    # Continue the recording from the replayed route.
-    recorder = SESSION.recorder
-    for step in route.steps:
-        if step.ref and (folder / step.ref).exists():
-            shutil.copy2(folder / step.ref, recorder.dir / step.ref)
-        recorder.route.steps.append(step)
-    if (folder / "savedata").exists():
-        if (recorder.dir / "savedata").exists():
-            shutil.rmtree(recorder.dir / "savedata")
-        shutil.copytree(folder / "savedata", recorder.dir / "savedata")
-    report_dir = SESSION.profile_dir / "runs" / f"{SESSION.stamp}-checkpoint-{name}"
-    SESSION.replaying = True
-    try:
-        result = routes.replay(
-            folder, route,
-            press=lambda st: _press(st.press, st.hold_ms, st.hold_frames),
-            grab=_grab_image, alive=lambda: bool(SESSION.emu and SESSION.emu.alive()),
-            report_dir=report_dir, first_timeout_s=first_timeout_s,
-            step_timeout_s=step_timeout_s, log=lambda _: None)
-    except routes.Diverged as e:
-        return {"arrived": False, "error": str(e), "pid": launched["pid"]}
-    finally:
-        SESSION.replaying = False
-        recorder.last = time.monotonic()
-    return {"arrived": True, "checkpoint": name, "pid": launched["pid"], **result}
+# Tools: error inventory
 
 
 @mcp.tool()
@@ -1240,22 +1092,7 @@ def error_inventory(logs: list[str] | None = None, warnings: bool = False) -> di
         if len(bucket) < 15:
             bucket.append(f"{group['count']}x {group['location']} {group['function']}: "
                           f"{group['example'][:160]}")
-    return {"report": str(out.with_suffix(".md")), "summary": data["summary"], "top": top}
-
-
-@mcp.tool()
-def tour(name: str = "tour", settle_s: float = 10.0, log_filter: str | None = None,
-         validation: bool = False) -> dict:
-    """Error-inventory run: replays the `tour` checkpoint (boot, menus, dealership, garage,
-    race, time trial), waits settle_s, stops, and returns the run's error inventory.
-    Record the tour once with launch + presses + checkpoint_save("tour")."""
-    result = checkpoint_load(name, log_filter=log_filter, validation=validation)
-    if result.get("arrived"):
-        time.sleep(settle_s)
-    stopped = stop()
-    return {"replay": result, "exit_code": stopped.get("exit_code"),
-            "run_log": stopped.get("run_log"), "inventory": stopped.get("inventory"),
-            "inventory_summary": stopped.get("inventory_summary")}
+    return {"report": f"{out}.md", "summary": data["summary"], "top": top}
 
 
 def main() -> None:
