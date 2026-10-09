@@ -1693,9 +1693,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             // -DisablePerf 39 binds the clamped range.
             static const bool null_impossible = Common::PerfFeatureEnabled(39);
             constexpr u64 GpuAddressLimit = 1ULL << 40;
-            const bool impossible = null_impossible && vsharp.num_records != UINT32_MAX &&
-                                    (vsharp.GetSize() >= GpuAddressLimit ||
-                                     u64(vsharp.base_address) + vsharp.GetSize() > GpuAddressLimit);
+            // FIX-036: also a V# of 1 GB or more whose base is outside guest memory (the same
+            // shader, base 0x92 at the purchase dialog); ClampRangeSize asserted on it.
+            const bool impossible =
+                null_impossible && vsharp.num_records != UINT32_MAX &&
+                (vsharp.GetSize() >= GpuAddressLimit ||
+                 u64(vsharp.base_address) + vsharp.GetSize() > GpuAddressLimit ||
+                 (vsharp.GetSize() >= 1_GB && vsharp.base_address != 0 &&
+                  !memory->IsValidMapping(vsharp.base_address)));
             if (impossible) {
                 static std::atomic<u32> logged{};
                 if (const u32 n = ++logged; n <= 20 || n % 1000 == 0) {
@@ -1722,7 +1727,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_WARNING(Render,
                                 "FIX-031: buffer {} (binding {}) for stage {:#x} bound empty: "
                                 "base={:#x}, stride={}, records={:#x} ends past the GPU address "
-                                "space; V# from{}",
+                                "space or starts outside guest memory; V# from{}",
                                 n, buffer_infos.size(), stage.pgm_hash, u64(vsharp.base_address),
                                 vsharp.GetStride(), vsharp.num_records, source);
                 }
