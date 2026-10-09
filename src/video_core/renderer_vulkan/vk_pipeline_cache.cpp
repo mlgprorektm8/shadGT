@@ -1305,7 +1305,8 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 bool IsWatchedShader(u64 hash) {
     static const std::vector<u64> watched = [] {
         // The Nurburgring grass: vertex generator, blade generator, and the pass before them.
-        std::vector<u64> hashes{0xab6a2d10, 0xaa3822a3, 0x766d0f18};
+        // DIAG-039: the dealership shader whose buffer V#s read as float constants.
+        std::vector<u64> hashes{0xab6a2d10, 0xaa3822a3, 0x766d0f18, 0xae32f77f};
         if (const char* env = std::getenv("SHADGT_WATCH_SHADERS"); env && *env) {
             hashes.clear();
             const std::string list{env};

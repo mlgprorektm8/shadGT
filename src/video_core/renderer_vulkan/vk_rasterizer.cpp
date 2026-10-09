@@ -1328,11 +1328,32 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             if (impossible) {
                 static std::atomic<u32> logged{};
                 if (const u32 n = ++logged; n <= 20 || n % 1000 == 0) {
+                    // DIAG-039: where each V# dword came from (user data index, its value,
+                    // and the guest address it was loaded from).
+                    std::string source;
+                    const auto& fetch = desc.sharp_fetch;
+                    const bool single =
+                        fetch.summary ==
+                        std::remove_cvref_t<decltype(fetch)>::Summary::SingleLoad;
+                    for (u32 i = 0; i < 4; ++i) {
+                        if (!single && !((fetch.load_mask >> i) & 1)) {
+                            source += fmt::format(" imm={:08x}", fetch.immediates[i]);
+                            continue;
+                        }
+                        const u32 off = single ? u32(fetch.offsets[0]) + i : u32(fetch.offsets[i]);
+                        const u64 src =
+                            off < stage.flattened_ud_src.size() ? stage.flattened_ud_src[off] : 0;
+                        source += fmt::format(
+                            " [{}]={:08x}{}", off,
+                            off < stage.flattened_ud_buf.size() ? stage.flattened_ud_buf[off] : 0,
+                            src ? fmt::format("@{:#x}", src) : std::string(" ud"));
+                    }
                     LOG_WARNING(Render,
-                                "FIX-031: buffer {} for stage {:#x} bound empty: base={:#x}, "
-                                "stride={}, records={:#x} ends past the GPU address space",
-                                n, stage.pgm_hash, u64(vsharp.base_address), vsharp.GetStride(),
-                                vsharp.num_records);
+                                "FIX-031: buffer {} (binding {}) for stage {:#x} bound empty: "
+                                "base={:#x}, stride={}, records={:#x} ends past the GPU address "
+                                "space; V# from{}",
+                                n, buffer_infos.size(), stage.pgm_hash, u64(vsharp.base_address),
+                                vsharp.GetStride(), vsharp.num_records, source);
                 }
             }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0 || impossible) {
