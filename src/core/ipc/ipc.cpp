@@ -3,12 +3,19 @@
 
 #include "ipc.h"
 
+#include <array>
+#include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
+
+#include <fmt/format.h>
 
 #include <SDL3/SDL.h>
 
+#include "common/elf_info.h"
 #include "common/memory_patcher.h"
+#include "common/singleton.h"
 #include "common/thread.h"
 #include "common/types.h"
 #include "core/debug_state.h"
@@ -16,9 +23,11 @@
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
 #include "core/libraries/audio/audioout.h"
+#include "input/controller.h"
 #include "input/input_handler.h"
 #include "sdl_window.h"
 #include "src/core/libraries/usbd/usbd.h"
+#include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -49,6 +58,7 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
  * - CAPABILITIES:
  *   - ENABLE_MEMORY_PATCH: enables PATCH_MEMORY command
  *   - ENABLE_EMU_CONTROL: enables PAUSE, RESUME, STOP, TOGGLE_FULLSCREEN commands
+ *   - ENABLE_TEST_AUTOMATION: enables PAD, SCREENSHOT, STATUS commands
  * - INPUT CMD:
  *   - RUN: start the emulator execution
  *   - START: start the game execution
@@ -61,6 +71,19 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
  *   - RESUME: resume the game execution
  *   - STOP: stop and quit the emulator
  *   - TOGGLE_FULLSCREEN: enable / disable fullscreen
+ *   - PAD(
+ *       buttons: number, lx: number, ly: number, rx: number, ry: number,
+ *       l2: number, r2: number, hold_frames: number
+ *     ): inject player 1's pad state for hold_frames presented frames (0 clears it).
+ *       buttons is an OrbisPadButtonDataOffset mask (Cross = 0x4000); sticks are 0-255 with
+ *       128 centred, triggers 0-255. It is merged with real input and needs no window focus.
+ *       Replies ;PAD_OK <until_frame>
+ *   - SCREENSHOT(path: str): save the next presented game frame (before host scaling) as a
+ *       PNG at path. Replies ;SCREENSHOT_QUEUED <path>; the file appears once the frame is
+ *       presented and written.
+ *   - STATUS: replies one line
+ *       ;STATUS frames=<n> fps=<x> paused=<0|1> serial=<id> app_ver=<v> title=<rest of line>
+ *       fps is measured over 500 ms while the command runs.
  * - OUTPUT CMD:
  *   - RESTART(argn: number, argv: ...string): Request restart of the emulator, must call STOP
  **/
@@ -82,6 +105,7 @@ void IPC::Init() {
     std::cerr << ";#IPC_ENABLED\n";
     std::cerr << ";ENABLE_MEMORY_PATCH\n";
     std::cerr << ";ENABLE_EMU_CONTROL\n";
+    std::cerr << ";ENABLE_TEST_AUTOMATION\n";
     std::cerr << ";#IPC_END\n";
     std::cerr.flush();
 
@@ -105,7 +129,12 @@ void IPC::InputLoop() {
     auto next_str = [&] -> const std::string& {
         static std::string line_buffer;
         do {
-            std::getline(std::cin, line_buffer, '\n');
+            if (!std::getline(std::cin, line_buffer, '\n')) {
+                // The client closed stdin: stop reading instead of spinning on EOF.
+                while (true) {
+                    std::this_thread::sleep_for(std::chrono::hours(1));
+                }
+            }
         } while (!line_buffer.empty() && line_buffer.back() == '\\');
         return line_buffer;
     };
@@ -151,6 +180,35 @@ void IPC::InputLoop() {
             SDL_memset(&event, 0, sizeof(event));
             event.type = SDL_EVENT_TOGGLE_FULLSCREEN;
             SDL_PushEvent(&event);
+        } else if (cmd == "PAD") {
+            const u32 buttons = static_cast<u32>(next_u64());
+            std::array<s32, 6> axes{};
+            for (auto& axis : axes) {
+                axis = static_cast<s32>(next_u64());
+            }
+            const u32 hold_frames = static_cast<u32>(next_u64());
+            auto& controllers = *Common::Singleton<Input::GameControllers>::Instance();
+            controllers[0]->Inject(buttons, axes, hold_frames);
+            std::cerr << ";PAD_OK " << DebugState.GetFrameNum() + hold_frames << std::endl;
+        } else if (cmd == "SCREENSHOT") {
+            const std::string path = next_str();
+            VideoCore::RequestScreenshotToPath(
+                std::filesystem::path(std::u8string(path.begin(), path.end())));
+            std::cerr << ";SCREENSHOT_QUEUED " << path << std::endl;
+        } else if (cmd == "STATUS") {
+            using namespace std::chrono;
+            const u32 frames_before = DebugState.GetFrameNum();
+            const auto time_before = steady_clock::now();
+            std::this_thread::sleep_for(milliseconds(500));
+            const u32 frames = DebugState.GetFrameNum();
+            const double seconds = duration<double>(steady_clock::now() - time_before).count();
+            const auto& elf = Common::ElfInfo::Instance();
+            std::cerr << fmt::format(";STATUS frames={} fps={:.1f} paused={} serial={} "
+                                     "app_ver={} title={}",
+                                     frames, (frames - frames_before) / seconds,
+                                     DebugState.IsGuestThreadsPaused() ? 1 : 0, elf.GameSerial(),
+                                     elf.AppVer(), elf.Title())
+                      << std::endl;
         } else if (cmd == "ADJUST_VOLUME") {
             int value = static_cast<int>(next_u64());
             bool is_game_specific = next_u64() != 0;

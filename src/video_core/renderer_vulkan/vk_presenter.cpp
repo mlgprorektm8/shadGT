@@ -174,6 +174,18 @@ static std::vector<std::filesystem::path> BuildScreenshotPaths(const ScreenshotK
         return paths;
     }
 
+    // Paths requested over IPC come first; the rest get generated names.
+    if (kind == ScreenshotKind::GameOnly) {
+        paths = VideoCore::TakeRequestedScreenshotPaths(count);
+        for (const auto& path : paths) {
+            std::error_code ec{};
+            std::filesystem::create_directories(path.parent_path(), ec);
+        }
+        if (paths.size() == count) {
+            return paths;
+        }
+    }
+
     const auto& screenshots_dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir);
     std::filesystem::create_directories(screenshots_dir);
 
@@ -197,11 +209,12 @@ static std::vector<std::filesystem::path> BuildScreenshotPaths(const ScreenshotK
           << ms;
 
     const char* suffix = kind == ScreenshotKind::GameOnly ? "game" : "hud";
-    const auto first_sequence = screenshot_sequence.fetch_add(count, std::memory_order_relaxed);
+    const auto generated = count - static_cast<u32>(paths.size());
+    const auto first_sequence = screenshot_sequence.fetch_add(generated, std::memory_order_relaxed);
 
     paths.reserve(count);
     const auto stamp_str = stamp.str();
-    for (u32 i = 0; i < count; ++i) {
+    for (u32 i = 0; i < generated; ++i) {
         paths.emplace_back(screenshots_dir / fmt::format("{}_{}_{}_{:06}.png", game_id, stamp_str,
                                                          suffix, first_sequence + i));
     }

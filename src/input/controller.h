@@ -105,6 +105,10 @@ public:
     void PollLightColour();
     bool SetVibration(u8 smallMotor, u8 largeMotor);
     void SetTouchpadState(int touchIndex, bool touchDown, float x, float y);
+    // IPC-injected pad state, merged into what the game reads for hold_frames presented frames:
+    // buttons are OR'd with real input, a stick axis away from centre or a trigger above the real
+    // one replaces it. hold_frames == 0 clears the injection.
+    void Inject(u32 buttons, const std::array<s32, 6>& axes, u32 hold_frames);
 
     float gyro_buf[3] = {0.0f, 0.0f, 0.0f}, accel_buf[3] = {0.0f, 9.81f, 0.0f};
     s32 user_id = Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID;
@@ -114,6 +118,8 @@ private:
     // m_state_mutex must be held by the caller.
     void PushStateLocked(u64 timestamp = 0);
     void UpdateOrientationLocked(u64 timestamp);
+    void ExpireInjectionLocked();
+    void ApplyInjectionLocked(State& state) const;
 
     u8 m_next_touch_id{1};
     u64 m_touch_down_timestamp{};
@@ -122,6 +128,13 @@ private:
     std::optional<Colour> override_colour{};
 
     State m_state;
+
+    struct Injection {
+        bool active{};
+        u32 buttons{};
+        std::array<s32, 6> axes{128, 128, 128, 128, 0, 0};
+        u32 until_frame{};
+    } m_injection;
 
     std::mutex m_state_mutex;
     RingBufferQueue<State> m_states_queue;
