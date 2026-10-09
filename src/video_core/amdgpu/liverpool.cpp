@@ -5,6 +5,7 @@
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <boost/preprocessor/stringize.hpp>
 #include <fmt/ranges.h>
@@ -201,6 +202,32 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 #define RESUME_ASC(task, id) RESUME(task, acb_task_name[id])
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
+
+// FIX-035: DMA_DATA with a register source or destination address space (SAS/DAS = 1). GT
+// Sport issues it on the graphics queue in the main menu; its exact effect is undocumented in
+// the sources available, so the packet is reported once per destination and skipped rather
+// than stopping the emulator.
+static bool SkipRegisterSpaceDmaData(const PM4DmaData* dma_data, const char* queue) {
+    if (dma_data->command.das == 0 && dma_data->command.sas == 0) {
+        return false;
+    }
+    static std::mutex mutex;
+    static std::unordered_set<u64> reported;
+    std::scoped_lock lk{mutex};
+    if (reported
+            .insert(u64(dma_data->dst_addr_lo) << 8 | u64(dma_data->src_sel) << 4 |
+                    u64(dma_data->dst_sel))
+            .second) {
+        LOG_ERROR(Render_Vulkan,
+                  "FIX-035: {} DMA_DATA with register address space skipped: sas {} das {} "
+                  "src_sel {} dst_sel {} src {:#x} dst {:#x} bytes {} saic {} daic {}",
+                  queue, u32(dma_data->command.sas), u32(dma_data->command.das),
+                  u32(dma_data->src_sel), u32(dma_data->dst_sel), dma_data->SrcAddress<u64>(),
+                  dma_data->DstAddress<u64>(), dma_data->NumBytes(), u32(dma_data->command.saic),
+                  u32(dma_data->command.daic));
+    }
+    return true;
+}
 
 static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
     if (offset > span.size()) {
@@ -936,7 +963,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
                     break;
                 }
-                ASSERT(dma_data->command.das == 0);
+                if (SkipRegisterSpaceDmaData(dma_data, "gfx")) {
+                    break;
+                }
                 if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
                     rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
                                            dma_data->data, true);
@@ -1448,7 +1477,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
                 break;
             }
-            ASSERT(dma_data->command.das == 0);
+            if (SkipRegisterSpaceDmaData(dma_data, "compute")) {
+                break;
+            }
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
                 rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data,
                                        true);
