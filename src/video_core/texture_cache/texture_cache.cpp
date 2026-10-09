@@ -636,8 +636,9 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         }
 
         // A full mip chain (or more layers) of the same memory under another color format of the
-        // same texel size: expand and copy, as for the same format (FIX-040).
-        if (image_info.ExtendsAcrossFormat(cache_image.info)) {
+        // same texel size: expand and copy, as for the same format (FIX-040, perf id 42).
+        static const bool extend_across_format = Common::PerfFeatureEnabled(42);
+        if (extend_across_format && image_info.ExtendsAcrossFormat(cache_image.info)) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
