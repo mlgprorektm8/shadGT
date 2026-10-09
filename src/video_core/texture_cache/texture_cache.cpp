@@ -646,6 +646,12 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
+        // A full mip chain (or more layers) of the same memory under another color format of the
+        // same texel size: expand and copy, as for the same format (FIX-040).
+        if (image_info.ExtendsAcrossFormat(cache_image.info)) {
+            return {ExpandImage(image_info, cache_image_id), -1, -1};
+        }
+
         const bool pow2_padding_only =
             image_info.props.is_pow2 != cache_image.info.props.is_pow2 &&
             image_info.tile_mode == cache_image.info.tile_mode &&
