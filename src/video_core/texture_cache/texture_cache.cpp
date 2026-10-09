@@ -12,6 +12,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/path_util.h"
 #include "common/hash.h"
 #include "common/perf_monitor.h"
 #include "core/emulator_settings.h"
@@ -171,6 +172,16 @@ void TextureCache::CompleteReadbacks(std::span<const PendingReadback> readbacks)
                             "DIAG-038: readback to {:#x}+{:#x} completed: {} of {} GPU words "
                             "nonzero, {} words kept from the guest",
                             readback.address, readback.size, nonzero, readback.size / 4, kept);
+                // DIAG-040: the bytes themselves, to look at the picture offline.
+                static std::atomic<u32> dumps{};
+                if (const u32 n = dumps++; n < 16) {
+                    const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+                                      fmt::format("readback_{:02}_{:#x}.bin", n, readback.address);
+                    if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
+                        std::fwrite(merged.data(), 1, readback.size, file);
+                        std::fclose(file);
+                    }
+                }
             }
             memory->TryWriteBacking(std::bit_cast<u8*>(readback.address), merged.data(),
                                     readback.size);
