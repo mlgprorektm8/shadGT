@@ -3,8 +3,10 @@
 
 // Diagnostic bundles: the draw history and the one-pass capture (video_core/diag_bundle.h).
 
+#include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <optional>
 
 #include <boost/container/small_vector.hpp>
 #include <nlohmann/json.hpp>
@@ -19,6 +21,14 @@
 #include "video_core/texture_cache/image.h"
 
 namespace Vulkan {
+
+namespace {
+// Episode counting and delayed starts for armed bundles (see DiagBundle::Request).
+u32 g_last_match_frame = ~0u;
+u32 g_episodes = 0;
+std::optional<VideoCore::DiagBundle::Request> g_delayed;
+u32 g_delayed_start = 0;
+} // namespace
 
 namespace {
 enum class DiagRole : u8 { Sampled, Target, Storage, Depth };
@@ -208,23 +218,28 @@ void Rasterizer::RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 c
                            ref.height == armed->height;
                 });
             }
-            if (fire && armed->skip) {
+            if (fire && (armed->skip || armed->repeat > 1)) {
                 // Count matching episodes: draws to the trigger within 120 frames of the last
                 // match belong to the same one (one thumbnail render spans several frames).
-                static u32 last_match_frame = ~0u;
-                static u32 episodes = 0;
                 const u32 frame = DebugState.GetFrameNum();
-                if (last_match_frame == ~0u || frame - last_match_frame > 120) {
-                    ++episodes;
+                if (g_last_match_frame == ~0u || frame - g_last_match_frame > 120) {
+                    ++g_episodes;
                     LOG_WARNING(Render_Vulkan, "DIAG-BUNDLE: '{}' matched at frame {} (episode {})",
-                                armed->reason, frame, episodes);
+                                armed->reason, frame, g_episodes);
                 }
-                last_match_frame = frame;
-                fire = episodes > armed->skip;
+                g_last_match_frame = frame;
+                fire = g_episodes > armed->skip;
             }
             if (fire) {
                 VideoCore::DiagBundle::Disarm();
-                DiagStart(*armed);
+                if (armed->delay) {
+                    g_delayed = *armed;
+                    g_delayed_start = DebugState.GetFrameNum() + armed->delay;
+                    LOG_WARNING(Render_Vulkan, "DIAG-BUNDLE: '{}' starts at frame {}",
+                                armed->reason, g_delayed_start);
+                } else {
+                    DiagStart(*armed);
+                }
             }
         }
     }
@@ -271,6 +286,11 @@ void Rasterizer::DiagWriteHistory(const std::filesystem::path& path, bool try_lo
 }
 
 void Rasterizer::DiagBeforeWork() {
+    if (!diag_capture && g_delayed && DebugState.GetFrameNum() >= g_delayed_start) {
+        const auto request = *g_delayed;
+        g_delayed.reset();
+        DiagStart(request);
+    }
     if (!diag_capture) {
         if (const auto armed = VideoCore::DiagBundle::Armed();
             armed && armed->trigger == VideoCore::DiagBundle::Trigger::Now) {
@@ -503,6 +523,12 @@ void Rasterizer::DiagFinish() {
     LOG_WARNING(Render_Vulkan, "DIAG-BUNDLE: written to {} (draws {}..{}, {} images, {} shaders)",
                 capture.dir.string(), capture.start_seq, end_seq, capture.images_written,
                 capture.shaders.size());
+    // Repeat: arm the same trigger for the next episode.
+    if (auto next = capture.request; next.repeat > 1) {
+        --next.repeat;
+        next.skip = g_episodes;
+        VideoCore::DiagBundle::Arm(std::move(next));
+    }
     diag_capture.reset();
 }
 

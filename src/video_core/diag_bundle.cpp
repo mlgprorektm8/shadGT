@@ -77,15 +77,18 @@ std::optional<Request> ParseTrigger(std::string_view trigger, std::string reason
 
 void Arm(Request request) {
     std::scoped_lock lk{armed_mutex};
-    LOG_WARNING(Render_Vulkan, "DIAG-BUNDLE: armed '{}' (trigger {}, {} frames, skip {})",
-                request.reason, static_cast<u32>(request.trigger), request.frames, request.skip);
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-BUNDLE: armed '{}' (trigger {}, {} frames, skip {}, delay {}, repeat {})",
+                request.reason, static_cast<u32>(request.trigger), request.frames, request.skip,
+                request.delay, request.repeat);
     armed = std::move(request);
     has_armed = true;
 }
 
 // SHADGT_BUNDLE_TRIGGER arms a bundle at startup without the IPC/MCP controller, for runs
 // started by hand: "target=WxH" or "shader=0xHASH", with SHADGT_BUNDLE_SKIP (episodes to let
-// pass) and SHADGT_BUNDLE_FRAMES. Needs SHADGT_DIAG=1 for shader code in the bundle.
+// pass), SHADGT_BUNDLE_DELAY (frames from the trigger to the capture), SHADGT_BUNDLE_REPEAT
+// (episodes to capture) and SHADGT_BUNDLE_FRAMES. Needs SHADGT_DIAG=1 for shader code in the bundle.
 static void ArmFromEnvironment() {
     const char* trigger = std::getenv("SHADGT_BUNDLE_TRIGGER");
     if (!trigger || !*trigger) {
@@ -93,6 +96,8 @@ static void ArmFromEnvironment() {
     }
     const char* frames = std::getenv("SHADGT_BUNDLE_FRAMES");
     const char* skip = std::getenv("SHADGT_BUNDLE_SKIP");
+    const char* delay = std::getenv("SHADGT_BUNDLE_DELAY");
+    const char* repeat = std::getenv("SHADGT_BUNDLE_REPEAT");
     auto request = ParseTrigger(trigger, fmt::format("env-{}", trigger),
                                 frames && *frames ? std::atoi(frames) : 2);
     if (!request) {
@@ -100,6 +105,8 @@ static void ArmFromEnvironment() {
         return;
     }
     request->skip = skip && *skip ? static_cast<u32>(std::atoi(skip)) : 0;
+    request->delay = delay && *delay ? static_cast<u32>(std::atoi(delay)) : 0;
+    request->repeat = repeat && *repeat ? std::max(std::atoi(repeat), 1) : 1;
     Arm(std::move(*request));
 }
 

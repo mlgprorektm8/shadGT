@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <imgui.h>
+#include <cstdlib>
 #include <vector>
+#include <imgui.h>
 
 #include "common/assert.h"
 #include "common/native_clock.h"
@@ -115,7 +116,12 @@ std::string DebugStateImpl::DescribeGuestThreads() {
             }
             const auto text = describe(stack[i]);
             const bool host = text.starts_with("host ");
-            const bool guest = !host && text.find(" Code ") != std::string::npos;
+            // Game code is mapped Flexible, system modules Code: any executable mapping counts.
+            const auto prot_at = text.find(" prot 0x");
+            const bool executable =
+                prot_at != std::string::npos &&
+                (std::strtoul(text.c_str() + prot_at + 6, nullptr, 16) & 4) != 0;
+            const bool guest = !host && !text.starts_with("unmapped") && executable;
             if ((host && host_frames < 8) || guest) {
                 out += fmt::format(" | [rsp+{:#x}] {:#x} {}", i * 8, stack[i], text);
                 host_frames += host ? 1 : 0;

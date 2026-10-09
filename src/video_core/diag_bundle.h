@@ -38,6 +38,11 @@ struct Request {
     /// Target/shader triggers: matching episodes to let pass before capturing (an episode ends
     /// after 120 frames without a match), e.g. 1 to capture the second car thumbnail.
     u32 skip{};
+    /// Frames to wait after the trigger before capturing (e.g. the end of a thumbnail render).
+    u32 delay{};
+    /// Episodes to capture in a row: after each bundle the trigger is armed again for the next
+    /// episode, e.g. 2 to capture the first (good) and second (bad) car thumbnail in one run.
+    u32 repeat{1};
 };
 
 /// SHADGT_DIAG=1: keep each shader's guest code and SPIR-V so bundles can include them.
