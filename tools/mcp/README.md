@@ -72,6 +72,14 @@ The keyboard fallback and `capture_frame` bring the shadGT window to the front.
 `press` without `hold_frames` holds for `hold_ms` of wall time, then clears. Use `hold_frames`
 when the game must see the press for an exact number of frames.
 
+## Smoke test without the Claude Code CLI
+
+`python tools/mcp/smoke_test.py` drives the server over MCP stdio, like Claude Code would. It
+launches the game, waits 45 s, takes a screenshot, presses Cross, waits 3 s, takes another
+screenshot, calls `status`, then stops the game. The results go to
+`<profile>/runs/mcp-smoke-<stamp>.log` and the screenshots go next to it as `-1.png` / `-2.png`.
+`--fake` runs it against the stub instead of the game.
+
 ## Tests
 
 `python tools/mcp/tests/test_shadgt_mcp.py` runs the server over real MCP stdio against
