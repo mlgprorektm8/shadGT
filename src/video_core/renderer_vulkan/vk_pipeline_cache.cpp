@@ -12,6 +12,7 @@
 #include <sstream>
 
 #include "common/elf_info.h"
+#include "common/guest_clock.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -571,6 +572,8 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::MakePipelineBuild()
 }
 
 void PipelineCache::FinishBuild(PipelineBuild& build) {
+    // FIX-044: the GPU thread waiting for (or doing) a pipeline build holds the guest clocks.
+    Common::GuestClock::CompilePause hold;
     if (!build.started.exchange(true)) {
         build.pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
@@ -732,6 +735,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        Common::GuestClock::CompilePause hold; // FIX-044
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
@@ -805,6 +809,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
+        Common::GuestClock::CompilePause hold; // FIX-044
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
@@ -1206,6 +1211,9 @@ namespace Vulkan {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    // FIX-044: translating a shader on the GPU thread holds the guest clocks; a PS4 runs
+    // precompiled shaders, so the game never sees this time pass.
+    Common::GuestClock::CompilePause hold;
     ++Common::GetWorkCounters().shaders_compiled;
     last_spv_hash = 0;
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
@@ -1515,6 +1523,7 @@ void PipelineCache::RecoverAttributeFlags(Shader::Info& info,
     // FIX-012: a shader from a cache entry stored without its attribute loads/stores is
     // translated again for them (its stored SPIR-V is kept), because the rect/quad-list helper
     // shaders forward exactly the outputs these flags name. The entry is stored again with them.
+    Common::GuestClock::CompilePause hold; // FIX-044
     Shader::Info translated{info.hw_stage, info.sw_stage, params};
     auto translate_runtime_info = runtime_info;
     [[maybe_unused]] const auto program =

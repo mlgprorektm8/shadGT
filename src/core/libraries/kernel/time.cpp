@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "common/assert.h"
+#include "common/guest_clock.h"
 #include "common/native_clock.h"
 #include "common/thread.h"
 #include "core/libraries/kernel/kernel.h"
@@ -39,11 +40,15 @@ u64 PS4_SYSV_ABI sceKernelGetTscFrequency() {
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTime() {
     // TODO: this timer should support suspends, so initial ptc needs to be updated on wake up
+    return clock->TicksToUS(Common::GuestClock::ReadTsc() - initial_ptc);
+}
+
+u64 GetHostProcessTime() {
     return clock->GetTimeUS(initial_ptc);
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter() {
-    return clock->GetUptime() - initial_ptc;
+    return Common::GuestClock::ReadTsc() - initial_ptc;
 }
 
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() {
@@ -51,7 +56,9 @@ u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() {
 }
 
 u64 PS4_SYSV_ABI sceKernelReadTsc() {
-    return clock->GetUptime();
+    // FIX-044: the guest's TSC and the clocks derived from it stand still while the GPU thread
+    // compiles shaders or pipelines (common/guest_clock.h).
+    return Common::GuestClock::ReadTsc();
 }
 
 static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTimespec* rmtp,
@@ -139,6 +146,16 @@ s32 PS4_SYSV_ABI posix_clock_gettime(u32 clock_id, OrbisKernelTimespec* ts) {
 
         ts->tv_sec = epoch_ns / 1'000'000'000;
         ts->tv_nsec = epoch_ns % 1'000'000'000;
+        return 0;
+    }
+    if (Common::GuestClock::Enabled() &&
+        (clock_id == ORBIS_CLOCK_UPTIME || clock_id == ORBIS_CLOCK_UPTIME_PRECISE ||
+         clock_id == ORBIS_CLOCK_MONOTONIC || clock_id == ORBIS_CLOCK_MONOTONIC_PRECISE ||
+         clock_id == ORBIS_CLOCK_UPTIME_FAST || clock_id == ORBIS_CLOCK_MONOTONIC_FAST)) {
+        // FIX-044: monotonic clocks follow the guest TSC; real time stays the host's.
+        const u64 ns = clock->TicksToNS(Common::GuestClock::ReadTsc());
+        ts->tv_sec = static_cast<s64>(ns / 1'000'000'000);
+        ts->tv_nsec = static_cast<s64>(ns % 1'000'000'000);
         return 0;
     }
 

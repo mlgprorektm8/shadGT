@@ -105,7 +105,10 @@ public:
         }
 
         UpdateVolumeIfChanged();
+        // FIX-044: the device is paced in host time; the game reads the output time in guest
+        // time, which stands still while the GPU thread compiles.
         const u64 current_time = Kernel::sceKernelGetProcessTime();
+        const u64 host_time = Kernel::GetHostProcessTime();
 
         // Convert audio data ONCE per call
         if (use_native_float) {
@@ -162,9 +165,9 @@ public:
 
         // Only sleep if we have healthy buffer queue
         if (queued >= 2) {
-            HandleTiming(current_time);
+            HandleTiming(host_time);
         } else {
-            next_output_time = current_time + period_us;
+            next_output_time = host_time + period_us;
         }
 
         last_output_time.store(current_time, std::memory_order_release);
@@ -380,7 +383,7 @@ private:
     }
 
     void UpdateVolumeIfChanged() {
-        const u64 current_time = Kernel::sceKernelGetProcessTime();
+        const u64 current_time = Kernel::GetHostProcessTime();
 
         if (current_time - last_volume_check_time < VOLUME_CHECK_INTERVAL_US) {
             return;

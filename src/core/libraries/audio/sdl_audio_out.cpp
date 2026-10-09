@@ -82,9 +82,11 @@ public:
         }
 
         UpdateVolumeIfChanged();
+        // FIX-044: the device is paced in host time; the game reads the output time in guest
+        // time, which stands still while the GPU thread compiles.
         const u64 current_time = Kernel::sceKernelGetProcessTime();
         convert(ptr, internal_buffer, buffer_frames, nullptr);
-        HandleTiming(current_time);
+        HandleTiming(Kernel::GetHostProcessTime());
 
         if ((output_count++ & 0xF) == 0) { // Check every 16 outputs
             ManageAudioQueue();
@@ -193,7 +195,7 @@ private:
     }
 
     void UpdateVolumeIfChanged() {
-        const u64 current_time = Kernel::sceKernelGetProcessTime();
+        const u64 current_time = Kernel::GetHostProcessTime();
 
         if (current_time - last_volume_check_time < VOLUME_CHECK_INTERVAL_US) {
             return;
