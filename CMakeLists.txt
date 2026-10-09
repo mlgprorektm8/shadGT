@@ -1073,6 +1073,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/amdgpu/pixel_format.h
                src/video_core/amdgpu/pm4_cmds.h
                src/video_core/amdgpu/pm4_opcodes.h
+               src/video_core/amdgpu/read_ahead_states.cpp
+               src/video_core/amdgpu/read_ahead_states.h
                src/video_core/amdgpu/regs_color.h
                src/video_core/amdgpu/regs_depth.h
                src/video_core/amdgpu/regs.cpp

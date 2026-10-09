@@ -273,6 +273,12 @@ void Liverpool::StartDrawPipe() {
     recorder->cb_extent = last_cb_extent;
     recorder->db_extent = last_db_extent;
     regs_dirty = {};
+    // PERF-034: the pipeline read-ahead goes on with the draw pipe; -DisablePerf 49 (or 19)
+    // turns it off.
+    if (Common::PerfFeatureEnabled(49) && Common::PerfFeatureEnabled(19)) {
+        read_ahead_states = std::make_unique<ReadAheadStates>();
+        pipeline_regs_written = true;
+    }
     if (const char* env = std::getenv("SHADGT_DRAW_PIPE_VERIFY")) {
         verify_interval = static_cast<u32>(std::strtoul(env, nullptr, 10));
     }
@@ -288,7 +294,8 @@ void Liverpool::StartDrawPipe() {
     pipe_report_start = std::chrono::steady_clock::now();
     pipelined.store(true, std::memory_order_release);
     LOG_WARNING(
-        Render, "PERF-031: draws are recorded on a second thread (draw pipe){}",
+        Render, "PERF-031: draws are recorded on a second thread (draw pipe){}{}",
+        read_ahead_states ? ", pipelines read ahead (PERF-034)" : "",
         verify_interval ? fmt::format(", registers verified every {} draws", verify_interval) : "");
 }
 
@@ -330,7 +337,52 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute) {
         }
         draw();
     });
+    if (read_ahead_states && !compute) {
+        OfferDrawState();
+    }
     ReportDrawPipe();
+}
+
+// FIX-014: draws the rasterizer filters out (Rasterizer::FilterDraw) never get a pipeline.
+static bool FilteredDraw(const Regs& state) {
+    using OperationMode = ColorControl::OperationMode;
+    const auto mode = state.color_control.mode;
+    return state.primitive_type == PrimitiveType::None ||
+           mode == OperationMode::EliminateFastClear || mode == OperationMode::FmaskDecompress ||
+           mode == OperationMode::Resolve;
+}
+
+void Liverpool::OfferDrawState() {
+    // The draw being decoded is still ahead of the recorder. Its state is hashed only when a
+    // register its pipeline key comes from was written since the previous draw.
+    if (pipeline_regs_written && read_ahead_states->Space() > 0) {
+        pipeline_regs_written = false;
+        if (!FilteredDraw(regs)) {
+            read_ahead_states->Offer(regs.reg_array);
+        }
+    }
+    // A pipeline miss on the recorder: new pipelines are appearing, so the draws after this
+    // one are read now, not only from the next command buffer on.
+    if (read_ahead_states->TakeNewMiss() || read_ahead_stopped_early) {
+        PipeReadAhead();
+    }
+}
+
+void Liverpool::PipeReadAhead() {
+    const size_t space = read_ahead_states->Space();
+    if (space == 0) {
+        read_ahead_stopped_early = true; // Again at the next draw.
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    read_ahead_stopped_early = ScanAheadForPipelines(
+        [&](const Regs& state) {
+            return !FilteredDraw(state) && read_ahead_states->Offer(state.reg_array);
+        },
+        4096, static_cast<u32>(std::min<size_t>(space, 256)));
+    ++pipe_read_ahead_stats.scans;
+    pipe_read_ahead_stats.ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 void Liverpool::SyncRecorder(std::string_view reason) {
@@ -436,13 +488,20 @@ void Liverpool::ReportDrawPipe() {
         reasons += fmt::format(" {}={}/{:.1f}ms", reason, entry.first, entry.second);
     }
     sync_reasons.clear();
+    std::string read_ahead;
+    if (read_ahead_states) {
+        read_ahead = fmt::format("; read-ahead: {} draw states queued, {} reads ahead ({:.1f} ms)",
+                                 read_ahead_states->TakeOffered(), pipe_read_ahead_stats.scans,
+                                 pipe_read_ahead_stats.ms);
+        pipe_read_ahead_stats = {};
+    }
     LOG_WARNING(Render,
                 "PERF-031 draw pipe in {:.1f} s: {} jobs, recorder busy {:.0f}%, max queued {}, "
                 "{} full-queue waits; {} waits moved to the recorder; drains {} ({} waited, "
-                "{:.1f} ms):{}",
+                "{:.1f} ms):{}{}",
                 seconds, stats.pushed, stats.recorder_busy_us / (seconds * 1e4), stats.max_queued,
                 stats.push_waits, waits_moved, stats.drains, stats.drains_that_waited,
-                stats.drain_wait_us / 1000.0, reasons);
+                stats.drain_wait_us / 1000.0, reasons, read_ahead);
     waits_moved = 0;
 }
 
@@ -670,6 +729,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         lookahead_dcb = dcb;
         on_command_buffer_start();
     }
+    // PERF-034: with the draw pipe the command thread reads ahead itself, from each command
+    // buffer's start while new pipelines keep appearing (PERF-020).
+    if (read_ahead_states && !dcb.empty() &&
+        read_ahead_states->MissWithin(std::chrono::seconds{5}) &&
+        !(Common::PerfFeatureEnabled(23) && scanned_packets.contains(dcb.data()))) {
+        lookahead_dcb = dcb;
+        PipeReadAhead();
+    }
 
     // TODO: potentially, ASCs also can depend on CE and in this case the
     // CE task should be moved into more global scope
@@ -793,6 +860,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::ClearState: {
                 regs.SetDefaults();
                 regs_dirty.MarkAll();
+                pipeline_regs_written = true;
                 break;
             }
             case PM4ItOpcode::SetConfigReg: {
@@ -1748,9 +1816,10 @@ bool Liverpool::ScanPackets(std::span<const u32> dcb,
     return true;
 }
 
-void Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on_draw) {
+bool Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on_draw,
+                                      u32 max_draws, u32 max_builds) {
     if (lookahead_dcb.empty()) {
-        return;
+        return false;
     }
     const u32* buffer_end = lookahead_dcb.data() + lookahead_dcb.size();
     std::span<const u32> start = lookahead_dcb;
@@ -1759,7 +1828,7 @@ void Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on
         // An earlier scan of this command buffer got past this point; continue it with the
         // registers it had there.
         if (scan_finished) {
-            return;
+            return false;
         }
         start = {scan_resume, buffer_end};
     } else {
@@ -1783,8 +1852,8 @@ void Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on
         scan_buffer_end = buffer_end;
     }
     // Enough to keep every build worker busy, without reading a whole frame ahead each time.
-    u32 draws_left = 2048;
-    u32 builds_left = 48;
+    u32 draws_left = max_draws;
+    u32 builds_left = max_builds;
     const u32* stopped_at = nullptr;
     scan_finished = ScanPackets(start, on_draw, 0, draws_left, builds_left, &stopped_at);
     // The command buffers this one was called from continue after it.
@@ -1794,6 +1863,7 @@ void Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on
         }
     }
     scan_resume = scan_finished ? buffer_end : stopped_at;
+    return !scan_finished;
 }
 
 template <bool is_indirect>

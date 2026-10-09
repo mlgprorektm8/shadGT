@@ -724,7 +724,78 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
     }
 }
 
+void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool restore) {
+    auto* states = liverpool->PipeReadAheadStates();
+    if (!states || states->Empty()) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    if (!queued_state_regs) {
+        // A queued state holds every register a key is built from; the others keep these values.
+        queued_state_regs = std::make_unique<AmdGpu::Regs>(liverpool->DrawRegs());
+    }
+    const auto key = graphics_key;
+    u32 evaluated = 0;
+    u32 started = 0;
+    // Before a draw, 2 ms at most, and while waiting for a build, 64 states between checks on
+    // it; the rest comes next time.
+    const auto budget = start + std::chrono::milliseconds{2};
+    while ((restore ? evaluated < 64 : std::chrono::steady_clock::now() < budget) &&
+           states->Take(queued_state_regs->reg_array)) {
+        ++evaluated;
+        regs_override = queued_state_regs.get();
+        draw_indirect_params = {};
+        const bool valid = RefreshGraphicsKey();
+        regs_override = nullptr;
+        if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(graphics_key) ||
+            pending_builds.contains(graphics_key)) {
+            continue;
+        }
+        pending_builds.emplace(graphics_key, StartPipelineBuild(false));
+        ++started;
+    }
+    draw_indirect_params = params;
+    if (restore && evaluated > 0) {
+        RefreshGraphicsKey();
+        ASSERT_MSG(graphics_key == key, "Read-ahead changed the current pipeline key");
+    }
+    auto& stats = queued_state_stats;
+    const auto now = std::chrono::steady_clock::now();
+    stats.evaluated += evaluated;
+    stats.started += started;
+    stats.ms += std::chrono::duration<double, std::milli>(now - start).count();
+    if (now - stats.since >= std::chrono::seconds{2}) {
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-034 pipeline read-ahead in {:.1f} s: {} draw states from the command "
+                    "thread evaluated, {} builds started, {:.1f} ms; {} draws waited for a build "
+                    "({:.1f} ms); {} pending",
+                    std::chrono::duration<double>(now - stats.since).count(), stats.evaluated,
+                    stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size());
+        stats = {};
+        stats.since = now;
+    }
+}
+
+void PipelineCache::WaitForBuild(PipelineBuild& build, const DrawIndirectParams params) {
+    using namespace std::chrono_literals;
+    BuildQueuedStates(params, true);
+    // An urgent build is at the front of the workers' queue, and an idle worker takes it at
+    // once; with every worker busy, this thread builds it (FinishBuild). So does a read-ahead
+    // build no worker has reached yet.
+    if (build.urgent) {
+        const auto grace = std::chrono::steady_clock::now() + 200us;
+        while (!build.started.load() && std::chrono::steady_clock::now() < grace) {
+            std::this_thread::yield();
+        }
+    }
+    while (build.started.load() && build.done.wait_for(500us) != std::future_status::ready) {
+        BuildQueuedStates(params, true);
+    }
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    // PERF-034: builds for the upcoming draws the command thread read ahead start first.
+    BuildQueuedStates(params, false);
     draw_indirect_params = params;
     ++draws_since_scan;
     if (!RefreshGraphicsKey()) {
@@ -763,6 +834,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         ++Common::GetWorkCounters().pipelines_compiled;
         last_pipeline_miss = std::chrono::steady_clock::now();
         GraphicsPipeline::NotePipelineMiss();
+        auto* const queued_states = liverpool->PipeReadAheadStates();
+        if (queued_states) {
+            queued_states->NoteMiss();
+        }
         if (pending != pending_builds.end()) {
             build = pending->second;
             pending_builds.erase(pending);
@@ -780,11 +855,23 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             build = StartPipelineBuild(true);
             ReadAhead(params);
             ASSERT_MSG(graphics_key == key, "Read-ahead changed the current pipeline key");
+        } else if (queued_states) {
+            // PERF-034: a worker builds it while this thread starts the builds the command
+            // thread's read-ahead queues meanwhile.
+            build = StartPipelineBuild(true);
         }
         if (build) {
             const auto wait_start = std::chrono::steady_clock::now();
+            if (queued_states) {
+                WaitForBuild(*build, params);
+            }
             FinishBuild(*build);
             const auto now = std::chrono::steady_clock::now();
+            if (queued_states) {
+                ++queued_state_stats.waits;
+                queued_state_stats.wait_ms +=
+                    std::chrono::duration<double, std::milli>(now - wait_start).count();
+            }
             ++Common::GetWorkCounters().pipeline_waits;
             Common::GetWorkCounters().pipeline_wait_us += u64(
                 std::chrono::duration_cast<std::chrono::microseconds>(now - wait_start).count());

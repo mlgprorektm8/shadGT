@@ -103,6 +103,13 @@ private:
     /// PERF-020: while new pipelines keep appearing, reads each command buffer ahead as soon as
     /// it starts, so its first new pipelines are built before their draws.
     void ReadAheadAtBufferStart();
+    /// PERF-034: with the draw pipe, starts builds for the upcoming draw states the command
+    /// thread queued. During a draw (`restore`), its key is computed again afterwards.
+    void BuildQueuedStates(const DrawIndirectParams params, bool restore);
+    /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
+    /// command thread queues meanwhile. Returns at once if no worker took the build, which
+    /// FinishBuild then does on this thread.
+    void WaitForBuild(PipelineBuild& build, const DrawIndirectParams params);
     /// Selects swizzled-alpha blend emulation for a lane-dependent blend, or reports it once.
     void RefreshSwizzledBlend(u32 cb, Shader::PsColorBuffer& color_buffer,
                               const AmdGpu::BlendControl& bc);
@@ -208,6 +215,16 @@ private:
         std::chrono::steady_clock::time_point since{};
     } read_ahead_stats;
     u32 last_scan_draws{};
+    // PERF-034: the registers of the queued draw state being evaluated.
+    std::unique_ptr<AmdGpu::Regs> queued_state_regs;
+    struct QueuedStateStats {
+        u32 evaluated{};
+        u32 started{};
+        u32 waits{};
+        double wait_ms{};
+        double ms{};
+        std::chrono::steady_clock::time_point since{};
+    } queued_state_stats;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;

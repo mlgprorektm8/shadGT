@@ -109,6 +109,13 @@ target_compile_features(shadps4_uploaded_pages_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_uploaded_pages_test PRIVATE GTest::gtest_main tsl::robin_map)
 gtest_discover_tests(shadps4_uploaded_pages_test)
 
+add_executable(shadps4_read_ahead_states_test test_read_ahead_states.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/read_ahead_states.cpp)
+target_include_directories(shadps4_read_ahead_states_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_read_ahead_states_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_read_ahead_states_test PRIVATE GTest::gtest_main xxHash::xxhash)
+gtest_discover_tests(shadps4_read_ahead_states_test)
+
 add_executable(shadps4_guest_clock_test test_guest_clock.cpp)
 target_include_directories(shadps4_guest_clock_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_guest_clock_test PRIVATE cxx_std_23)
@@ -353,6 +360,7 @@ target_link_libraries(shadps4_ngs2_test PRIVATE
 target_link_libraries(shadps4_gcn_test PRIVATE
     GTest::gtest_main
     fmt::fmt
+    tsl::robin_map
     nlohmann_json::nlohmann_json
     magic_enum::magic_enum
     toml11::toml11
@@ -495,6 +503,7 @@ target_include_directories(shadgt_wave64_inspect PRIVATE ${CMAKE_SOURCE_DIR}/src
 target_compile_features(shadgt_wave64_inspect PRIVATE cxx_std_23)
 target_link_libraries(shadgt_wave64_inspect PRIVATE fmt::fmt nlohmann_json::nlohmann_json
     magic_enum::magic_enum toml11::toml11 Boost::headers Vulkan::Headers sirit SDL3::SDL3
+    tsl::robin_map
     spdlog::spdlog half::half xbyak::xbyak Zydis::Zydis)
 if (WIN32)
     target_link_libraries(shadgt_wave64_inspect PRIVATE onecore)

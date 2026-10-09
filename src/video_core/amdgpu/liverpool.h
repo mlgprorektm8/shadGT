@@ -27,6 +27,7 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/read_ahead_states.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/amdgpu/regs_delta.h"
 
@@ -227,8 +228,16 @@ public:
     /// PERF-019: reads the graphics commands after the current packet without executing them,
     /// tracking register writes in a copy of the registers, and calls on_draw with that copy at
     /// each draw. on_draw returns true when it started a pipeline build. A later call for the
-    /// same command buffer continues where the previous one stopped.
-    void ScanAheadForPipelines(const std::function<bool(const Regs&)>& on_draw);
+    /// same command buffer continues where the previous one stopped. Returns true when it
+    /// stopped early (after `max_draws` new draws or `max_builds` builds).
+    bool ScanAheadForPipelines(const std::function<bool(const Regs&)>& on_draw,
+                               u32 max_draws = 2048, u32 max_builds = 48);
+
+    /// PERF-034: upcoming draw states the command thread read ahead for the pipeline cache;
+    /// null without the draw pipe.
+    ReadAheadStates* PipeReadAheadStates() const {
+        return read_ahead_states.get();
+    }
     /// PERF-020: called on the command thread when a graphics command buffer starts, with the
     /// read-ahead positioned at its first packet.
     std::function<void()> on_command_buffer_start;
@@ -343,6 +352,20 @@ private:
     /// Runs on the recorder, in order: waits as the command thread would have.
     void RecorderWaitRegMem(const PM4CmdWaitRegMem& wait);
 
+    // PERF-034: the pipeline read-ahead with the draw pipe, on the command thread.
+    std::unique_ptr<ReadAheadStates> read_ahead_states;
+    bool pipeline_regs_written{};
+    bool read_ahead_stopped_early{};
+    struct {
+        u64 scans;
+        double ms;
+    } pipe_read_ahead_stats{};
+    /// Queues the state of the graphics draw being decoded when its pipeline registers
+    /// changed, and reads ahead while new pipelines keep appearing.
+    void OfferDrawState();
+    /// Reads the commands ahead of the command thread and queues the new draw states found.
+    void PipeReadAhead();
+
     void StartDrawPipe();
     void ReportDrawPipe();
     void VerifyRecorderRegs(const Regs& expected);
@@ -356,12 +379,15 @@ private:
     bool WritesLiveCommands(VAddr address, u64 size) const;
     void MarkRegs(u32 first, u32 count) {
         regs_dirty.Mark(first, count);
+        if (read_ahead_states && ReadAheadStates::AffectsPipeline(first, count)) {
+            pipeline_regs_written = true; // PERF-034
+        }
     }
     template <typename T>
     void MarkReg(const T& field) {
         const auto offset = static_cast<u32>(reinterpret_cast<const u8*>(&field) -
                                              reinterpret_cast<const u8*>(regs.reg_array.data()));
-        regs_dirty.Mark(offset / sizeof(u32), static_cast<u32>((sizeof(T) + 3) / sizeof(u32)));
+        MarkRegs(offset / sizeof(u32), static_cast<u32>((sizeof(T) + 3) / sizeof(u32)));
     }
 
     std::array<ConstDumpRecord, 256> recent_const_dumps{};
