@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/logging/log.h"
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/ir/position.h"
 #include "shader_recompiler/ir/reinterpret.h"
@@ -25,6 +26,11 @@ static AmdGpu::NumberFormat NumberFormatCompressed(AmdGpu::ShaderExportFormat ex
         UNREACHABLE_MSG("Unimplemented compressed export format {}",
                         static_cast<u32>(export_format));
     }
+}
+
+static bool IsCompressedExportFormat(AmdGpu::ShaderExportFormat export_format) {
+    return export_format >= AmdGpu::ShaderExportFormat::ABGR_FP16 &&
+           export_format <= AmdGpu::ShaderExportFormat::ABGR_SINT16;
 }
 
 static u32 MaskFromExportFormat(u8 mask, AmdGpu::ShaderExportFormat export_format) {
@@ -57,8 +63,6 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
         // discards these exports. Keep them from becoming the synthetic second source.
         return;
     }
-    info.mrt_mask |= 1u << static_cast<u8>(mrt);
-
     // Dual source blending uses MRT1 for exporting src1
     u32 color_buffer_idx = static_cast<u32>(mrt) - static_cast<u32>(IR::Attribute::RenderTarget0);
     if (runtime_info.hw.fs.dual_source_blending && mrt == IR::Attribute::RenderTarget1) {
@@ -66,6 +70,24 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
     }
 
     const auto color_buffer = runtime_info.hw.fs.color_buffers[color_buffer_idx];
+    if (exp.compr && exp.en != 0 && !IsCompressedExportFormat(color_buffer.export_format) &&
+        color_buffer.export_format != AmdGpu::ShaderExportFormat::Zero) {
+        // FIX-033: GT Sport loads a race with a shader that exports packed 16-bit components to
+        // a target whose SPI_SHADER_COL_FORMAT is a 32-bit format. AMD's compilers only pack
+        // exports for the 16-bit formats, and what the hardware does with this combination is
+        // unknown, so the export is dropped (the target keeps its contents) instead of guessing
+        // a conversion. This used to abort the emulator.
+        LOG_ERROR(Render_Recompiler,
+                  "FIX-033: fs {:#x} exports packed 16-bit data to MRT{} with 32-bit export "
+                  "format {} (target data format {}, number format {}, enable mask {:#x}); "
+                  "export dropped",
+                  info.pgm_hash, color_buffer_idx, static_cast<u32>(color_buffer.export_format),
+                  static_cast<u32>(color_buffer.data_format),
+                  static_cast<u32>(color_buffer.num_format), static_cast<u32>(exp.en));
+        return;
+    }
+    info.mrt_mask |= 1u << static_cast<u8>(mrt);
+
     if (color_buffer.export_format == AmdGpu::ShaderExportFormat::Zero || exp.en == 0) {
         // No export
         return;
