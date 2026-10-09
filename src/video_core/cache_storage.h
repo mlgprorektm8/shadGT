@@ -38,6 +38,8 @@ public:
 
     void Load(BlobType type, const std::string& name, std::vector<u8>& data);
     void Load(BlobType type, const std::string& name, std::vector<u32>& data);
+    /// Whether a blob is stored, without reporting a missing one (on-demand loading probes).
+    [[nodiscard]] bool Exists(BlobType type, const std::string& name) const;
 
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
 

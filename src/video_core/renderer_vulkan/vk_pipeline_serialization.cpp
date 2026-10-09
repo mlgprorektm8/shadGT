@@ -6,6 +6,7 @@
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "video_core/cache_storage.h"
+#include "video_core/renderer_vulkan/shader_usage_serde.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -20,7 +21,10 @@ static constexpr u32 ShaderBinaryVersion = 15u;
 // Version 14: stored specializations no longer include compile-time runtime-info changes.
 // 15: shader attribute loads/stores are stored (FIX-012). Version 14 entries still load, with
 // their flags recovered on first use by a rect/quad-list pipeline.
-static constexpr u32 ShaderMetaVersion = 15u;
+// 16: the resource usage FIX-043 keys permutations by follows the Info. Versions 14 and 15
+// still load, as translations of unknown usage (keyed on every resource property, as stored).
+static constexpr u32 ShaderMetaVersion = 16u;
+static constexpr u32 ShaderMetaVersionWithoutResourceUsage = 15u;
 static constexpr u32 ShaderMetaVersionWithoutAttributeFlags = 14u;
 // 9: rect/quad-list helper shaders built from complete attribute info (FIX-012). Version 8
 // entries still load unless they carry such helper shaders, which may have been built from a
@@ -91,6 +95,7 @@ void RegisterShaderMeta(const Shader::Info& info,
 
     spec.Serialize(ar);
     info.Serialize(ar);
+    WriteResourceUsage(meta, info);
 
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderMeta,
                                        fmt::format("{:#018x}", perm_hash), ar.TakeOff());
@@ -113,6 +118,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     u32 meta_version{};
     meta.Read(meta_version);
     if (meta_version != Serialization::ShaderMetaVersion &&
+        meta_version != Serialization::ShaderMetaVersionWithoutResourceUsage &&
         meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags) {
         return false;
     }
@@ -128,7 +134,12 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
-    info.Deserialize(ar, perm_hash_ar, meta_version == Serialization::ShaderMetaVersion);
+    info.Deserialize(ar, perm_hash_ar,
+                     meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags);
+    info.resource_usage_known = false;
+    if (meta_version >= Serialization::ShaderMetaVersion) {
+        ReadResourceUsage(meta, info);
+    }
     return true;
 }
 
