@@ -38,7 +38,8 @@ void assert_fail_impl() {
 namespace {
 using VideoCore::ImageInfo;
 
-ImageInfo Color2D(VAddr address, u32 width, u32 height, u32 levels, AmdGpu::TileMode tile_mode) {
+ImageInfo Color2D(VAddr address, u32 width, u32 height, u32 levels, AmdGpu::TileMode tile_mode,
+                  vk::Format format = vk::Format::eB10G11R11UfloatPack32, u32 bits = 32) {
     ImageInfo info{};
     info.guest_address = address;
     info.type = AmdGpu::ImageType::Color2D;
@@ -46,8 +47,8 @@ ImageInfo Color2D(VAddr address, u32 width, u32 height, u32 levels, AmdGpu::Tile
     info.props.is_block = false;
     info.props.is_pow2 = false;
     info.props.is_tiled = true;
-    info.pixel_format = vk::Format::eB10G11R11UfloatPack32;
-    info.num_bits = 32;
+    info.pixel_format = format;
+    info.num_bits = bits;
     info.num_samples = 1;
     info.size = {width, height, 1};
     info.pitch = std::max(width, 8u);
@@ -107,4 +108,31 @@ TEST(ImageMips, MacroTiledLevelsStillNeedTheSameArrayMode) {
     // A depth (different micro tile mode) target at a micro-tiled mip is not that mip either.
     const auto depth = Color2D(0x100a668000, 64, 32, 1, AmdGpu::TileMode::Depth1DThin);
     EXPECT_EQ(depth.MipOf(texture), -1);
+}
+
+// FIX-040: in the bad car thumbnail capture (bundle 20261009-130850), the environment memory at
+// 0x1009bc0000 was cached as a 1-level R8G8B8A8 image (uid 8693) when the game rendered and
+// sampled it as B10G11R11; in the good one (20261009-130627) it was cached as B10G11R11 (uid
+// 1985). Sampling it as the 12-level texture must expand the cached image in both cases.
+TEST(ImageMips, FullChainExtendsAnImageCachedUnderAnotherFormat) {
+    const auto texture = Color2D(EnvMap, 2048, 1024, 12, Macro);
+    const auto cached_rgba8 =
+        Color2D(EnvMap, 2048, 1024, 1, Macro, vk::Format::eR8G8B8A8Unorm, 32);
+    EXPECT_TRUE(texture.ExtendsAcrossFormat(cached_rgba8));
+
+    // Same format: the ordinary expansion path handles it.
+    const auto cached_same = Color2D(EnvMap, 2048, 1024, 1, Macro);
+    EXPECT_FALSE(texture.ExtendsAcrossFormat(cached_same));
+    // A single level of the other format stays a view (no more resources to add).
+    const auto level0 = Color2D(EnvMap, 2048, 1024, 1, Macro);
+    EXPECT_FALSE(level0.ExtendsAcrossFormat(cached_rgba8));
+    // Different texel size, size or tiling: a different surface, never copied bit for bit.
+    const auto cached_rgba16 =
+        Color2D(EnvMap, 2048, 1024, 1, Macro, vk::Format::eR16G16B16A16Sfloat, 64);
+    EXPECT_FALSE(texture.ExtendsAcrossFormat(cached_rgba16));
+    const auto cached_small = Color2D(EnvMap, 512, 512, 1, Macro, vk::Format::eR8G8B8A8Unorm, 32);
+    EXPECT_FALSE(texture.ExtendsAcrossFormat(cached_small));
+    const auto cached_linear =
+        Color2D(EnvMap, 2048, 1024, 1, Micro, vk::Format::eR8G8B8A8Unorm, 32);
+    EXPECT_FALSE(texture.ExtendsAcrossFormat(cached_linear));
 }

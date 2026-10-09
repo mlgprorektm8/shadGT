@@ -75,6 +75,21 @@ struct ImageInfo {
                size.depth == 1 && info.size.depth == 1;
     }
 
+    /// FIX-040: whether this image is a larger view (more mips or layers) of an image cached at
+    /// the same address with the same layout but another color format of the same texel size.
+    /// GPU memory has no format: the cached image only records the first use (GT Sport's car
+    /// thumbnail environment at 0x1009bc0000 is sometimes first bound as R8G8B8A8 and later
+    /// rendered and sampled as a 12-level B10G11R11 texture). Such a request must expand the
+    /// cached image like a same-format one, not become a view of its single level.
+    bool ExtendsAcrossFormat(const ImageInfo& cached) const {
+        return guest_address == cached.guest_address && pixel_format != cached.pixel_format &&
+               type == cached.type && !props.is_depth && !cached.props.is_depth &&
+               props.is_block == cached.props.is_block && num_bits == cached.num_bits &&
+               num_samples == cached.num_samples && size == cached.size &&
+               pitch == cached.pitch && tile_mode == cached.tile_mode &&
+               resources > cached.resources;
+    }
+
     void UpdateSize() noexcept;
 
     struct {
