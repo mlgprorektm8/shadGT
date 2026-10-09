@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <bitset>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -139,6 +140,15 @@ struct Info : InfoPersistent {
     bool stores_tess_level_outer{};
     bool stores_tess_level_inner{};
     bool translation_failed{};
+
+    // FIX-043: which bound-resource properties translation read, so StageSpecialization keys a
+    // permutation only on those. Set by the resource patching pass; false for a shader loaded
+    // from storage, whose key keeps every property.
+    bool resource_usage_known{};
+    // The buffer's V# stride entered an address (indexed, thread-id or swizzled addressing).
+    std::bitset<NUM_BUFFERS> buffer_stride_used{};
+    // The image's sRGB format decided a forced degamma (a sampler with force_degamma).
+    std::bitset<NUM_IMAGES> image_srgb_used{};
 
     std::array<Interpolation, IR::NumParams> fs_interpolation{};
 

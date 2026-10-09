@@ -134,6 +134,135 @@ TEST(ShaderBindings, CountsMipFallbackDescriptorsWhenReusingAModule) {
     EXPECT_EQ(binding.buffer, 4);
 }
 
+namespace {
+
+// FIX-043: specializations built the way the pipeline cache builds them, from a translated
+// shader's Info and the V#/T#s bound for a draw.
+AmdGpu::Buffer BoundBuffer(u32 stride) {
+    AmdGpu::Buffer buffer{};
+    buffer.base_address = 0x10000;
+    buffer.num_records = 256;
+    buffer.stride = stride;
+    return buffer;
+}
+
+void Bind(Shader::BufferResource& resource, const AmdGpu::Buffer& buffer) {
+    std::memcpy(resource.sharp_fetch.immediates.data(), &buffer, sizeof(buffer));
+}
+
+void Bind(Shader::ImageResource& resource, const AmdGpu::Image& image) {
+    std::memcpy(resource.sharp_fetch.immediates.data(), &image, sizeof(image));
+}
+
+Shader::StageSpecialization KeyFor(const Shader::Info& info) {
+    Shader::RuntimeInfo runtime_info{};
+    runtime_info.Initialize(info.hw_stage, info.sw_stage);
+    return Shader::StageSpecialization(info, runtime_info, Shader::Profile{}, {});
+}
+
+Shader::Info TranslatedFragmentWithBuffer(bool usage_known) {
+    Shader::Info info;
+    info.hw_stage = Shader::HwStage::Fragment;
+    info.sw_stage = Shader::SwStage::Fragment;
+    info.buffers.emplace_back();
+    info.resource_usage_known = usage_known;
+    return info;
+}
+
+} // namespace
+
+TEST(ShaderSpecialization, StrideOfABufferWithoutIndexedAddressingDoesNotSplitPermutations) {
+    auto info = TranslatedFragmentWithBuffer(true);
+    Bind(info.buffers[0], BoundBuffer(16));
+    const auto compiled = KeyFor(info);
+    Bind(info.buffers[0], BoundBuffer(48));
+    EXPECT_TRUE(compiled == KeyFor(info));
+
+    // Indexed addressing multiplies by the stride, so it stays in the key.
+    info.buffer_stride_used.set(0);
+    Bind(info.buffers[0], BoundBuffer(16));
+    const auto indexed = KeyFor(info);
+    Bind(info.buffers[0], BoundBuffer(48));
+    EXPECT_FALSE(indexed == KeyFor(info));
+}
+
+TEST(ShaderSpecialization, KeepsEveryBufferPropertyWhenTranslationUsageIsUnknown) {
+    // A shader loaded from storage carries no usage flags.
+    auto info = TranslatedFragmentWithBuffer(false);
+    Bind(info.buffers[0], BoundBuffer(16));
+    const auto compiled = KeyFor(info);
+    Bind(info.buffers[0], BoundBuffer(48));
+    EXPECT_FALSE(compiled == KeyFor(info));
+}
+
+TEST(ShaderSpecialization, ThreadIdAddressingAndCoherenceSplitPermutations) {
+    auto info = TranslatedFragmentWithBuffer(true);
+    Bind(info.buffers[0], BoundBuffer(16));
+    const auto compiled = KeyFor(info);
+
+    auto add_tid = BoundBuffer(16);
+    add_tid.add_tid_enable = 1;
+    Bind(info.buffers[0], add_tid);
+    EXPECT_FALSE(compiled == KeyFor(info));
+
+    auto coherent = BoundBuffer(16);
+    coherent.mtype = 3;
+    Bind(info.buffers[0], coherent);
+    EXPECT_FALSE(compiled == KeyFor(info));
+}
+
+TEST(ShaderSpecialization, UnboundBufferIsComparedWithTheDescriptorTranslationSaw) {
+    auto info = TranslatedFragmentWithBuffer(true);
+    // Translated while the slot held an empty, unswizzled V#.
+    auto empty = BoundBuffer(16);
+    empty.num_records = 0;
+    Bind(info.buffers[0], empty);
+    const auto compiled = KeyFor(info);
+    EXPECT_FALSE(compiled.bitset[0]);
+    Bind(info.buffers[0], BoundBuffer(64));
+    EXPECT_TRUE(compiled == KeyFor(info));
+
+    // Swizzled addressing in the empty V# went into the code, so a plain V# needs new code.
+    auto swizzled = empty;
+    swizzled.swizzle_enable = 1;
+    Bind(info.buffers[0], swizzled);
+    const auto compiled_swizzled = KeyFor(info);
+    Bind(info.buffers[0], BoundBuffer(64));
+    EXPECT_FALSE(compiled_swizzled == KeyFor(info));
+
+    // A typed buffer read through a null V# returns zeros; a bound one needs new code.
+    info.buffers[0].is_formatted = true;
+    Bind(info.buffers[0], AmdGpu::Buffer::Null());
+    const auto compiled_typed = KeyFor(info);
+    auto typed = BoundBuffer(16);
+    typed.data_format = static_cast<u32>(AmdGpu::DataFormat::Format32);
+    Bind(info.buffers[0], typed);
+    EXPECT_FALSE(compiled_typed == KeyFor(info));
+}
+
+TEST(ShaderSpecialization, SrgbFormatSplitsPermutationsOnlyWhenItDecidesADegamma) {
+    Shader::Info info;
+    info.hw_stage = Shader::HwStage::Fragment;
+    info.sw_stage = Shader::SwStage::Fragment;
+    info.images.emplace_back();
+    info.resource_usage_known = true;
+    auto image = AmdGpu::Image::Null(false);
+    image.base_address = 0x100;
+    Bind(info.images[0], image);
+    const auto compiled = KeyFor(info);
+    ASSERT_TRUE(compiled.bitset[0]);
+    auto srgb = image;
+    srgb.num_format = static_cast<u64>(AmdGpu::NumberFormat::Srgb);
+    Bind(info.images[0], srgb);
+    EXPECT_TRUE(compiled == KeyFor(info));
+
+    info.image_srgb_used.set(0);
+    Bind(info.images[0], image);
+    const auto degamma = KeyFor(info);
+    Bind(info.images[0], srgb);
+    EXPECT_FALSE(degamma == KeyFor(info));
+}
+
 // These focused header tests do not initialize the emulator's logging or fatal-error backend.
 void Common::Log::VLog(Class, Level, const char* file, int line, const char*, fmt::string_view,
                        fmt::format_args) {
@@ -142,4 +271,14 @@ void Common::Log::VLog(Class, Level, const char* file, int line, const char*, fm
 
 void assert_fail_impl() {
     std::abort();
+}
+
+void unreachable_impl() {
+    std::abort();
+}
+
+// StageSpecialization parses a fetch shader only for vertex stages, which these tests do not use.
+bool Shader::Gcn::ParseFetchShader(const Shader::Info&, Shader::Gcn::FetchShaderData&) {
+    ADD_FAILURE() << "Unexpected fetch shader parse";
+    return false;
 }

@@ -641,6 +641,13 @@ void PatchBufferArgs(IR::Inst& inst, Info& info) {
         return;
     }
 
+    // FIX-043: the V# stride enters the address only through an index (IDXEN), the thread id
+    // or swizzling; other strides can reuse this translation.
+    const auto inst_info = inst.Flags<IR::BufferInstInfo>();
+    if (inst_info.index_enable || buffer.add_tid_enable || buffer.swizzle_enable) {
+        info.buffer_stride_used.set(handle.U32());
+    }
+
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
     inst.SetArg(IR::LoadBufferArgs::Address,
                 CalculateBufferAddress(ir, inst, info, buffer, buffer.stride));
@@ -832,6 +839,10 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
     }();
 
     auto converted = ApplyReadNumberConversionVec4(ir, texel, image.GetNumberConversion());
+    if (sampler.force_degamma) {
+        // FIX-043: only here does the T#'s sRGB format change the code.
+        info.image_srgb_used.set(&image_res - info.images.data());
+    }
     if (sampler.force_degamma && image.GetNumberFmt() != AmdGpu::NumberFormat::Srgb) {
         converted = ApplyForceDegamma(ir, texel);
     }
@@ -960,6 +971,7 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
             PatchGlobalDataShareAccess(inst, info, descriptors, profile);
         }
     }
+    info.resource_usage_known = true;
 }
 
 } // namespace Shader::Optimization

@@ -19,6 +19,8 @@ struct Program {
         std::unique_ptr<Shader::Info> info;
         /// The SPIR-V, kept only in diagnostic runs (SHADGT_DIAG) for diagnostic bundles.
         std::vector<u32> spv;
+        /// FIX-043 diagnostic: hash of the SPIR-V, to count permutations that repeat another.
+        u64 spv_hash{};
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;

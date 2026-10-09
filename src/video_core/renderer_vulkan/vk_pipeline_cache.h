@@ -116,8 +116,12 @@ private:
     bool RefreshComputeKey();
 
     void DumpFailedShader(std::span<const u32> code, u64 hash, Shader::HwStage stage);
+    void LogRepeatedPermutation(const Program& program, size_t perm_idx, Shader::HwStage hw_stage,
+                                u64 pgm_hash);
     std::unordered_set<u64> failed_shaders;
     std::vector<u32> diag_last_spv;
+    /// FIX-043 diagnostic: hash of the SPIR-V that CompileModule produced last.
+    u64 last_spv_hash{};
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
     std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::HwStage stage, size_t perm_idx,

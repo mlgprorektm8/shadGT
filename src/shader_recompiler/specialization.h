@@ -29,12 +29,16 @@ struct BufferSpecialization {
     u32 num_format : 4;
     u32 index_stride : 2;
     u32 element_size : 2;
+    // FIX-043: recorded only for a translation with known resource usage (zero otherwise).
+    u32 add_tid_enable : 1;
+    u32 coherent : 1;
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
 
     bool operator==(const BufferSpecialization& other) const {
         return stride == other.stride && is_formatted == other.is_formatted &&
-               swizzle_enable == other.swizzle_enable &&
+               swizzle_enable == other.swizzle_enable && add_tid_enable == other.add_tid_enable &&
+               coherent == other.coherent &&
                (!is_formatted ||
                 (data_format == other.data_format && num_format == other.num_format &&
                  dst_select == other.dst_select && num_conversion == other.num_conversion)) &&
@@ -111,36 +115,51 @@ struct StageSpecialization {
                              spec.dst_select = sharp.DstSelect();
                          });
         }
+        // FIX-043: with the resource usage of the translation known, the key holds only the
+        // properties the code was built from: a buffer's stride when it entered an address, an
+        // image's sRGB format when it decided a forced degamma, and for an unbound buffer the
+        // V# translation saw instead of zeros. Thread-id addressing and coherence, which the
+        // code also reads from the V#, are added to the key.
+        const bool usage_known = info->resource_usage_known;
         u32 binding{};
-        ForEachSharp(binding, buffers, info->buffers,
-                     [](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
-                         spec.stride = sharp.GetStride();
-                         spec.is_formatted = desc.is_formatted;
-                         spec.swizzle_enable = sharp.swizzle_enable;
-                         if (spec.is_formatted) {
-                             spec.data_format = static_cast<u32>(sharp.GetDataFmt());
-                             spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
-                             spec.dst_select = sharp.DstSelect();
-                             spec.num_conversion = sharp.GetNumberConversion();
-                         }
-                         if (spec.swizzle_enable) {
-                             spec.index_stride = sharp.index_stride;
-                             spec.element_size = sharp.element_size;
-                         }
-                     });
-        ForEachSharp(binding, images, info->images,
-                     [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                         spec.type = sharp.GetViewType(desc.is_array);
-                         spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
-                         spec.is_storage = desc.is_written;
-                         if (spec.is_storage) {
-                             spec.dst_select = sharp.DstSelect();
-                         } else {
-                             spec.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
-                         }
-                         spec.num_conversion = sharp.GetNumberConversion();
-                         spec.num_bindings = desc.NumBindings(*info);
-                     });
+        ForEachSharp(
+            binding, buffers, info->buffers,
+            [this, usage_known](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+                const size_t index = &desc - info->buffers.data();
+                spec.stride =
+                    !usage_known || info->buffer_stride_used[index] ? sharp.GetStride() : 0;
+                if (usage_known) {
+                    spec.add_tid_enable = sharp.add_tid_enable;
+                    spec.coherent =
+                        desc.buffer_type == BufferType::SharedMemory || sharp.mtype == 3;
+                }
+                spec.is_formatted = desc.is_formatted;
+                spec.swizzle_enable = sharp.swizzle_enable;
+                if (spec.is_formatted) {
+                    spec.data_format = static_cast<u32>(sharp.GetDataFmt());
+                    spec.num_format = static_cast<u32>(sharp.GetNumberFmt());
+                    spec.dst_select = sharp.DstSelect();
+                    spec.num_conversion = sharp.GetNumberConversion();
+                }
+                if (spec.swizzle_enable) {
+                    spec.index_stride = sharp.index_stride;
+                    spec.element_size = sharp.element_size;
+                }
+            },
+            usage_known);
+        ForEachSharp(
+            binding, images, info->images, [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
+                spec.type = sharp.GetViewType(desc.is_array);
+                spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
+                spec.is_storage = desc.is_written;
+                if (spec.is_storage) {
+                    spec.dst_select = sharp.DstSelect();
+                } else if (!usage_known || info->image_srgb_used[&desc - info->images.data()]) {
+                    spec.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
+                }
+                spec.num_conversion = sharp.GetNumberConversion();
+                spec.num_bindings = desc.NumBindings(*info);
+            });
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.width = sharp.width;
@@ -172,12 +191,18 @@ struct StageSpecialization {
         }
     }
 
-    void ForEachSharp(u32& binding, auto& spec_list, auto& desc_list, auto&& func) {
+    void ForEachSharp(u32& binding, auto& spec_list, auto& desc_list, auto&& func,
+                      bool record_unbound = false) {
         for (const auto& desc : desc_list) {
             auto& spec = spec_list.emplace_back();
             const auto sharp = desc.GetSharp(*info);
             if (!sharp) {
                 binding++;
+                if (record_unbound) {
+                    // FIX-043: what translation saw for the unbound resource, so a bound one
+                    // later is compared with the code's inputs instead of with zeros.
+                    func(spec, desc, sharp);
+                }
                 continue;
             }
             bitset[binding++] = true;
