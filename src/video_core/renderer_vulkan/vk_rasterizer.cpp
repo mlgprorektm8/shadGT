@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/stencil_reference.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/fence_order.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_diag.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -649,16 +650,31 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     // (they are rare, unlike the small ones PERF-009 v1 slowed races with).
     // -DisablePerf 40 signals them right away.
     static const bool wait_large = Common::PerfFeatureEnabled(40);
-    const bool readbacks_pending = compute_queue
-                                       ? wait_large && texture_cache.HasLargePendingReadbacks()
-                                       : texture_cache.HasPendingReadbacks();
+    // FIX-041: fences wait for every readback issued before them, queued or in flight, of any
+    // size, on both queues (see fence_order.h). -DisablePerf 41 restores the previous rules.
+    static const bool order_all = Common::PerfFeatureEnabled(41);
     bool address_pending;
     {
         std::scoped_lock lk{deferred_fences_mutex};
         address_pending = deferred_fence_addresses.contains(address);
     }
-    if (!readbacks_pending && !address_pending) {
+    const FenceReadbackState state{
+        .compute_queue = compute_queue,
+        .queued_any = texture_cache.HasPendingReadbacks(),
+        .queued_large = compute_queue && texture_cache.HasLargePendingReadbacks(),
+        .in_flight = readback_fences.load() != 0,
+        .address_pending = address_pending,
+    };
+    if (!ShouldDeferFence(state, order_all, wait_large)) {
         return false;
+    }
+    if (order_all && state.in_flight && !state.queued_any && !address_pending) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 20) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-041: {} fence at {:#x} waits for an in-flight readback",
+                        compute_queue ? "compute" : "graphics", address);
+        }
     }
     texture_cache.ReleaseFinishedReadbacks();
     buffer_cache.ReleaseFinishedAsyncReadbacks();

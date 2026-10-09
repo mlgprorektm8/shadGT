@@ -96,6 +96,12 @@ target_link_libraries(shadps4_image_mips_test PRIVATE
     GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers magic_enum::magic_enum)
 gtest_discover_tests(shadps4_image_mips_test)
 
+add_executable(shadps4_fence_order_test test_fence_order.cpp)
+target_include_directories(shadps4_fence_order_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_fence_order_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_fence_order_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_fence_order_test)
+
 add_executable(shadps4_image_barriers_test test_image_barriers.cpp)
 target_include_directories(shadps4_image_barriers_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_image_barriers_test PRIVATE cxx_std_23)
