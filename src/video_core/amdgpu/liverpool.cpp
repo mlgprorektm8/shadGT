@@ -495,6 +495,10 @@ void Liverpool::ReportDrawPipe() {
                                  pipe_read_ahead_stats.ms);
         pipe_read_ahead_stats = {};
     }
+    if (commands_recorded != 0) {
+        read_ahead += fmt::format("; {} commands run on the recorder", commands_recorded);
+        commands_recorded = 0;
+    }
     LOG_WARNING(Render,
                 "PERF-031 draw pipe in {:.1f} s: {} jobs, recorder busy {:.0f}%, max queued {}, "
                 "{} full-queue waits; {} waits moved to the recorder; drains {} ({} waited, "
@@ -537,7 +541,14 @@ void Liverpool::ProcessCommands() {
         return;
     }
     // PERF-031: commands from other threads (flips, cache flushes, unmaps) use the caches.
-    SyncRecorder("commands");
+    // PERF-035: with the draw pipe they run on the recorder, in order behind the work decoded so
+    // far (where a drain would have run them here), and decoding goes on meanwhile. A sender
+    // that waits for its command still returns only once it ran. -DisablePerf 50 drains instead.
+    static const bool commands_on_recorder = Common::PerfFeatureEnabled(50);
+    const bool record = draw_pipe && commands_on_recorder;
+    if (!record) {
+        SyncRecorder("commands");
+    }
     // Process incoming commands with high priority
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
@@ -547,7 +558,12 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
-        callback();
+        if (record) {
+            ++commands_recorded;
+            Record(std::move(callback));
+        } else {
+            callback();
+        }
     }
 }
 

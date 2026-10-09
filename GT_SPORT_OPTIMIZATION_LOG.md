@@ -1310,3 +1310,89 @@ Lance's runs (16:44 pipe + cache, 16:54 cache) ran races at about 24 FPS in both
 - XXH3 of 4 KB pages runs at 45-49 GB/s here, about 3 ms per frame for a 10 MB hot set
   checked 14 times. The upload path costs about 13 ms per frame for 130 MB.
 - A 2 s `PERF-033 hot pages` line reports pages not uploaded and the MB saved.
+
+## Severe stalls in the pipe build, PERF-034 and PERF-035 (October 9, branch `perf-parallel-gpu`)
+
+Lance's 17:23 race on the pipe build ran at 30-40 FPS but with severe stalls. The DIAG-033 stall
+lines (game frames of 100 ms or more) from that log and the 16:54 main-build race:
+
+| Run | Frames | Stalls >= 100 ms | Stall time | Pipelines | Built on |
+|---|---|---|---|---|---|
+| 16:54 main (read-ahead on) | 7,693 | 87 | 26.6 s | 2,057 | 2,046 on `shadGT:PipelineBuild` workers |
+| 17:23 pipe (read-ahead off) | 22,600 | 141 | 80.4 s | 3,038 | all on `shadGT:GpuRecorder` |
+
+The stalls in the 17:23 run, grouped by cause:
+
+| Cause | Stalls | Time | Share |
+|---|---|---|---|
+| Pipeline creation on the recorder | 83 | 65.9 s | 82% |
+| Command-buffer waits while pipelines were being built | 25 | 9.3 s | 12% |
+| Other command-buffer and GPU waits | 6 | 0.8 s | 1% |
+| Unaccounted (outside draw steps; frames of about 130-150 ms) | 25 | 3.0 s | 4% |
+| Dispatch | 1 | 1.3 s | 2% |
+| Uploads | 1 | 0.1 s | under 1% |
+
+- No stall was due to shader translation: 105 shaders were translated in the whole session, and
+  3,500 modules were loaded from the store.
+- No stall was due to memory protection.
+- FIX-044 held the guest clocks for 55.6 s in all, including 400 holds of 50 ms or more. Those
+  holds are the same compiles: the game's clock did not jump over them, but the picture froze.
+- Pipeline library creation took 46.7 s in all: a median of 1.6 ms per pipeline, and up to
+  304 ms.
+- Per pipeline built, stall time was 26 ms on the pipe build and 13 ms on main. Main read ahead:
+  1,909 of its 2,057 pipelines were already building before their draw.
+
+### PERF-034 (perf id 49): pipeline read-ahead with the draw pipe
+
+The recorder builds pipelines but cannot read the command buffers that the command thread is
+decoding, so the read-ahead was off with the pipe. Now the two threads split the work:
+
+- **Command thread: finding new states.** It offers the register state of each graphics draw it
+  decodes to a queue (`ReadAheadStates`). A state is a copy of the PERF-023 ranges (config,
+  graphics shader, context and uconfig registers; 34 KB).
+  - A state is hashed only when a register its pipeline key depends on was written since the
+    previous draw.
+  - A state is queued only if its hash is new. The hash is PERF-021/022's: graphics shader
+    registers without user data, plus the context and primitive registers.
+- **Command thread: reading ahead.** It reads the commands ahead of itself with the PERF-019
+  scanner and queues the new states it finds:
+  - at each command buffer's start, while a pipeline miss happened within 5 s;
+  - right after the recorder reports a miss.
+- **Recorder.** Before each draw, it takes up to 2 ms of queued states, computes their keys, and
+  starts worker builds for the keys that are new.
+  - On a miss, the recorder starts the current pipeline as an urgent build and keeps starting
+    builds for newly queued states while it waits. If no worker picks the build up, the recorder
+    builds it itself.
+  - Afterwards it recomputes the current key, and checks it is unchanged.
+- The queue holds 512 states and reuses their buffers.
+- The read-ahead is speculative. A draw always computes its own key, so a wrong or unused state
+  only costs a build that nobody uses.
+- A 2 s line reports what happened: `PERF-034 pipeline read-ahead in 2.0 s: ... evaluated, ...
+  builds started, ...; ... draws waited for a build`. The PERF-031 line adds `read-ahead: N draw
+  states queued`.
+
+### PERF-035 (perf id 50): commands from other threads run on the recorder
+
+- Commands from other threads are flips, CPU-fault readbacks and texture unmaps. Until now the
+  command thread drained the pipe for each one and ran it itself: 120-330 times per 2 s in
+  races, blocking it for up to 450 ms per 2 s.
+- Now each command is queued to the recorder, in the same order. Decoding goes on meanwhile.
+- A sender waiting for its command (a faulting game thread, for example) still returns only
+  after the command ran.
+- The PERF-031 line adds `N commands run on the recorder`.
+
+### Checked offline
+
+- Unit tests: `shadps4_read_ahead_states_test` (6), and the 7 draw-pipe tests. They check:
+  - ranges copied exactly;
+  - user data not making new states, while program, context and primitive writes do;
+  - `AffectsPipeline` against the hash, for every register;
+  - a full queue not marking a state seen;
+  - misses seen once;
+  - order across threads.
+- The test build had been broken since PERF-033. `uploaded_pages.h` needs `tsl::robin_map` in
+  `shadps4_gcn_test` and `shadgt_wave64_inspect`, and both now have it.
+- 45 GCN instruction-execution tests fail: v_add3/or3/and_or, packed f16, mad_mix,
+  16-bit shifts, and some SCC carry cases. They test the shader recompiler, which this work does
+  not change.
+- `-DisablePerf 49` turns PERF-034 off, and `-DisablePerf 50` turns PERF-035 off.

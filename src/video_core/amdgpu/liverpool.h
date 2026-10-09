@@ -344,6 +344,8 @@ private:
     std::unordered_map<VAddr, PendingLabel> pending_labels;
     u64 label_jobs{};
     u64 waits_moved{};
+    // PERF-035: commands from other threads run on the recorder instead of after a drain.
+    u64 commands_recorded{};
     /// Records a job that writes `value` at `address` (a fence or WRITE_DATA).
     void RecordLabelWrite(VAddr address, std::vector<u8> value,
                           Common::UniqueFunction<void>&& work);
