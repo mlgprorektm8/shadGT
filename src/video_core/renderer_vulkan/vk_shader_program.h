@@ -17,6 +17,8 @@ struct Program {
         Shader::StageSpecialization spec;
         // Pipelines retain this address, so metadata must survive list reallocations.
         std::unique_ptr<Shader::Info> info;
+        /// FIX-043 diagnostic: hash of the SPIR-V, to count permutations that repeat another.
+        u64 spv_hash{};
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;

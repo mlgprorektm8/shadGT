@@ -1206,6 +1206,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
     ++Common::GetWorkCounters().shaders_compiled;
+    last_spv_hash = 0;
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
@@ -1230,6 +1231,11 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     }
     const auto translate_end = std::chrono::steady_clock::now();
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
+    last_spv_hash = XXH3_64bits(spv.data(), spv.size() * sizeof(u32));
+    if (!Common::PerfFeatureEnabled(44)) {
+        // FIX-043 off (-DisablePerf 44): permutations keyed on every resource property.
+        info.resource_usage_known = false;
+    }
 
     vk::ShaderModule module;
 
@@ -1442,10 +1448,39 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     RegisterShaderMeta(*info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
     const auto* info_ptr = info.get();
     program->InsertPermut(module, std::move(spec), std::move(info), perm_idx);
+    program->modules[perm_idx].spv_hash = last_spv_hash;
+    LogRepeatedPermutation(*program, perm_idx, hw_stage, params.hash);
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
     }
     return std::make_tuple(info_ptr, module, perm_hash);
+}
+
+void PipelineCache::LogRepeatedPermutation(const Program& program, size_t perm_idx,
+                                           Shader::HwStage hw_stage, u64 pgm_hash) {
+    // FIX-043 diagnostic: a new permutation whose SPIR-V equals an existing one's was translated
+    // only because their keys differ in a property its code does not read.
+    const auto& added = program.modules[perm_idx];
+    if (added.spv_hash == 0) {
+        return;
+    }
+    for (size_t i = 0; i < program.modules.size(); ++i) {
+        const auto& other = program.modules[i];
+        if (i == perm_idx || !other.info || other.spv_hash != added.spv_hash) {
+            continue;
+        }
+        static u64 repeats = 0;
+        ++repeats;
+        if (repeats <= 40 || repeats % 200 == 0) {
+            u32 index{};
+            const char* reason = other.spec.FirstDifference(added.spec, index);
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-043: permutation {} of {}_{:#x} has the same SPIR-V as permutation "
+                        "{} (keys differ first in {}[{}]); {} such repeats so far",
+                        perm_idx, hw_stage, pgm_hash, i, reason ? reason : "none", index, repeats);
+        }
+        return;
+    }
 }
 
 bool PipelineCache::IsTessEmulatedDraw() const {
