@@ -1080,6 +1080,7 @@ void Rasterizer::ResetBindings(bool is_compute) {
     bound_images.clear();
     bound_buffers.clear();
     diag_empty_bindings.clear();
+    diag_sharp_reads.clear();
     diag_storage_images.clear();
     needs_barrier = false;
 }
@@ -1349,36 +1350,42 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             // -DisablePerf 39 binds the clamped range.
             static const bool null_impossible = Common::PerfFeatureEnabled(39);
             constexpr u64 GpuAddressLimit = 1ULL << 40;
-            // FIX-036: also a V# of 1 GB or more whose base is outside guest memory (the same
-            // shader, base 0x92 at the purchase dialog); ClampRangeSize asserted on it.
+            // FIX-036: also a V# whose base is outside guest memory (the same shader: base 0x92
+            // at the purchase dialog, where ClampRangeSize asserted, and 0xa0fffc0000, whose
+            // pages were then hashed).
             const bool impossible =
                 null_impossible && vsharp.num_records != UINT32_MAX &&
                 (vsharp.GetSize() >= GpuAddressLimit ||
                  u64(vsharp.base_address) + vsharp.GetSize() > GpuAddressLimit ||
-                 (vsharp.GetSize() >= 1_GB && vsharp.base_address != 0 &&
-                  !memory->IsValidMapping(vsharp.base_address)));
+                 (vsharp.GetSize() != 0 && vsharp.base_address != 0 &&
+                  (!memory->IsValidMapping(vsharp.base_address, 4) ||
+                   !memory->IsMappedAddress(vsharp.base_address))));
+            // DIAG-039: where each V# dword came from (user data index, its value, and the
+            // guest address it was loaded from).
+            const auto sharp_source = [&] {
+                std::string source;
+                const auto& fetch = desc.sharp_fetch;
+                const bool single =
+                    fetch.summary == std::remove_cvref_t<decltype(fetch)>::Summary::SingleLoad;
+                for (u32 i = 0; i < 4; ++i) {
+                    if (!single && !((fetch.load_mask >> i) & 1)) {
+                        source += fmt::format(" imm={:08x}", fetch.immediates[i]);
+                        continue;
+                    }
+                    const u32 off = single ? u32(fetch.offsets[0]) + i : u32(fetch.offsets[i]);
+                    const u64 src =
+                        off < stage.flattened_ud_src.size() ? stage.flattened_ud_src[off] : 0;
+                    source += fmt::format(
+                        " [{}]={:08x}{}", off,
+                        off < stage.flattened_ud_buf.size() ? stage.flattened_ud_buf[off] : 0,
+                        src ? fmt::format("@{:#x}", src) : std::string(" ud"));
+                }
+                return source;
+            };
             if (impossible) {
                 static std::atomic<u32> logged{};
                 if (const u32 n = ++logged; n <= 20 || n % 1000 == 0) {
-                    // DIAG-039: where each V# dword came from (user data index, its value,
-                    // and the guest address it was loaded from).
-                    std::string source;
-                    const auto& fetch = desc.sharp_fetch;
-                    const bool single =
-                        fetch.summary == std::remove_cvref_t<decltype(fetch)>::Summary::SingleLoad;
-                    for (u32 i = 0; i < 4; ++i) {
-                        if (!single && !((fetch.load_mask >> i) & 1)) {
-                            source += fmt::format(" imm={:08x}", fetch.immediates[i]);
-                            continue;
-                        }
-                        const u32 off = single ? u32(fetch.offsets[0]) + i : u32(fetch.offsets[i]);
-                        const u64 src =
-                            off < stage.flattened_ud_src.size() ? stage.flattened_ud_src[off] : 0;
-                        source += fmt::format(
-                            " [{}]={:08x}{}", off,
-                            off < stage.flattened_ud_buf.size() ? stage.flattened_ud_buf[off] : 0,
-                            src ? fmt::format("@{:#x}", src) : std::string(" ud"));
-                    }
+                    const auto source = sharp_source();
                     LOG_WARNING(Render,
                                 "FIX-031: buffer {} (binding {}) for stage {:#x} bound empty: "
                                 "base={:#x}, stride={}, records={:#x} ends past the GPU address "
@@ -1389,10 +1396,26 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0 || impossible) {
                 // DIAG-041: empty buffer bindings of the draw.
-                diag_empty_bindings +=
-                    fmt::format(" | EMPTY buf {} of {:#x}: base={:#x} stride={} records={:#x}",
-                                buffer_infos.size(), stage.pgm_hash, u64(vsharp.base_address),
-                                vsharp.GetStride(), vsharp.num_records);
+                // Diagnostic bundles also record where the V# was read from.
+                diag_empty_bindings += fmt::format(
+                    " | EMPTY buf {} of {:#x}: base={:#x} stride={} records={:#x}{}",
+                    buffer_infos.size(), stage.pgm_hash, u64(vsharp.base_address),
+                    vsharp.GetStride(), vsharp.num_records,
+                    VideoCore::DiagBundle::Enabled() ? " V# from" + sharp_source() : std::string{});
+                if (VideoCore::DiagBundle::Enabled()) {
+                    const auto& fetch = desc.sharp_fetch;
+                    const bool single =
+                        fetch.summary == std::remove_cvref_t<decltype(fetch)>::Summary::SingleLoad;
+                    for (u32 i = 0; i < 4; ++i) {
+                        const u32 off = single ? u32(fetch.offsets[0]) + i : u32(fetch.offsets[i]);
+                        if ((single || ((fetch.load_mask >> i) & 1)) &&
+                            off < stage.flattened_ud_src.size() && stage.flattened_ud_src[off] &&
+                            off < stage.flattened_ud_buf.size()) {
+                            diag_sharp_reads.emplace_back(stage.flattened_ud_src[off],
+                                                          stage.flattened_ud_buf[off]);
+                        }
+                    }
+                }
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());

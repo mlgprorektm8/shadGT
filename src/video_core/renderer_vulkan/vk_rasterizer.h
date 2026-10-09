@@ -233,6 +233,9 @@ private:
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
     /// DIAG-041: buffers and images of the current draw that were bound empty.
     std::string diag_empty_bindings;
+    /// Diagnostic runs: guest address and value of each V# dword of the draw's empty buffer
+    /// bindings, so a bundle can tell whether the memory changed after the draw read it.
+    std::vector<std::pair<VAddr, u32>> diag_sharp_reads;
     /// Records the current draw or dispatch in the history that diagnostic bundles are written
     /// from, and starts a bundle whose trigger it matches (vk_rasterizer_diag.cpp).
     void RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 count);

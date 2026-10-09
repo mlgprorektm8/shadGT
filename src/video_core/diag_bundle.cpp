@@ -139,7 +139,7 @@ void CapturePm4(std::string_view queue, std::span<const u32> first, std::span<co
         return;
     }
     std::scoped_lock lk{pm4_mutex};
-    if (!pm4_active || pm4_count >= 4096) {
+    if (!pm4_active || pm4_count >= 65536) {
         return;
     }
     const u32 n = ++pm4_count;

@@ -27,6 +27,8 @@ struct Rasterizer::DiagCapture {
     std::unordered_set<u64> shaders;
     /// Buffer ranges bound during the capture -> written by a draw or dispatch.
     std::map<std::pair<VAddr, u32>, bool> buffers;
+    /// V# dwords of empty bindings: guest address -> (value the draw read, first draw).
+    std::map<VAddr, std::pair<u32, u64>> sharp_reads;
     /// Per image, the version and file of its last dump: unchanged images are not dumped again.
     std::unordered_map<u64, std::pair<u64, std::string>> dumped;
     std::ofstream images;

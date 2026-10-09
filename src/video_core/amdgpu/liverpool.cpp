@@ -390,6 +390,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            VideoCore::DiagBundle::CapturePm4(
+                "ce-ib", {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
             auto task =
                 ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
             RESUME_CE(task);
@@ -1157,6 +1159,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                VideoCore::DiagBundle::CapturePm4(
+                    "gfx-ib", {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size},
+                    {});
                 RecordCmdBuffer(indirect_buffer->Address<const u32>(),
                                 u64(indirect_buffer->ib_size) * sizeof(u32), true);
                 lookahead_outer.push_back(lookahead_dcb);
@@ -1463,6 +1468,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            VideoCore::DiagBundle::CapturePm4(
+                "asc-ib", {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
             auto task = ProcessCompute<true>(
                 {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
             RESUME_ASC(task, vqid);

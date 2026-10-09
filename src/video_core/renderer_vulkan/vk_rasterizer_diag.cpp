@@ -205,6 +205,11 @@ void Rasterizer::RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 c
                     diag_capture->shaders.insert(hash);
                 }
             }
+            for (const auto& [address, value] : diag_sharp_reads) {
+                if (diag_capture->sharp_reads.size() < 20000) {
+                    diag_capture->sharp_reads.try_emplace(address, value, record.seq);
+                }
+            }
             for (const auto& buffer : record.buffers) {
                 if (diag_capture->buffers.size() < 20000) {
                     diag_capture->buffers[{buffer.address, buffer.size}] |= buffer.written;
@@ -417,6 +422,30 @@ void Rasterizer::DiagFinish() {
         buffers.push_back(entry);
     }
     WriteJson(capture.dir / "buffers.json", buffers);
+
+    // Descriptors: the V# dwords of empty bindings as the draws read them, and the same guest
+    // memory now. A dword that changed was written after the draw read it (a descriptor read too
+    // early, or memory reused).
+    nlohmann::json descriptors = nlohmann::json::array();
+    u32 changed = 0;
+    for (const auto& [address, read] : capture.sharp_reads) {
+        const auto [value, seq] = read;
+        nlohmann::json entry = {{"address", fmt::format("{:#x}", address)},
+                                {"read", fmt::format("{:#010x}", value)},
+                                {"first_draw", seq}};
+        if (memory->IsValidMapping(address, 4)) {
+            const u32 now = *std::bit_cast<const u32*>(address);
+            entry["now"] = fmt::format("{:#010x}", now);
+            entry["changed"] = now != value;
+            changed += now != value ? 1 : 0;
+        }
+        descriptors.push_back(entry);
+    }
+    WriteJson(capture.dir / "descriptors.json", descriptors);
+    LOG_WARNING(Render_Vulkan,
+                "DIAG-BUNDLE: {} of {} empty-binding descriptor dwords changed "
+                "after the draws read them",
+                changed, capture.sharp_reads.size());
 
     const auto& request = capture.request;
     WriteJson(capture.dir / "manifest.json",
