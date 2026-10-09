@@ -329,6 +329,48 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 
+    // DIAG-041: draws into GT Sport's car thumbnail (448x126 linear targets): the shaders and
+    // every image they touch, to find where the car's colour is lost.
+    {
+        static u32 traced = 0;
+        bool thumbnail = false;
+        for (u32 cb = 0; cb < std::bit_width(pipeline->GetGraphicsKey().mrt_mask); ++cb) {
+            const auto image_id = cb_descs[cb].image_id;
+            if (image_id) {
+                const auto& info = texture_cache.GetImage(image_id).info;
+                thumbnail |= info.size.width == 448 && info.size.height == 126 &&
+                             !info.props.is_tiled;
+            }
+        }
+        if (thumbnail && traced < 300) {
+            ++traced;
+            std::string images;
+            for (const auto image_id : bound_images) {
+                const auto& image = texture_cache.GetImage(image_id);
+                images += fmt::format(
+                    " | img {} {:#x} {}x{} {} {} gpu={} ver={}", image_id.index,
+                    image.info.guest_address, image.info.size.width, image.info.size.height,
+                    vk::to_string(image.info.pixel_format), AmdGpu::NameOf(image.info.tile_mode),
+                    True(image.flags & VideoCore::ImageFlagBits::GpuModified),
+                    image.contents_version);
+            }
+            for (u32 cb = 0; cb < std::bit_width(pipeline->GetGraphicsKey().mrt_mask); ++cb) {
+                if (const auto image_id = cb_descs[cb].image_id) {
+                    const auto& image = texture_cache.GetImage(image_id);
+                    images += fmt::format(" | rt{} {} {:#x} {}", cb, image_id.index,
+                                          image.info.guest_address,
+                                          vk::to_string(image.info.pixel_format));
+                }
+            }
+            const auto hash = [&](Shader::SwStage stage) -> u64 {
+                const auto* info = pipeline->GetStages()[u32(stage)];
+                return info ? info->pgm_hash : 0;
+            };
+            LOG_WARNING(Render_Vulkan, "DIAG-041: thumbnail draw {} vs {:#x} fs {:#x}{}", traced,
+                        hash(Shader::SwStage::Vertex), hash(Shader::SwStage::Fragment), images);
+        }
+    }
+
     ResetBindings(false);
 }
 
