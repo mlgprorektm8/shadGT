@@ -16,6 +16,9 @@ import time
 
 frames = 0
 paused = False
+# The "screen" changes with every button press (FAKE_SHADGT_SCREEN_OFFSET shifts it, so a
+# replay sees different screens than were recorded).
+screen = int(os.environ.get("FAKE_SHADGT_SCREEN_OFFSET", "0"))
 pending_screenshots: list[str] = []
 lock = threading.Lock()
 quit_event = threading.Event()
@@ -45,13 +48,16 @@ def presenter() -> None:
             shots = list(pending_screenshots)
             pending_screenshots.clear()
         for path in shots:
-            from PIL import Image
+            from PIL import Image, ImageDraw
 
-            Image.new("RGB", (64, 36), (frames % 256, 80, 160)).save(path)
+            image = Image.new("RGB", (64, 36), (40 * (screen % 6), 80, 160))
+            ImageDraw.Draw(image).rectangle([4 * (screen % 12), 4, 4 * (screen % 12) + 10, 20],
+                                            fill=(255, 255, 255))
+            image.save(path)
 
 
 def reader() -> None:
-    global paused
+    global paused, screen
     lines = iter(sys.stdin.readline, "")
 
     def arg() -> str:
@@ -71,6 +77,8 @@ def reader() -> None:
             record(["PAD", *values])
             with lock:
                 until = frames + int(values[7], 0)
+                if int(values[0], 0) != 0:
+                    screen += 1
             out(f"PAD_OK {until}")
         elif cmd == "SCREENSHOT" and automation:
             path = arg()

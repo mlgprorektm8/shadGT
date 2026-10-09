@@ -36,7 +36,7 @@ def is_error(result):
     return bool(attr(result, "is_error", "isError"))
 
 
-class McpServerTest(unittest.TestCase):
+class ServerTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.profile = Path(self.tmp.name)
@@ -79,6 +79,8 @@ class McpServerTest(unittest.TestCase):
             return structured.get("result", structured)
         return json.loads(result.content[0].text)
 
+
+class McpServerTest(ServerTestBase):
     def test_tools_registered(self):
         async def body(s):
             return sorted(t.name for t in (await s.list_tools()).tools)
@@ -86,7 +88,9 @@ class McpServerTest(unittest.TestCase):
         names = self.run_session(body)
         self.assertEqual(names, sorted([
             "launch", "stop", "pause", "resume", "status", "read_log", "wait_for_log",
-            "list_dumps", "screenshot", "press", "input_sequence", "capture_frame"]))
+            "list_dumps", "screenshot", "press", "input_sequence", "capture_frame",
+            "checkpoint_save", "checkpoint_list", "checkpoint_delete", "checkpoint_edit",
+            "checkpoint_load", "error_inventory", "tour"]))
 
     def test_smoke_launch_screenshot_press_stop(self):
         """The smoke test Lance runs on the real game, against the stub."""
@@ -187,6 +191,84 @@ class McpServerTest(unittest.TestCase):
         self.assertEqual(launched["screenshot_mode"], "window capture")
         self.assertNotIn("frames", status)
         self.assertNotIn(["STATUS"], self.commands())
+
+
+class CheckpointTest(ServerTestBase):
+    def setUp(self):
+        super().setUp()
+        self.savedata = self.profile / "user/home/1000/savedata/CUSA03220"
+        self.savedata.mkdir(parents=True)
+        (self.savedata / "memory.dat").write_text("garage A", encoding="utf-8")
+
+    def test_record_and_replay(self):
+        async def body(s):
+            await s.call_tool("launch", {})
+            for button in ("cross", "down", "cross"):
+                self.data(await s.call_tool("press", {"button": button, "hold_ms": 30}))
+            saved = self.data(await s.call_tool(
+                "checkpoint_save", {"name": "dealership", "description": "test route"}))
+            await s.call_tool("stop", {})
+            # The run changed the save data; loading must put back what it started from.
+            (self.savedata / "memory.dat").write_text("garage B", encoding="utf-8")
+            listed = self.data(await s.call_tool("checkpoint_list", {}))
+            loaded = self.data(await s.call_tool("checkpoint_load", {"name": "dealership"}))
+            await s.call_tool("stop", {})
+            return saved, listed, loaded
+
+        saved, listed, loaded = self.run_session(body)
+        self.assertEqual(saved["steps"], 3)
+        self.assertEqual(listed[0]["presses"], "cross down cross")
+        self.assertTrue(loaded["arrived"], loaded)
+        self.assertEqual([s["similarity"] for s in loaded["steps"]], [1.0, 1.0, 1.0])
+        self.assertEqual(loaded["final_similarity"], 1.0)
+        self.assertEqual((self.savedata / "memory.dat").read_text(encoding="utf-8"), "garage A")
+        backup = self.profile / "savedata-backups/last-before-checkpoint/memory.dat"
+        self.assertEqual(backup.read_text(encoding="utf-8"), "garage B")
+        pads = [c for c in self.commands() if c[0] == "PAD" and c[1] != "0x0"]
+        self.assertEqual([p[1] for p in pads], ["0x4000", "0x40", "0x4000"] * 2)
+
+    def test_replay_stops_at_first_divergence(self):
+        async def body(s):
+            await s.call_tool("launch", {})
+            await s.call_tool("press", {"button": "cross", "hold_ms": 30})
+            await s.call_tool("checkpoint_save", {"name": "menu"})
+            await s.call_tool("stop", {})
+            return None
+
+        self.run_session(body)
+
+        async def replay(s):
+            loaded = self.data(await s.call_tool(
+                "checkpoint_load", {"name": "menu", "first_timeout_s": 2}))
+            await s.call_tool("stop", {})
+            return loaded
+
+        loaded = self.run_session(replay, {"FAKE_SHADGT_SCREEN_OFFSET": "3"})
+        self.assertFalse(loaded["arrived"])
+        self.assertIn("step 0 (cross)", loaded["error"])
+        # A box around a region that matches anyway lets the route through.
+
+    def test_inventory_after_run(self):
+        log = self.profile / "user/log/shad_log.txt"
+        log.write_text(
+            "[Core] <Error> (Game:Main) stubs.cpp:35 CommonStub: Stub: sceFoo (nid: x) called, "
+            "returning zero to 0x1234\n"
+            "[Lib.Pad] <Error> (Game:Main) pad.cpp:276 scePadInit: (STUBBED) called\n"
+            "[Lib.Pad] <Error> (Game:Main) pad.cpp:276 scePadInit: (STUBBED) called\n"
+            "[Debug] <Critical> (Game:Main) signals.cpp:147 SignalHandler: Unhandled Exception "
+            "code 0xc0000005 at 0x80001234\n", encoding="utf-8")
+
+        async def body(s):
+            await s.call_tool("launch", {})
+            stopped = self.data(await s.call_tool("stop", {}))
+            inv = self.data(await s.call_tool("error_inventory", {"logs": [str(log)]}))
+            return stopped, inv
+
+        stopped, inv = self.run_session(body)
+        self.assertEqual(stopped["inventory_summary"]["crash"], 1)
+        self.assertEqual(inv["summary"], {"crash": 1, "gpu": 0, "unimplemented": 1, "stub": 1,
+                                          "error": 0, "warning": 0})
+        self.assertTrue(inv["top"]["stub"][0].startswith("2x"))
 
 
 class UnitTest(unittest.TestCase):
