@@ -63,12 +63,7 @@ public:
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();
 
-    void WarmUp();
     void Sync();
-
-    bool LoadComputePipeline(Serialization::Archive& ar);
-    bool LoadGraphicsPipeline(Serialization::Archive& ar, bool has_attribute_flags);
-    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
@@ -98,11 +93,9 @@ private:
     class PipelineBuildWorkers;
     /// PERF-019: builds the pipeline for the current key on a worker thread.
     std::shared_ptr<PipelineBuild> StartPipelineBuild(bool urgent);
-    /// PERF-024: a build of the current key, infos and modules, queued at a priority.
-    enum class BuildPriority { Urgent, Normal, Background };
-    std::shared_ptr<PipelineBuild> MakePipelineBuild(
-        bool preloading, const GraphicsPipeline::SerializationSupport& sdata);
-    void QueueBuild(const std::shared_ptr<PipelineBuild>& build, BuildPriority priority);
+    /// A build of the current key, infos and modules.
+    std::shared_ptr<PipelineBuild> MakePipelineBuild();
+    void QueueBuild(const std::shared_ptr<PipelineBuild>& build, bool urgent);
     /// Builds the pipeline unless a worker already started; returns when it is built.
     void FinishBuild(PipelineBuild& build);
     /// PERF-019: starts builds for the new pipelines of the draws after the current one.
@@ -181,8 +174,6 @@ private:
     std::chrono::steady_clock::time_point driver_cache_saved_at{};
     std::jthread driver_cache_writer;
 
-    struct PreloadQueue;
-    PreloadQueue* preload_queue{};
     std::unordered_set<u64> logged_swizzled_blends;
 
     // Only if Config::collectShadersForDebug()
@@ -207,8 +198,6 @@ private:
     } read_ahead_stats;
     u32 last_scan_draws{};
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
-    /// PERF-024: cached pipelines are built by workers after the game has started.
-    bool background_preload{};
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
 };

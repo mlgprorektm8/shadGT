@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$BuildDirectory = (Join-Path $PSScriptRoot '../Build/x64-Clang-Release'),
     [string]$ProfileConfig = (Join-Path $PSScriptRoot '../Build/gt-sport-fixed/user/config.json'),
     # The unpacked win64 release of https://github.com/shadps4-emu/shadps4-qtlauncher.
@@ -100,9 +100,8 @@ to play.
 If the game crashes on start, a third-party overlay (screen recorder, FPS counter, GPU
 tuning tool) may be hooking Vulkan; close it and try again.
 
-The first launch compiles shaders as the game needs them, so it stutters until the shader
-cache in user\cache has been built up; later launches precompile it with a progress counter
-in the window title.
+Shaders compile as the game needs them, so new scenes can stutter the first time they
+appear. The driver pipeline cache in user\cache makes later launches compile faster.
 
 Settings tested for accuracy (do not change unless comparing): readbacks_mode 1 and
 readback_linear_images_enabled true in user\config.json.

@@ -1077,3 +1077,24 @@ Lance chose (October 7) to keep this branch separate from `main` until it reache
 
 - PERF-010 fence deferral for hot pages: deferring fences until page readbacks landed made races slower (14-18 vs 20-35 FPS). Page readbacks now only ride along with fences.
 - PERF-011 (skip GPU-written bytes in uploads instead of draining on CPU write faults next to them): fine with 64-byte granularity, but with exact store sizes (PERF-011b) it fired every frame and produced blue, exploded vertices around the track. Without byte-level CPU write tracking it can lose CPU stores to excluded bytes, so it is disabled.
+
+## Shader precompilation removed (October 9, branch `mcp-server`)
+
+Lance asked (October 9) for the shader precompilation to be deleted completely. Removed:
+
+- `PipelineCache::WarmUp` (upstream's preload of every stored pipeline at startup) and its
+  loaders `LoadGraphicsPipeline`, `LoadComputePipeline` and `LoadPipelineStage`.
+- FIX-011's worker-thread precompile (`PreloadQueue`) and the "Compiling shaders N / M"
+  window title.
+- PERF-024's background build of stored pipelines: the low-priority worker queue, the
+  `preloading` builds and their promotion by the read-ahead, and the `-DisablePerf 24` switch.
+- The `preloading` constructor argument of graphics and compute pipelines (only used for
+  pipelines built from stored data).
+
+The shader database (`user/cache`) is no longer opened, so it is neither read nor written and
+the files stay as they are (cache format versions unchanged). Every pipeline compiles the
+first time a draw needs it.
+
+Kept: the driver pipeline cache (`<serial>.vkpipelinecache`, loaded at start and saved
+during play and on exit), the read-ahead builds (PERF-019 to 023) and the shader cache's
+serialization code.
