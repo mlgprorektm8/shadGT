@@ -123,6 +123,14 @@ def scan(paths: list[Path]) -> dict[str, Group]:
                 if not m:
                     continue
                 level, cls, func, msg = m["level"], m["cls"], m["func"], m["msg"]
+                if (m["loc"].startswith("signals.cpp") and recent_crash and
+                        not msg.startswith("Unhandled Exception")):
+                    # Details of the crash report above (registers, fault address, stacks).
+                    target = recent_crash[1]
+                    if "host code" in msg.lower() or "stack" in msg.lower() or                             msg.startswith(("Fault address", "Guest instruction", "RIP ")):
+                        target.stack = (target.stack + " || " if target.stack else "") + msg[:600]
+                    recent_crash = (number, target)
+                    continue
                 if msg.startswith("Host stack:"):
                     # The call stack of the failed check logged just before it.
                     target = recent_crash[1] if recent_crash else last_group
