@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
+#include "common/perf_monitor.h"
 #include "common/singleton.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/equeue.h"
@@ -59,8 +61,11 @@ bool EqueueInternal::AddEvent(EqueueEvent& event) {
         // Calculate timer interval
         event.time_added = std::chrono::steady_clock::now();
         if (event.event.filter == OrbisKernelEvent::Filter::Timer) {
-            // Set timer interval, this is stored in milliseconds for timers.
-            event.timer_interval = std::chrono::milliseconds(event.event.data);
+            // Set timer interval, this is stored in milliseconds for timers, unless the caller
+            // already set the exact period (FIX-042: sceKernelAddTimerEvent takes microseconds).
+            if (event.timer_interval.count() == 0) {
+                event.timer_interval = std::chrono::milliseconds(event.event.data);
+            }
         } else if (event.event.filter == OrbisKernelEvent::Filter::HrTimer) {
             // Retrieve inputted time, this is stored in the bintime format.
             OrbisKernelBintime* time = reinterpret_cast<OrbisKernelBintime*>(event.event.data);
@@ -553,6 +558,20 @@ int PS4_SYSV_ABI sceKernelAddTimerEvent(OrbisKernelEqueue eq, int id, OrbisKerne
     event.event.fflags = 0;
     event.event.data = usec / 1000;
     event.event.udata = udata;
+    // FIX-042: the period is in microseconds. Rounding it down to whole milliseconds made a
+    // 16666 us (60 Hz) timer fire every 16 ms (62.5 Hz); GT Sport paces its flip thread with
+    // such a timer. -DisablePerf 43 restores the millisecond period.
+    static const bool exact_period = Common::PerfFeatureEnabled(43);
+    if (exact_period) {
+        event.timer_interval = std::chrono::microseconds(usec);
+    }
+    {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 16) {
+            LOG_WARNING(Kernel_Event, "Timer event added: equeue {:#x} id {} period {} us udata {}",
+                        eq, id, usec, fmt::ptr(udata));
+        }
+    }
 
     auto& equeue = kqueues[eq];
     if (!equeue->AddEvent(event)) {

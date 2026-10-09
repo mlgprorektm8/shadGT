@@ -10,6 +10,7 @@
 #include <fmt/ranges.h>
 #include "common/debug.h"
 #include "common/file_activity.h"
+#include "common/guest_watch.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "core/debug_state.h"
@@ -155,6 +156,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
                             "THUMBNAIL-MARK: 800x450 render starts at frame {}, t={} ms; files {}",
                             frame, Common::FileActivity::NowMs(),
                             Common::FileActivity::InFlight());
+                Common::GuestWatch::Arm(120);
             }
             last_frame = frame;
         }

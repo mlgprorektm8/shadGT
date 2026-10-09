@@ -3,12 +3,16 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/guest_watch.h"
+#include "common/singleton.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
+#include "core/linker.h"
+#include "core/memory.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -267,6 +271,27 @@ void ReportFlipStats() {
 } // namespace
 
 void VideoOutDriver::Flip(const Request& req) {
+    // Diagnostics: guest counters against presented frames (common/guest_watch.h).
+    if (Common::GuestWatch::frames_left.load(std::memory_order_relaxed) != 0) {
+        --Common::GuestWatch::frames_left;
+        static const VAddr base =
+            Common::Singleton<Core::Linker>::Instance()->GetModule(0)->GetBaseAddress();
+        static const auto start = std::chrono::steady_clock::now();
+        std::string values;
+        auto* memory = Core::Memory::Instance();
+        for (const u64 offset : Common::GuestWatch::Offsets()) {
+            const VAddr address = base + offset;
+            values += memory->IsValidMapping(address, 8)
+                          ? fmt::format(" {:#x}={}", offset, *std::bit_cast<const u64*>(address))
+                          : fmt::format(" {:#x}=?", offset);
+        }
+        LOG_WARNING(Lib_VideoOut, "GUEST-WATCH flip frame {} t={} ms vblank {}:{}",
+                    DebugState.GetFrameNum(),
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count(),
+                    req.port->vblank_status.count, values);
+    }
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
