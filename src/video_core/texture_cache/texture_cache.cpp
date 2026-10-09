@@ -112,6 +112,13 @@ static u64 HashGuestBytes(VAddr address, u32 size) {
     return XXH3_64bits(bytes.data(), size);
 }
 
+// FIX-029: guest memory read through its backing (no protection faults).
+static std::shared_ptr<std::vector<u8>> CopyGuestBytes(VAddr address, u32 size) {
+    auto bytes = std::make_shared<std::vector<u8>>(size);
+    Core::Memory::Instance()->CopySparseMemory(address, bytes->data(), size);
+    return bytes;
+}
+
 void TextureCache::CompleteReadbacks(std::span<const PendingReadback> readbacks) {
     // May run on the scheduler thread after the GPU work completed. The guest may have unmapped
     // the memory meanwhile (for example while loading a race); skip those writes.
@@ -119,9 +126,43 @@ void TextureCache::CompleteReadbacks(std::span<const PendingReadback> readbacks)
     // GT Sport frees a small render target's memory and reuses it for its heap while the
     // readback is in flight; the stale image then overwrote a free-list link and the game
     // crashed in its allocator after buying a car or starting a race.
+    // FIX-029: skipping the whole readback lost GPU results the game needed: GT Sport's 448x126
+    // car thumbnail target lives in its heap too, and a skipped readback left the PNG encoder
+    // without the picture (crash after buying a car). Only the 32-bit words the guest changed
+    // keep the guest's value now; the rest gets the GPU result. -DisablePerf 38 skips whole.
     static const bool check_guest_bytes = Common::PerfFeatureEnabled(33);
+    static const bool merge_words = Common::PerfFeatureEnabled(38);
     auto* memory = Core::Memory::Instance();
     for (const auto& readback : readbacks) {
+        if (check_guest_bytes && merge_words && readback.guest_bytes &&
+            memory->IsValidMapping(readback.address, readback.size)) {
+            std::vector<u8> merged(readback.size);
+            memory->CopySparseMemory(readback.address, merged.data(), readback.size);
+            readback.download.Invalidate();
+            const u8* gpu = readback.download.mapped;
+            const u8* recorded = readback.guest_bytes->data();
+            u32 kept = 0;
+            for (u32 offset = 0; offset < readback.size; offset += 4) {
+                const u32 n = std::min<u32>(4, readback.size - offset);
+                if (std::memcmp(merged.data() + offset, recorded + offset, n) == 0) {
+                    std::memcpy(merged.data() + offset, gpu + offset, n);
+                } else {
+                    ++kept;
+                }
+            }
+            if (kept != 0) {
+                static std::atomic<u32> merges{};
+                if (const u32 n = ++merges; n <= 20 || n % 500 == 0 || readback.size >= 64_KB) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-029: image readback {} to {:#x}+{:#x} kept {} words the "
+                                "guest changed after it was recorded",
+                                n, readback.address, readback.size, kept);
+                }
+            }
+            memory->TryWriteBacking(std::bit_cast<u8*>(readback.address), merged.data(),
+                                    readback.size);
+            continue;
+        }
         if (check_guest_bytes && memory->IsValidMapping(readback.address, readback.size) &&
             HashGuestBytes(readback.address, readback.size) != readback.guest_hash) {
             static std::atomic<u32> skipped{};
@@ -199,8 +240,11 @@ std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(I
     static constexpr u32 NoData = 0;
     Core::MemoryManager::NoteEmulatorWrite(image.info.guest_address, 0, &NoData);
     image.readback_version = image.contents_version;
+    static const bool merge_words = Common::PerfFeatureEnabled(38);
     return PendingReadback{image.info.guest_address, download, download_size,
-                           HashGuestBytes(image.info.guest_address, download_size)};
+                           HashGuestBytes(image.info.guest_address, download_size),
+                           merge_words ? CopyGuestBytes(image.info.guest_address, download_size)
+                                       : nullptr};
 }
 
 static u32 ImageDownloadSize(const Image& image) {
