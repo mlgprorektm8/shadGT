@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/types.h"
 
@@ -54,9 +55,9 @@ std::optional<Request> ParseTrigger(std::string_view trigger, std::string reason
 /// Arms a bundle request (replacing an armed one that has not fired).
 void Arm(Request request);
 /// The armed request, if any (cheap when none is armed).
-std::optional<Request> Armed();
+std::vector<Request> Armed();
 /// Clears the armed request once the rasterizer has started on it.
-void Disarm();
+void Disarm(std::string_view reason);
 
 /// A new, empty bundle folder under user/log/bundles.
 std::filesystem::path NewBundleDir(std::string_view reason);

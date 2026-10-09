@@ -6,6 +6,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
+#include "common/file_activity.h"
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
@@ -80,6 +81,7 @@ namespace Libraries::Kernel {
 
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     LOG_INFO(Kernel_Fs, "path = {} flags = {:#x} mode = {:#o}", raw_path, flags, mode);
+    const Common::FileActivity::Scope activity{"open", raw_path ? raw_path : "", 0};
 
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
@@ -401,6 +403,11 @@ s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
         return -1;
     }
 
+    u64 requested = 0;
+    for (s32 i = 0; i < iovcnt; i++) {
+        requested += iov[i].iov_len;
+    }
+    const Common::FileActivity::Scope activity{"read", file->m_guest_name, requested};
     s64 total_read = 0;
     for (s32 i = 0; i < iovcnt; i++) {
         total_read += ReadFile(file, iov[i].iov_base, iov[i].iov_len);
@@ -566,6 +573,7 @@ s64 PS4_SYSV_ABI read(s32 fd, void* buf, u64 nbytes) {
         return -1;
     }
 
+    const Common::FileActivity::Scope activity{"read", file->m_guest_name, nbytes};
     return ReadFile(file, buf, nbytes);
 }
 
@@ -1034,6 +1042,11 @@ s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 off
         *__Error() = POSIX_EIO;
         return -1;
     }
+    u64 requested = 0;
+    for (s32 i = 0; i < iovcnt; i++) {
+        requested += iov[i].iov_len;
+    }
+    const Common::FileActivity::Scope activity{"read", file->m_guest_name, requested};
     s64 total_read = 0;
     for (s32 i = 0; i < iovcnt; i++) {
         total_read += ReadFile(file, iov[i].iov_base, iov[i].iov_len);

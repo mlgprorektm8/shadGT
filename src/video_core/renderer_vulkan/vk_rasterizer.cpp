@@ -9,6 +9,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/ranges.h>
 #include "common/debug.h"
+#include "common/file_activity.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "core/debug_state.h"
@@ -142,6 +143,20 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
+        // Diagnostics: GT Sport renders the car thumbnail into an 800x450 target. Mark when a
+        // render to that size starts (first bind after 120 frames without one), with the time
+        // and the guest file reads in flight, to line it up with stalls and streaming.
+        if (image.info.size.width == 800 && image.info.size.height == 450) {
+            static u32 last_frame = ~0u;
+            const u32 frame = DebugState.GetFrameNum();
+            if (last_frame == ~0u || frame - last_frame > 120) {
+                LOG_WARNING(Render_Vulkan,
+                            "THUMBNAIL-MARK: 800x450 render starts at frame {}, t={} ms; files {}",
+                            frame, Common::FileActivity::NowMs(),
+                            Common::FileActivity::InFlight());
+            }
+            last_frame = frame;
+        }
     }
 
     if ((regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||

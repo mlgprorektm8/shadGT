@@ -19,7 +19,7 @@ namespace VideoCore::DiagBundle {
 
 namespace {
 std::mutex armed_mutex;
-std::optional<Request> armed;
+std::vector<Request> armed;
 std::atomic<bool> has_armed{false};
 
 std::mutex pm4_mutex;
@@ -81,49 +81,98 @@ void Arm(Request request) {
                 "DIAG-BUNDLE: armed '{}' (trigger {}, {} frames, skip {}, delay {}, repeat {})",
                 request.reason, static_cast<u32>(request.trigger), request.frames, request.skip,
                 request.delay, request.repeat);
-    armed = std::move(request);
+    // Several triggers can wait at once (e.g. the car thumbnail and a dealership shader); arming
+    // the same reason again replaces it.
+    std::erase_if(armed, [&](const Request& r) { return r.reason == request.reason; });
+    armed.push_back(std::move(request));
     has_armed = true;
 }
 
-// SHADGT_BUNDLE_TRIGGER arms a bundle at startup without the IPC/MCP controller, for runs
-// started by hand: "target=WxH" or "shader=0xHASH", with SHADGT_BUNDLE_SKIP (episodes to let
-// pass), SHADGT_BUNDLE_DELAY (frames from the trigger to the capture), SHADGT_BUNDLE_REPEAT
-// (episodes to capture) and SHADGT_BUNDLE_FRAMES. Needs SHADGT_DIAG=1 for shader code in the bundle.
-static void ArmFromEnvironment() {
-    const char* trigger = std::getenv("SHADGT_BUNDLE_TRIGGER");
-    if (!trigger || !*trigger) {
-        return;
+static u32 EnvU32(const char* name, u32 fallback) {
+    const char* value = std::getenv(name);
+    return value && *value ? static_cast<u32>(std::atoi(value)) : fallback;
+}
+
+// One trigger with options: "target=800x450,skip=0,repeat=2,delay=30,frames=3". Options not
+// given come from the defaults.
+static void ArmItem(std::string_view item, u32 frames, u32 skip, u32 delay, u32 repeat) {
+    std::string_view trigger = item.substr(0, item.find(','));
+    for (size_t at = item.find(','); at != std::string_view::npos;) {
+        const size_t end = item.find(',', at + 1);
+        const auto option = item.substr(at + 1, end == std::string_view::npos ? end : end - at - 1);
+        const auto eq = option.find('=');
+        const auto key = option.substr(0, eq);
+        const u32 value = eq == std::string_view::npos
+                              ? 0
+                              : static_cast<u32>(std::atoi(std::string(option.substr(eq + 1)).c_str()));
+        if (key == "frames") {
+            frames = value;
+        } else if (key == "skip") {
+            skip = value;
+        } else if (key == "delay") {
+            delay = value;
+        } else if (key == "repeat") {
+            repeat = value;
+        }
+        at = end;
     }
-    const char* frames = std::getenv("SHADGT_BUNDLE_FRAMES");
-    const char* skip = std::getenv("SHADGT_BUNDLE_SKIP");
-    const char* delay = std::getenv("SHADGT_BUNDLE_DELAY");
-    const char* repeat = std::getenv("SHADGT_BUNDLE_REPEAT");
-    auto request = ParseTrigger(trigger, fmt::format("env-{}", trigger),
-                                frames && *frames ? std::atoi(frames) : 2);
+    auto request = ParseTrigger(trigger, fmt::format("env-{}", trigger), frames);
     if (!request) {
-        LOG_ERROR(Render_Vulkan, "DIAG-BUNDLE: SHADGT_BUNDLE_TRIGGER '{}' not understood", trigger);
+        LOG_ERROR(Render_Vulkan, "DIAG-BUNDLE: trigger '{}' not understood", item);
         return;
     }
-    request->skip = skip && *skip ? static_cast<u32>(std::atoi(skip)) : 0;
-    request->delay = delay && *delay ? static_cast<u32>(std::atoi(delay)) : 0;
-    request->repeat = repeat && *repeat ? std::max(std::atoi(repeat), 1) : 1;
+    request->skip = skip;
+    request->delay = delay;
+    request->repeat = std::max(repeat, 1u);
     Arm(std::move(*request));
 }
 
-std::optional<Request> Armed() {
+// Bundles armed at startup without the IPC/MCP controller, for runs started by hand.
+// SHADGT_BUNDLE_TRIGGER: ';'-separated triggers ("target=WxH" or "shader=0xHASH", each with
+// optional ",skip=,delay=,repeat=,frames=" options); SHADGT_BUNDLE_SKIP/DELAY/REPEAT/FRAMES are
+// the defaults. SHADGT_BUNDLE_AUTO adds standing triggers when SHADGT_DIAG is on (default: the
+// first use of the dealership shader that reads garbage descriptors); set it to 0 to disable.
+static void ArmFromEnvironment() {
+    const u32 frames = EnvU32("SHADGT_BUNDLE_FRAMES", 2);
+    const u32 skip = EnvU32("SHADGT_BUNDLE_SKIP", 0);
+    const u32 delay = EnvU32("SHADGT_BUNDLE_DELAY", 0);
+    const u32 repeat = EnvU32("SHADGT_BUNDLE_REPEAT", 1);
+    std::string triggers;
+    if (const char* env = std::getenv("SHADGT_BUNDLE_TRIGGER"); env && *env) {
+        triggers = env;
+    }
+    if (Enabled()) {
+        const char* automatic = std::getenv("SHADGT_BUNDLE_AUTO");
+        const std::string standing =
+            automatic ? automatic : "shader=0xae32f77f,frames=2,skip=0,delay=0,repeat=1";
+        if (!standing.empty() && standing != "0") {
+            triggers += (triggers.empty() ? "" : ";") + standing;
+        }
+    }
+    std::string_view rest = triggers;
+    while (!rest.empty()) {
+        const auto end = rest.find(';');
+        if (const auto item = rest.substr(0, end); !item.empty()) {
+            ArmItem(item, frames, skip, delay, repeat);
+        }
+        rest = end == std::string_view::npos ? std::string_view{} : rest.substr(end + 1);
+    }
+}
+
+std::vector<Request> Armed() {
     static std::once_flag from_environment;
     std::call_once(from_environment, ArmFromEnvironment);
     if (!has_armed.load(std::memory_order_relaxed)) {
-        return std::nullopt;
+        return {};
     }
     std::scoped_lock lk{armed_mutex};
     return armed;
 }
 
-void Disarm() {
+void Disarm(std::string_view reason) {
     std::scoped_lock lk{armed_mutex};
-    armed.reset();
-    has_armed = false;
+    std::erase_if(armed, [&](const Request& r) { return r.reason == reason; });
+    has_armed = !armed.empty();
 }
 
 std::filesystem::path NewBundleDir(std::string_view reason) {

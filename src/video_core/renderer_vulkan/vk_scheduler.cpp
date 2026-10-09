@@ -7,6 +7,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/file_activity.h"
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
 #include "common/thread.h"
@@ -323,6 +324,7 @@ void Scheduler::PerfMonitorThread(std::stop_token stoken) {
         LOG_WARNING(Render_Vulkan, "Frontend work in {:.1f} s: {}",
                     std::chrono::duration<double>(now - window_start).count(),
                     Common::TakeWorkCounters());
+        LOG_WARNING(Render_Vulkan, "Guest file activity: {}", Common::FileActivity::Report());
         VideoCore::DiagBundle::OnMonitorTick();
         window_start = now;
         window_tick = tick;

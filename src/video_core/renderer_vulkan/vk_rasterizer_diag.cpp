@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <optional>
 
@@ -24,8 +25,11 @@ namespace Vulkan {
 
 namespace {
 // Episode counting and delayed starts for armed bundles (see DiagBundle::Request).
-u32 g_last_match_frame = ~0u;
-u32 g_episodes = 0;
+struct EpisodeState {
+    u32 last_match_frame = ~0u;
+    u32 episodes = 0;
+};
+std::map<std::string, EpisodeState> g_episodes;
 std::optional<VideoCore::DiagBundle::Request> g_delayed;
 u32 g_delayed_start = 0;
 } // namespace
@@ -207,7 +211,11 @@ void Rasterizer::RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 c
 
     // A bundle armed on a target size or a shader starts at the draw that matches it.
     if (!diag_capture) {
-        if (const auto armed = VideoCore::DiagBundle::Armed()) {
+        for (const auto& armed_request : VideoCore::DiagBundle::Armed()) {
+            if (diag_capture || g_delayed) {
+                break;
+            }
+            const auto* armed = &armed_request;
             using VideoCore::DiagBundle::Trigger;
             bool fire = false;
             if (armed->trigger == Trigger::Shader) {
@@ -222,16 +230,17 @@ void Rasterizer::RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 c
                 // Count matching episodes: draws to the trigger within 120 frames of the last
                 // match belong to the same one (one thumbnail render spans several frames).
                 const u32 frame = DebugState.GetFrameNum();
-                if (g_last_match_frame == ~0u || frame - g_last_match_frame > 120) {
-                    ++g_episodes;
+                auto& state = g_episodes[armed->reason];
+                if (state.last_match_frame == ~0u || frame - state.last_match_frame > 120) {
+                    ++state.episodes;
                     LOG_WARNING(Render_Vulkan, "DIAG-BUNDLE: '{}' matched at frame {} (episode {})",
-                                armed->reason, frame, g_episodes);
+                                armed->reason, frame, state.episodes);
                 }
-                g_last_match_frame = frame;
-                fire = g_episodes > armed->skip;
+                state.last_match_frame = frame;
+                fire = state.episodes > armed->skip;
             }
             if (fire) {
-                VideoCore::DiagBundle::Disarm();
+                VideoCore::DiagBundle::Disarm(armed->reason);
                 if (armed->delay) {
                     g_delayed = *armed;
                     g_delayed_start = DebugState.GetFrameNum() + armed->delay;
@@ -292,10 +301,12 @@ void Rasterizer::DiagBeforeWork() {
         DiagStart(request);
     }
     if (!diag_capture) {
-        if (const auto armed = VideoCore::DiagBundle::Armed();
-            armed && armed->trigger == VideoCore::DiagBundle::Trigger::Now) {
-            VideoCore::DiagBundle::Disarm();
-            DiagStart(*armed);
+        for (const auto& armed : VideoCore::DiagBundle::Armed()) {
+            if (armed.trigger == VideoCore::DiagBundle::Trigger::Now) {
+                VideoCore::DiagBundle::Disarm(armed.reason);
+                DiagStart(armed);
+                break;
+            }
         }
         return;
     }
@@ -526,7 +537,7 @@ void Rasterizer::DiagFinish() {
     // Repeat: arm the same trigger for the next episode.
     if (auto next = capture.request; next.repeat > 1) {
         --next.repeat;
-        next.skip = g_episodes;
+        next.skip = g_episodes[next.reason].episodes;
         VideoCore::DiagBundle::Arm(std::move(next));
     }
     diag_capture.reset();
