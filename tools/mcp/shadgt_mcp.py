@@ -36,6 +36,7 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP, Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import analyze_bundle as analyze_bundle_module  # noqa: E402
 import inventory  # noqa: E402
 
 # ---------------------------------------------------------------------------------------------
@@ -635,7 +636,8 @@ def _is_shadgt_running() -> bool:
 def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
            env: dict[str, str] | None = None, disable_perf: str = "",
            perf_overrides: bool = True, game_path: str | None = None,
-           log_filter: str | None = None, validation: bool = False) -> dict:
+           log_filter: str | None = None, validation: bool | None = None,
+           diag: bool = False) -> dict:
     """Start GT Sport under shadGT with IPC control, like scripts/Run-GTSportPerformance.ps1.
 
     build_dir: folder containing shadGT.exe (default Build/x64-Clang-Release).
@@ -645,7 +647,9 @@ def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
     perf_overrides: apply the script's diagnostics-off config overrides (restored on exit).
     log_filter: log filter for this run instead of "*:Warning" (e.g. "*:Info").
     validation: enable the Vulkan validation layers (core + sync) from Build/tools/VulkanSDK;
-      their messages go to the log and into the run's inventory. Much slower.
+      their messages go to the log and into the run's inventory. Much slower. Defaults to diag.
+    diag: diagnostic run (SHADGT_DIAG=1): shaders keep their guest code and SPIR-V so the
+      bundle tool can include them, and validation is on unless validation=false.
     Returns pid, IPC capabilities and paths. The built-in GT Sport 1.69 boot patch is applied
     by the emulator itself, so IPC disabling automatic patch loading does not affect it.
     """
@@ -670,6 +674,8 @@ def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
 
         SESSION.stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         SESSION.last_exit = None
+        if validation is None:
+            validation = diag
         overrides = {section: dict(keys) for section, keys in PERF_OVERRIDES.items()}
         if log_filter:
             overrides["Log"]["filter"] = log_filter
@@ -692,6 +698,8 @@ def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
         if validation:
             sdk = _main_checkout() / "Build/tools/VulkanSDK/Bin"
             environment["VK_LAYER_PATH"] = str(sdk)
+        if diag:
+            environment["SHADGT_DIAG"] = "1"
         environment.update(env or {})
 
         try:
@@ -1093,6 +1101,86 @@ def error_inventory(logs: list[str] | None = None, warnings: bool = False) -> di
             bucket.append(f"{group['count']}x {group['location']} {group['function']}: "
                           f"{group['example'][:160]}")
     return {"report": f"{out}.md", "summary": data["summary"], "top": top}
+
+
+# ---------------------------------------------------------------------------------------------
+# Tools: diagnostic bundles
+
+
+BUNDLE_WRITTEN = re.compile(r"DIAG-BUNDLE: written to (.+?) \(draws")
+
+
+def _bundles_dir() -> Path:
+    return SESSION.profile_dir / "user/log/bundles"
+
+
+@mcp.tool()
+def bundle(reason: str = "manual", trigger: str = "now", frames: int = 2,
+           timeout_s: float = 300.0, focus: list[str] | None = None, wait: bool = True) -> dict:
+    """Capture a one-pass diagnostic bundle and analyze it.
+
+    trigger: "now"; "target=WxH" (the first draw rendering to a WxH color target);
+      "shader=0xHASH" (the first draw/dispatch using that shader); or "log:<regex>" (when a new
+      log line matches). frames: frames recorded after the trigger (2 = the second frame's
+      draws have every image they touch both before and after them).
+    focus: images to trace in the report (WxH, uid=N or 0xADDRESS).
+    The emulator writes draws, image snapshots, shaders (with SPIR-V in diag runs), buffers and
+    PM4 into user/log/bundles/<stamp>-<reason>/; the log is copied in, then the analyzer
+    writes report/report.md. wait=false only arms it (analyze later with analyze_bundle).
+    Launch with diag=true for shader binaries and validation messages."""
+    emu = SESSION.require()
+    if not emu.has("ENABLE_DIAG_BUNDLE"):
+        raise RuntimeError("This build has no diagnostic bundles (ENABLE_DIAG_BUNDLE).")
+    log_offset = SESSION.log_path.stat().st_size if SESSION.log_path.exists() else 0
+    if trigger.startswith("log:"):
+        found = wait_for_log(trigger[4:], timeout_s=timeout_s)
+        if not found.get("found"):
+            return {"captured": False, "reason": f"log pattern not seen: {found.get('reason')}"}
+        trigger = "now"
+    reply = emu.request(["DIAG_BUNDLE", reason, str(frames), trigger], "DIAG_BUNDLE_")
+    if not reply.startswith("DIAG_BUNDLE_ARMED"):
+        raise RuntimeError(reply)
+    if not wait:
+        return {"armed": True, "trigger": trigger}
+    deadline = time.monotonic() + timeout_s
+    folder = None
+    while time.monotonic() < deadline and folder is None:
+        if not emu.alive():
+            raise RuntimeError("The emulator exited before the bundle was written")
+        if SESSION.log_path.exists():
+            with open(SESSION.log_path, "rb") as f:
+                f.seek(log_offset)
+                text = f.read().decode("utf-8", errors="replace")
+            m = BUNDLE_WRITTEN.search(text)
+            if m:
+                folder = Path(m.group(1))
+        time.sleep(0.5)
+    if folder is None:
+        return {"captured": False, "reason": f"no bundle within {timeout_s} s (trigger not hit?)"}
+    return analyze_bundle(str(folder), focus)
+
+
+@mcp.tool()
+def analyze_bundle(path: str | None = None, focus: list[str] | None = None) -> dict:
+    """Analyze a diagnostic bundle (default: the newest) into report/report.md: NaN/Inf
+    images, reads of empty or never-written images, empty bindings, untranslated shaders,
+    validation errors, stubs hit, black targets, and the producer chain of each focus image
+    (WxH, uid=N or 0xADDRESS) with PNG previews. Returns the counts and the top findings."""
+    if path:
+        folder = Path(path)
+    else:
+        candidates = sorted((p for p in _bundles_dir().glob("*") if
+                             (p / "manifest.json").exists()), key=lambda p: p.stat().st_mtime)
+        if not candidates:
+            raise FileNotFoundError("No bundles found")
+        folder = candidates[-1]
+    if SESSION.log_path.exists() and not (folder / "log.txt").exists():
+        shutil.copy2(SESSION.log_path, folder / "log.txt")
+    report = analyze_bundle_module.analyze(folder, focus or [])
+    top = {k: v[:8] for k, v in report["findings"].items()}
+    return {"bundle": str(folder), "report": str(folder / "report/report.md"),
+            "counts": report["counts"], "top": top,
+            "chains": [{"uid": c["uid"], "lines": c["lines"][:60]} for c in report["chains"]]}
 
 
 def main() -> None:

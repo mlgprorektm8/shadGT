@@ -12,8 +12,8 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
-#include "common/path_util.h"
 #include "common/hash.h"
+#include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -90,8 +90,18 @@ void TextureCache::ProcessDownloadImages() {
 
 bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path) {
     Image& image = slot_images[image_id];
-    const u32 bytes_per_texel = image.info.num_bits / 8;
-    if (image.info.props.is_depth || image.info.props.is_block || bytes_per_texel == 0) {
+    u32 bytes_per_texel = image.info.num_bits / 8;
+    auto aspect = vk::ImageAspectFlagBits::eColor;
+    if (image.info.props.is_depth) {
+        // The depth aspect only: D16 copies 2 bytes per texel, the other depth formats 4
+        // (D24 in the low 24 bits).
+        aspect = vk::ImageAspectFlagBits::eDepth;
+        bytes_per_texel = image.info.pixel_format == vk::Format::eD16Unorm ||
+                                  image.info.pixel_format == vk::Format::eD16UnormS8Uint
+                              ? 2
+                              : 4;
+    }
+    if (image.info.props.is_block || bytes_per_texel == 0) {
         return false;
     }
     const u32 width = image.info.size.width;
@@ -104,7 +114,7 @@ bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path
         .bufferImageHeight = height,
         .imageSubresource =
             {
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .aspectMask = aspect,
                 .mipLevel = 0,
                 .baseArrayLayer = 0,
                 .layerCount = 1,
@@ -263,7 +273,8 @@ void TextureCache::ReleaseFinishedReadbacks() {
 
 std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(ImageId image_id) {
     Image& image = slot_images[image_id];
-    const bool large = image.info.pitch * image.info.size.height * (image.info.num_bits / 8) >= 64_KB;
+    const bool large =
+        image.info.pitch * image.info.size.height * (image.info.num_bits / 8) >= 64_KB;
     if (large && (False(image.flags & ImageFlagBits::GpuModified) ||
                   True(image.flags & ImageFlagBits::Dirty))) {
         LOG_WARNING(Render_Vulkan,
@@ -422,20 +433,20 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         // a guest write in between goes unseen; skip the write if the bytes changed meanwhile.
         const u64 guest_hash =
             skip_written_back ? HashGuestBytes(image.info.guest_address, download_size) : 0;
-        scheduler.DeferPriorityOperation([this, device_addr = image.info.guest_address, download,
-                                          download_size, guest_hash] {
-            if (skip_written_back && HashGuestBytes(device_addr, download_size) != guest_hash) {
-                LOG_WARNING(Render_Vulkan,
-                            "FIX-024: download to {:#x}+{:#x} skipped: the guest changed that "
-                            "memory while it was in flight",
-                            device_addr, download_size);
-            } else {
-                download.Invalidate();
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
-                                                          download.mapped, download_size);
-            }
-            runtime.GetStagingPool().FreeDeferred(download);
-        });
+        scheduler.DeferPriorityOperation(
+            [this, device_addr = image.info.guest_address, download, download_size, guest_hash] {
+                if (skip_written_back && HashGuestBytes(device_addr, download_size) != guest_hash) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-024: download to {:#x}+{:#x} skipped: the guest changed that "
+                                "memory while it was in flight",
+                                device_addr, download_size);
+                } else {
+                    download.Invalidate();
+                    Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                              download.mapped, download_size);
+                }
+                runtime.GetStagingPool().FreeDeferred(download);
+            });
     }
 }
 

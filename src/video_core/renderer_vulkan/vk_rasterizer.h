@@ -8,11 +8,14 @@
 
 #include <array>
 #include <chrono>
+#include <filesystem>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/diag_bundle.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -230,12 +233,18 @@ private:
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
     /// DIAG-041: buffers and images of the current draw that were bound empty.
     std::string diag_empty_bindings;
-    /// DIAG-044: records the current draw or dispatch in the dependency history.
+    /// Records the current draw or dispatch in the history that diagnostic bundles are written
+    /// from, and starts a bundle whose trigger it matches (vk_rasterizer_diag.cpp).
     void RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 count);
-    /// DIAG-044: logs and dumps everything the image's current contents were made from.
-    void TraceImageDependencies(VideoCore::ImageId image_id);
-    VideoCore::ImageId diag_trace_source{};
-    std::string diag_trace_tag{"thumb"};
+    /// DIAG-BUNDLE: at the start of each draw or dispatch; takes the image snapshots at frame
+    /// boundaries of a capture and finishes it.
+    void DiagBeforeWork();
+    void DiagStart(const VideoCore::DiagBundle::Request& request);
+    void DiagSnapshot();
+    void DiagFinish();
+    void DiagWriteHistory(const std::filesystem::path& path, bool try_lock);
+    struct DiagCapture;
+    std::unique_ptr<DiagCapture> diag_capture;
     /// DIAG-045: images of the current draw or dispatch bound for writing (storage).
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> diag_storage_images;
 

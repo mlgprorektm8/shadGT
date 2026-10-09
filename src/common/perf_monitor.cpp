@@ -13,6 +13,7 @@
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
+#include "video_core/diag_bundle.h"
 
 #ifdef _WIN32
 #include <intrin.h>
@@ -263,6 +264,7 @@ void NoteGameFrame() {
         const double frontend_wait = d.frontend_wait_us / 1000.0;
         const double pipeline_wait = d.pipeline_wait_us / 1000.0;
         const double accounted = draw + dispatch + submit + gpu_wait + frontend_wait;
+        VideoCore::DiagBundle::OnStall(ms);
         if (++stalls <= 400 || stalls % 50 == 0) {
             LOG_WARNING(
                 Render_Vulkan,

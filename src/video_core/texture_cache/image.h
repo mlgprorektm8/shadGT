@@ -108,12 +108,8 @@ public:
 
 struct Image;
 
-/// DIAG-042: an address window whose image modifications are logged with their caller (GT Sport's
-/// car thumbnail source by default; SHADGT_WATCH_IMAGE=<hex address> picks another).
-bool IsWatchedImageAddress(VAddr address, u64 size);
-void NoteWatchedImageModification(const Image& image, std::source_location loc);
-
-/// DIAG-044: every image modification, in a ring, to explain how a picture got its contents.
+/// Every image modification, in a ring, to explain how a picture got its contents (written into
+/// diagnostic bundles).
 struct ImageModRecord {
     u64 uid;
     u64 version;
@@ -123,14 +119,6 @@ struct ImageModRecord {
 void NoteImageModification(u64 uid, u64 version, std::source_location loc);
 /// The newest modifications of an image, oldest first.
 std::vector<ImageModRecord> RecentImageModifications(u64 uid, size_t max_count);
-/// The watched address windows (DIAG-043 dumps the images in them).
-std::span<const VAddr> WatchedImageWindows();
-constexpr u64 WatchedImageWindowSize = 2_MB;
-
-/// DIAG-043: recent records of watched images, kept in memory and written to the log when the car
-/// thumbnail is drawn, so the log shows the history that led to it without flooding.
-void PushDiagRecord(std::string record);
-void FlushDiagRecords(u32 then_live);
 
 struct Image : public Common::LRUNode<> {
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
@@ -162,9 +150,6 @@ struct Image : public Common::LRUNode<> {
     void MarkModified(std::source_location loc = std::source_location::current()) {
         contents_version = global_contents_version.Next();
         NoteImageModification(image_uid, contents_version, loc);
-        if (IsWatchedImageAddress(info.guest_address, info.guest_size)) {
-            NoteWatchedImageModification(*this, loc);
-        }
     }
 
     void MarkGpuModified(ImageFlagBits modified = ImageFlagBits::GpuModified,

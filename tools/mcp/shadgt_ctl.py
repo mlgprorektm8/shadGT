@@ -31,7 +31,8 @@ def serve() -> None:
 
     tools = {name: getattr(server, name) for name in (
         "launch", "stop", "pause", "resume", "status", "read_log", "wait_for_log", "list_dumps",
-        "press", "input_sequence", "capture_frame", "error_inventory")}
+        "press", "input_sequence", "capture_frame", "error_inventory", "bundle",
+        "analyze_bundle")}
     lock = threading.Lock()
 
     def screenshot(save_path: str | None = None, **_):

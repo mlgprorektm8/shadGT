@@ -6,10 +6,10 @@
 #include <atomic>
 #include <cstdlib>
 #include <deque>
-#include <mutex>
-#include <vector>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -27,62 +27,6 @@ using namespace Vulkan;
 
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
 Common::IncrementalIdProvider<u64> Image::global_contents_version{};
-
-std::span<const VAddr> WatchedImageWindows() {
-    // GT Sport's car thumbnail chain: the 800x450 car frames, their 1600x900 accumulation (later
-    // reused for the 400x225 result) and the 1600x225 vertical pass.
-    static const std::vector<VAddr> windows = [] {
-        std::vector<VAddr> list{0x101fe00000, 0x1027800000, 0x101f210000};
-        if (const char* env = std::getenv("SHADGT_WATCH_IMAGE"); env && *env) {
-            list.clear();
-            const std::string text{env};
-            for (size_t start = 0; start < text.size();) {
-                const size_t end = std::min(text.find(',', start), text.size());
-                list.push_back(VAddr(std::stoull(text.substr(start, end - start), nullptr, 16)));
-                start = end + 1;
-            }
-        }
-        return list;
-    }();
-    return windows;
-}
-
-bool IsWatchedImageAddress(VAddr address, u64 size) {
-    for (const VAddr base : WatchedImageWindows()) {
-        if (address < base + WatchedImageWindowSize && base < address + size) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static std::mutex g_diag_mutex;
-static std::deque<std::string> g_diag_records;
-static u32 g_diag_live = 0;
-
-void PushDiagRecord(std::string record) {
-    std::scoped_lock lk{g_diag_mutex};
-    if (g_diag_live > 0) {
-        --g_diag_live;
-        LOG_WARNING(Render_Vulkan, "{}", record);
-        return;
-    }
-    g_diag_records.push_back(std::move(record));
-    if (g_diag_records.size() > 20000) {
-        g_diag_records.pop_front();
-    }
-}
-
-void FlushDiagRecords(u32 then_live) {
-    std::scoped_lock lk{g_diag_mutex};
-    LOG_WARNING(Render_Vulkan, "DIAG-043: the {} records before this thumbnail draw:",
-                g_diag_records.size());
-    for (const auto& record : g_diag_records) {
-        LOG_WARNING(Render_Vulkan, "{}", record);
-    }
-    g_diag_records.clear();
-    g_diag_live = then_live;
-}
 
 static constexpr size_t ImageModRingSize = 1 << 18;
 static std::array<ImageModRecord, ImageModRingSize> g_image_mods{};
@@ -105,18 +49,6 @@ std::vector<ImageModRecord> RecentImageModifications(u64 uid, size_t max_count) 
     }
     std::reverse(found.begin(), found.end());
     return found;
-}
-
-void NoteWatchedImageModification(const Image& image, std::source_location loc) {
-    std::string_view file = loc.file_name();
-    if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
-        file.remove_prefix(slash + 1);
-    }
-    PushDiagRecord(fmt::format("DIAG-042: image at {:#x} {}x{} {} {} modified to ver {} by {}:{}",
-                               image.info.guest_address, image.info.size.width,
-                               image.info.size.height, vk::to_string(image.info.pixel_format),
-                               AmdGpu::NameOf(image.info.tile_mode), image.contents_version,
-                               file, loc.line()));
 }
 
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,

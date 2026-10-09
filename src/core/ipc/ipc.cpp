@@ -27,6 +27,7 @@
 #include "input/input_handler.h"
 #include "sdl_window.h"
 #include "src/core/libraries/usbd/usbd.h"
+#include "video_core/diag_bundle.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -59,6 +60,7 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
  *   - ENABLE_MEMORY_PATCH: enables PATCH_MEMORY command
  *   - ENABLE_EMU_CONTROL: enables PAUSE, RESUME, STOP, TOGGLE_FULLSCREEN commands
  *   - ENABLE_TEST_AUTOMATION: enables PAD, SCREENSHOT, STATUS commands
+ *   - ENABLE_DIAG_BUNDLE: enables DIAG_BUNDLE
  * - INPUT CMD:
  *   - RUN: start the emulator execution
  *   - START: start the game execution
@@ -81,6 +83,10 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
  *   - SCREENSHOT(path: str): save the next presented game frame (before host scaling) as a
  *       PNG at path. Replies ;SCREENSHOT_QUEUED <path>; the file appears once the frame is
  *       presented and written.
+ *   - DIAG_BUNDLE(reason: str, frames: number, trigger: str): arm a diagnostic bundle
+ *       (video_core/diag_bundle.h). trigger is "now", "target=WxH" or "shader=0xHASH".
+ *       Replies ;DIAG_BUNDLE_ARMED or ;DIAG_BUNDLE_ERROR <message>. The log line
+ *       "DIAG-BUNDLE: written to <dir>" follows when the bundle is complete.
  *   - STATUS: replies one line
  *       ;STATUS frames=<n> fps=<x> paused=<0|1> serial=<id> app_ver=<v> title=<rest of line>
  *       fps is measured over 500 ms while the command runs.
@@ -106,6 +112,7 @@ void IPC::Init() {
     std::cerr << ";ENABLE_MEMORY_PATCH\n";
     std::cerr << ";ENABLE_EMU_CONTROL\n";
     std::cerr << ";ENABLE_TEST_AUTOMATION\n";
+    std::cerr << ";ENABLE_DIAG_BUNDLE\n";
     std::cerr << ";#IPC_END\n";
     std::cerr.flush();
 
@@ -195,6 +202,16 @@ void IPC::InputLoop() {
             VideoCore::RequestScreenshotToPath(
                 std::filesystem::path(std::u8string(path.begin(), path.end())));
             std::cerr << ";SCREENSHOT_QUEUED " << path << std::endl;
+        } else if (cmd == "DIAG_BUNDLE") {
+            std::string reason = next_str();
+            const u32 frames = static_cast<u32>(next_u64());
+            const std::string trigger = next_str();
+            if (auto request = VideoCore::DiagBundle::ParseTrigger(trigger, reason, frames)) {
+                VideoCore::DiagBundle::Arm(std::move(*request));
+                std::cerr << ";DIAG_BUNDLE_ARMED" << std::endl;
+            } else {
+                std::cerr << ";DIAG_BUNDLE_ERROR bad trigger " << trigger << std::endl;
+            }
         } else if (cmd == "STATUS") {
             using namespace std::chrono;
             const u32 frames_before = DebugState.GetFrameNum();

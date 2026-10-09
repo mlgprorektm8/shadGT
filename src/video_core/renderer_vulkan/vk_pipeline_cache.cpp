@@ -28,6 +28,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
+#include "video_core/diag_bundle.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -1250,6 +1251,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
             .count(),
         spv.size());
 
+    if (VideoCore::DiagBundle::Enabled()) {
+        diag_last_spv = spv;
+    }
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
 
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
@@ -1442,6 +1446,12 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     RegisterShaderMeta(*info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
     const auto* info_ptr = info.get();
     program->InsertPermut(module, std::move(spec), std::move(info), perm_idx);
+    if (VideoCore::DiagBundle::Enabled()) {
+        program->modules[perm_idx].spv = std::move(diag_last_spv);
+        if (program->guest_code.empty()) {
+            program->guest_code.assign(params.code.begin(), params.code.end());
+        }
+    }
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
     }

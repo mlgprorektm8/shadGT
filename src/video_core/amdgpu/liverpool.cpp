@@ -26,6 +26,7 @@
 #include "video_core/amdgpu/pm4_rewind.h"
 #include "video_core/amdgpu/pm4_type0.h"
 #include "video_core/buffer_cache/region_definitions.h"
+#include "video_core/diag_bundle.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -1744,6 +1745,7 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
     const auto original_dcb = dcb;
+    VideoCore::DiagBundle::CapturePm4("gfx", dcb, ccb);
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
@@ -1767,6 +1769,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
+    VideoCore::DiagBundle::CapturePm4(fmt::format("asc{}", vqid), acb, {});
     VideoCore::BumpUploadEpoch();
     const auto& task = ProcessCompute(acb, vqid);
     {

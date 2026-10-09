@@ -6,6 +6,7 @@
 #include "common/recoverable.h"
 #include "core/signals.h"
 #include "emulator.h"
+#include "video_core/diag_bundle.h"
 
 #if defined(ARCH_X86_64)
 #define Crash() __asm__ __volatile__("int $3")
@@ -27,6 +28,7 @@ void assert_fail_impl() {
         // The failed check is already logged; the RecoverableScope's owner handles it.
         throw Common::RecoverableFailure("assertion failed (see the log line above)");
     }
+    VideoCore::DiagBundle::OnCrash("assertion");
     Core::Signals::Instance()->RemoveHandlers();
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     Crash();

@@ -17,11 +17,15 @@ struct Program {
         Shader::StageSpecialization spec;
         // Pipelines retain this address, so metadata must survive list reallocations.
         std::unique_ptr<Shader::Info> info;
+        /// The SPIR-V, kept only in diagnostic runs (SHADGT_DIAG) for diagnostic bundles.
+        std::vector<u32> spv;
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
 
     ModuleList modules{};
+    /// The guest (GCN) code, kept only in diagnostic runs (SHADGT_DIAG) for diagnostic bundles.
+    std::vector<u32> guest_code;
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
                    std::unique_ptr<Shader::Info> info) {

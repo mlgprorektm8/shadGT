@@ -89,7 +89,7 @@ class McpServerTest(ServerTestBase):
         self.assertEqual(names, sorted([
             "launch", "stop", "pause", "resume", "status", "read_log", "wait_for_log",
             "list_dumps", "screenshot", "press", "input_sequence", "capture_frame",
-            "error_inventory"]))
+            "error_inventory", "bundle", "analyze_bundle"]))
 
     def test_smoke_launch_screenshot_press_stop(self):
         """The smoke test Lance runs on the real game, against the stub."""

@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_rasterizer_diag.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -67,7 +68,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     });
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    VideoCore::DiagBundle::SetCrashWriter({});
+}
 
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->regs;
@@ -237,229 +240,9 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
-// DIAG-044: a history of the images each draw and dispatch read and wrote, to find what a picture
-// was made from (GT Sport's car thumbnail comes out as a black silhouette).
-namespace {
-enum class DiagRole : u8 { Sampled, Target, Storage, Depth };
-
-struct DiagImageRef {
-    u64 uid;
-    u32 slot;
-    VAddr address;
-    u32 width;
-    u32 height;
-    vk::Format format;
-    u64 version;
-    VideoCore::ImageFlagBits flags;
-    DiagRole role;
-};
-
-struct DiagDrawRecord {
-    u64 seq;
-    u64 vs;
-    u64 fs;
-    bool compute;
-    u32 count;
-    boost::container::small_vector<DiagImageRef, 6> images;
-    struct BufferRef {
-        VAddr address;
-        u32 size;
-        bool written;
-    };
-    boost::container::small_vector<BufferRef, 4> buffers;
-    std::string empty;
-};
-
-std::mutex g_diag_history_mutex;
-std::deque<DiagDrawRecord> g_diag_history;
-u64 g_diag_seq = 0;
-constexpr size_t DiagHistorySize = 150000;
-
-const char* RoleName(DiagRole role) {
-    switch (role) {
-    case DiagRole::Sampled:
-        return "reads";
-    case DiagRole::Target:
-        return "renders to";
-    case DiagRole::Storage:
-        return "writes storage";
-    case DiagRole::Depth:
-        return "depth";
-    }
-    return "?";
-}
-} // namespace
-
-void Rasterizer::RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 count) {
-    DiagDrawRecord record{};
-    record.compute = compute;
-    record.count = count;
-    for (const auto* info : pipeline->GetStages()) {
-        if (!info) {
-            continue;
-        }
-        if (info->sw_stage == Shader::SwStage::Fragment) {
-            record.fs = info->pgm_hash;
-        } else if (record.vs == 0) {
-            record.vs = info->pgm_hash;
-        }
-    }
-    const auto add = [&](VideoCore::ImageId id, DiagRole role) {
-        if (!id) {
-            return;
-        }
-        const auto& image = texture_cache.GetImage(id);
-        for (const auto& existing : record.images) {
-            if (existing.uid == image.image_uid && existing.role == role) {
-                return;
-            }
-        }
-        record.images.push_back({image.image_uid, id.index, image.info.guest_address,
-                                 image.info.size.width, image.info.size.height,
-                                 image.info.pixel_format, image.contents_version, image.flags,
-                                 role});
-    };
-    if (!compute) {
-        const auto& key = static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey();
-        for (u32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
-            add(cb_descs[cb].image_id, DiagRole::Target);
-        }
-        add(db_desc.first, DiagRole::Depth);
-    }
-    for (const auto id : bound_images) {
-        const auto& image = texture_cache.GetImage(id);
-        if (image.binding.is_target) {
-            continue;
-        }
-        const bool storage = image.binding.force_general ||
-                             std::ranges::find(diag_storage_images, id) != diag_storage_images.end();
-        add(id, storage ? DiagRole::Storage : DiagRole::Sampled);
-    }
-    for (const auto& bound : bound_buffers) {
-        if (bound.guest_address != 0) {
-            record.buffers.push_back({bound.guest_address, bound.size, bound.is_written});
-        }
-    }
-    record.empty = diag_empty_bindings;
-    std::scoped_lock lk{g_diag_history_mutex};
-    record.seq = ++g_diag_seq;
-    g_diag_history.push_back(std::move(record));
-    if (g_diag_history.size() > DiagHistorySize) {
-        g_diag_history.pop_front();
-    }
-}
-
-void Rasterizer::TraceImageDependencies(VideoCore::ImageId source_id) {
-    std::scoped_lock lk{g_diag_history_mutex};
-    const auto& source = texture_cache.GetImage(source_id);
-    struct Pending {
-        u64 uid;
-        size_t before;
-        u32 depth;
-    };
-    std::vector<Pending> queue{{source.image_uid, g_diag_history.size(), 0}};
-    std::unordered_set<u64> visited{source.image_uid};
-    std::vector<size_t> producers;
-    std::unordered_set<size_t> producer_set;
-    std::unordered_map<u64, DiagImageRef> images;
-    std::unordered_map<u64, u32> image_depth{{source.image_uid, 0}};
-    constexpr size_t MaxProducersPerImage = 400;
-    constexpr size_t MaxProducers = 6000;
-    for (size_t q = 0; q < queue.size() && producers.size() < MaxProducers; ++q) {
-        const auto [uid, before, depth] = queue[q];
-        size_t found = 0;
-        for (size_t i = before; i-- > 0 && found < MaxProducersPerImage;) {
-            const auto& record = g_diag_history[i];
-            const bool writes = std::ranges::any_of(record.images, [&](const DiagImageRef& ref) {
-                return ref.uid == uid && ref.role != DiagRole::Sampled;
-            });
-            if (!writes) {
-                continue;
-            }
-            ++found;
-            if (!producer_set.insert(i).second) {
-                continue;
-            }
-            producers.push_back(i);
-            for (const auto& ref : record.images) {
-                images.try_emplace(ref.uid, ref);
-                if (ref.role == DiagRole::Sampled && depth < 12 && visited.insert(ref.uid).second) {
-                    image_depth[ref.uid] = depth + 1;
-                    queue.push_back({ref.uid, i, depth + 1});
-                }
-            }
-        }
-    }
-    std::ranges::sort(producers);
-    LOG_WARNING(Render_Vulkan,
-                "DIAG-044: [{}] image {} at {:#x} ({}x{} {}) was made by {} draws and dispatches "
-                "from {} images; history holds {} records",
-                diag_trace_tag, source_id.index, source.info.guest_address, source.info.size.width,
-                source.info.size.height, vk::to_string(source.info.pixel_format), producers.size(),
-                visited.size(), g_diag_history.size());
-    for (const size_t i : producers) {
-        const auto& record = g_diag_history[i];
-        std::string text;
-        for (const auto& ref : record.images) {
-            text += fmt::format(" | {} uid {} {:#x} {}x{} {} ver {} flags {:#x}", RoleName(ref.role),
-                                ref.uid, ref.address, ref.width, ref.height,
-                                vk::to_string(ref.format), ref.version, u32(ref.flags));
-        }
-        for (const auto& buffer : record.buffers) {
-            text += fmt::format(" | buf {:#x}+{:#x}{}", buffer.address, buffer.size,
-                                buffer.written ? " written" : "");
-        }
-        LOG_WARNING(Render_Vulkan, "DIAG-044: [{}] #{} {} vs {:#x} fs {:#x} count {}{}{}",
-                    diag_trace_tag, record.seq, record.compute ? "dispatch" : "draw", record.vs,
-                    record.fs, record.count, text, record.empty);
-    }
-    // How each image got its contents (uploads from guest memory, draws, copies).
-    for (const u64 uid : visited) {
-        std::string text;
-        for (const auto& mod : VideoCore::RecentImageModifications(uid, 24)) {
-            std::string_view file = mod.file ? mod.file : "?";
-            if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
-                file.remove_prefix(slash + 1);
-            }
-            text += fmt::format(" | ver {} by {}:{}", mod.version, file, mod.line);
-        }
-        LOG_WARNING(Render_Vulkan, "DIAG-044: [{}] uid {} depth {} modifications:{}",
-                    diag_trace_tag, uid, image_depth[uid], text);
-    }
-    // The current pictures of every image still alive, nearest to the thumbnail first.
-    std::vector<std::pair<u32, u64>> order;
-    for (const u64 uid : visited) {
-        order.emplace_back(image_depth[uid], uid);
-    }
-    std::ranges::sort(order);
-    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
-    u32 dumped = 0;
-    for (const auto& [depth, uid] : order) {
-        const auto it = images.find(uid);
-        const VideoCore::ImageId id =
-            uid == source.image_uid ? source_id
-                                    : (it != images.end() ? VideoCore::ImageId{it->second.slot}
-                                                          : VideoCore::ImageId{});
-        if (!texture_cache.IsImageAlive(id, uid) || dumped >= 200) {
-            continue;
-        }
-        const auto& image = texture_cache.GetImage(id);
-        if (u64(image.info.size.width) * image.info.size.height > 4096ULL * 4096) {
-            continue;
-        }
-        if (texture_cache.DumpImage(
-                id, dir / fmt::format("dep{}_d{:02}_uid{}_{:#x}_{}x{}_{}.bin", diag_trace_tag, depth,
-                                      uid, image.info.guest_address, image.info.size.width,
-                                      image.info.size.height,
-                                      vk::to_string(image.info.pixel_format)))) {
-            ++dumped;
-        }
-    }
-    LOG_WARNING(Render_Vulkan, "DIAG-044: dumped {} of those images to {}", dumped, dir.string());
-}
-
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
+    DiagBeforeWork();
     ++Common::GetWorkCounters().draws;
     using Common::Phase;
     using Common::PhaseTimer;
@@ -554,145 +337,16 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 
-    // DIAG-041: draws into GT Sport's car thumbnail (448x126 linear targets) and into the watched
-    // images of its chain: the shaders, every image and buffer they touch, and empty bindings.
-    // DIAG-043: kept in memory and written out (with image dumps) when the thumbnail is drawn.
-    bool dump_thumbnail_chain = false;
     RecordDiagHistory(pipeline, false, regs.num_indices);
-    // DIAG-045: GT Sport accumulates the thumbnail's car frames into a 1600x900 target; trace the
-    // frame being added while the images it was made from are still alive.
-    {
-        const auto rt = cb_descs[0].image_id;
-        const auto& stages = pipeline->GetStages();
-        const auto* fs = stages[u32(Shader::SwStage::Fragment)];
-        if (rt && fs && fs->pgm_hash == 0x5589ec47) {
-            const auto& info = texture_cache.GetImage(rt).info;
-            static u32 accumulation_traces = 0;
-            if (info.size.width == 1600 && info.size.height == 900 && accumulation_traces < 2) {
-                for (const auto image_id : bound_images) {
-                    if (!texture_cache.GetImage(image_id).binding.is_target) {
-                        ++accumulation_traces;
-                        diag_trace_source = image_id;
-                        diag_trace_tag = fmt::format("acc{}", accumulation_traces);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    {
-        bool thumbnail = false;
-        bool watched = false;
-        for (u32 cb = 0; cb < std::bit_width(pipeline->GetGraphicsKey().mrt_mask); ++cb) {
-            const auto image_id = cb_descs[cb].image_id;
-            if (image_id) {
-                const auto& info = texture_cache.GetImage(image_id).info;
-                thumbnail |=
-                    info.size.width == 448 && info.size.height == 126 && !info.props.is_tiled;
-                watched |= VideoCore::IsWatchedImageAddress(info.guest_address, info.guest_size);
-            }
-        }
-        if (thumbnail || watched) {
-            static u64 records = 0;
-            std::string images;
-            for (const auto image_id : bound_images) {
-                const auto& image = texture_cache.GetImage(image_id);
-                images += fmt::format(
-                    " | img {} {:#x} {}x{} {} {} gpu={} ver={}", image_id.index,
-                    image.info.guest_address, image.info.size.width, image.info.size.height,
-                    vk::to_string(image.info.pixel_format), AmdGpu::NameOf(image.info.tile_mode),
-                    True(image.flags & VideoCore::ImageFlagBits::GpuModified),
-                    image.contents_version);
-            }
-            for (u32 cb = 0; cb < std::bit_width(pipeline->GetGraphicsKey().mrt_mask); ++cb) {
-                if (const auto image_id = cb_descs[cb].image_id) {
-                    const auto& image = texture_cache.GetImage(image_id);
-                    images += fmt::format(" | rt{} {} {:#x} {}x{} {} mask {:#x}", cb,
-                                          image_id.index, image.info.guest_address,
-                                          image.info.size.width, image.info.size.height,
-                                          vk::to_string(image.info.pixel_format),
-                                          regs.color_target_mask.GetMask(cb));
-                }
-            }
-            for (const auto& bound : bound_buffers) {
-                if (bound.guest_address != 0) {
-                    images += fmt::format(" | buf {:#x}+{:#x}{}", bound.guest_address,
-                                          bound.size, bound.is_written ? " w" : "");
-                }
-            }
-            images += diag_empty_bindings;
-            images += fmt::format(" | {} {}", is_indexed ? "indexed" : "draw", regs.num_indices);
-            const auto hash = [&](Shader::SwStage stage) -> u64 {
-                const auto* info = pipeline->GetStages()[u32(stage)];
-                return info ? info->pgm_hash : 0;
-            };
-            VideoCore::PushDiagRecord(fmt::format(
-                "DIAG-041: {} draw {} vs {:#x} fs {:#x}{}", thumbnail ? "thumbnail" : "watched",
-                ++records, hash(Shader::SwStage::Vertex), hash(Shader::SwStage::Fragment), images));
-            if (thumbnail) {
-                VideoCore::FlushDiagRecords(400);
-                // DIAG-043: once per thumbnail source picture, the pictures of the whole chain.
-                static u64 dumped_version = ~0ULL;
-                for (const auto image_id : bound_images) {
-                    const auto& image = texture_cache.GetImage(image_id);
-                    if (!image.binding.is_target && image.contents_version != dumped_version) {
-                        dumped_version = image.contents_version;
-                        dump_thumbnail_chain = true;
-                        diag_trace_source = image_id;
-                        break;
-                    }
-                }
-            }
-        }
-    }
 
     ResetBindings(false);
-
-    if (diag_trace_source && !dump_thumbnail_chain) {
-        TraceImageDependencies(diag_trace_source);
-        diag_trace_source = {};
-    }
-    if (dump_thumbnail_chain) {
-        diag_trace_tag = "thumb";
-        static u32 dumps = 0;
-        if (dumps < 3) {
-            ++dumps;
-            const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
-            std::vector<VideoCore::ImageId> seen;
-            for (const VAddr base : VideoCore::WatchedImageWindows()) {
-                texture_cache.ForEachImageInRegion(
-                    base, VideoCore::WatchedImageWindowSize,
-                    [&](VideoCore::ImageId id, VideoCore::Image&) {
-                        if (std::ranges::find(seen, id) == seen.end()) {
-                            seen.push_back(id);
-                        }
-                    });
-            }
-            u32 index = 0;
-            for (const auto id : seen) {
-                const auto& image = texture_cache.GetImage(id);
-                const auto path =
-                    dir / fmt::format("chain{}_{:02}_{:#x}_{}x{}_{}_ver{}.bin", dumps, index++,
-                                      image.info.guest_address, image.info.size.width,
-                                      image.info.size.height,
-                                      vk::to_string(image.info.pixel_format),
-                                      image.contents_version);
-                texture_cache.DumpImage(id, path);
-            }
-            LOG_WARNING(Render_Vulkan, "DIAG-043: dumped {} images of the thumbnail chain to {}",
-                        index, dir.string());
-        }
-        if (diag_trace_source) {
-            TraceImageDependencies(diag_trace_source);
-            diag_trace_source = {};
-        }
-    }
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
+    DiagBeforeWork();
     ++Common::GetWorkCounters().draws;
 
     SubmitChunkIfNeeded();
@@ -777,6 +431,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
+    DiagBeforeWork();
     ++Common::GetWorkCounters().dispatches;
     Common::PhaseTimer total_timer{Common::Phase::DispatchTotal};
 
@@ -816,6 +471,7 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
+    DiagBeforeWork();
     ++Common::GetWorkCounters().dispatches;
 
     SubmitChunkIfNeeded();
@@ -978,9 +634,9 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     // (they are rare, unlike the small ones PERF-009 v1 slowed races with).
     // -DisablePerf 40 signals them right away.
     static const bool wait_large = Common::PerfFeatureEnabled(40);
-    const bool readbacks_pending =
-        compute_queue ? wait_large && texture_cache.HasLargePendingReadbacks()
-                      : texture_cache.HasPendingReadbacks();
+    const bool readbacks_pending = compute_queue
+                                       ? wait_large && texture_cache.HasLargePendingReadbacks()
+                                       : texture_cache.HasPendingReadbacks();
     bool address_pending;
     {
         std::scoped_lock lk{deferred_fences_mutex};
@@ -1704,8 +1360,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     std::string source;
                     const auto& fetch = desc.sharp_fetch;
                     const bool single =
-                        fetch.summary ==
-                        std::remove_cvref_t<decltype(fetch)>::Summary::SingleLoad;
+                        fetch.summary == std::remove_cvref_t<decltype(fetch)>::Summary::SingleLoad;
                     for (u32 i = 0; i < 4; ++i) {
                         if (!single && !((fetch.load_mask >> i) & 1)) {
                             source += fmt::format(" imm={:08x}", fetch.immediates[i]);
@@ -1729,10 +1384,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0 || impossible) {
                 // DIAG-041: empty buffer bindings of the draw.
-                diag_empty_bindings += fmt::format(
-                    " | EMPTY buf {} of {:#x}: base={:#x} stride={} records={:#x}",
-                    buffer_infos.size(), stage.pgm_hash, u64(vsharp.base_address),
-                    vsharp.GetStride(), vsharp.num_records);
+                diag_empty_bindings +=
+                    fmt::format(" | EMPTY buf {} of {:#x}: base={:#x} stride={} records={:#x}",
+                                buffer_infos.size(), stage.pgm_hash, u64(vsharp.base_address),
+                                vsharp.GetStride(), vsharp.num_records);
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());

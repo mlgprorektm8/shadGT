@@ -1113,6 +1113,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_presenter.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
                src/video_core/renderer_vulkan/vk_rasterizer.h
+               src/video_core/renderer_vulkan/vk_rasterizer_diag.cpp
+               src/video_core/renderer_vulkan/vk_rasterizer_diag.h
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.h
                src/video_core/renderer_vulkan/vk_runtime.cpp
@@ -1154,6 +1156,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/texture_cache/types.h
                src/video_core/cache_storage.cpp
                src/video_core/cache_storage.h
+               src/video_core/diag_bundle.cpp
+               src/video_core/diag_bundle.h
                src/video_core/page_manager.cpp
                src/video_core/page_manager.h
                src/video_core/renderdoc.cpp

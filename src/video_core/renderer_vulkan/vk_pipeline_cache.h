@@ -83,6 +83,12 @@ public:
         return profile;
     }
 
+    /// The translated program of a guest shader, if it was compiled (diagnostic bundles).
+    const Program* FindProgram(u64 hash) const {
+        const auto it = program_cache.find(hash);
+        return it != program_cache.end() ? it->second.get() : nullptr;
+    }
+
 private:
     bool RefreshGraphicsKey();
     /// Registers the pipeline keys are built from: the current ones, or during read-ahead the
@@ -111,6 +117,7 @@ private:
 
     void DumpFailedShader(std::span<const u32> code, u64 hash, Shader::HwStage stage);
     std::unordered_set<u64> failed_shaders;
+    std::vector<u32> diag_last_spv;
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
     std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::HwStage stage, size_t perm_idx,

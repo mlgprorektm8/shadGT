@@ -14,6 +14,7 @@
 #include "core/memory.h"
 #include "core/signals.h"
 #include "emulator.h"
+#include "video_core/diag_bundle.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -228,6 +229,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                              memory->DescribeBackingWrites(value, 0x100));
             }
         }
+        VideoCore::DiagBundle::OnCrash(fmt::format("exception-{:#x}", code));
         Common::Log::Flush();
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
