@@ -15,9 +15,20 @@ u64 ReadAheadStates::PipelineStateHash(std::span<const u32> regs) {
     for (u32 stage_base = 0; stage_base < ShGfxCount; stage_base += 0x40) {
         std::fill_n(sh.begin() + stage_base + 0xC, 16, 0u);
     }
+    std::array<u32, ContextCount> context;
+    std::memcpy(context.data(), regs.data() + ContextFirst, sizeof(context));
+    std::array<u32, PrimitiveCount> primitive;
+    std::memcpy(primitive.data(), regs.data() + PrimitiveFirst, sizeof(primitive));
+    for (const u32 reg : PerDrawRegisters) {
+        if (reg >= ContextFirst && reg < ContextFirst + ContextCount) {
+            context[reg - ContextFirst] = 0;
+        } else if (reg >= PrimitiveFirst && reg < PrimitiveFirst + PrimitiveCount) {
+            primitive[reg - PrimitiveFirst] = 0;
+        }
+    }
     u64 hash = XXH3_64bits(sh.data(), sizeof(sh));
-    hash = XXH3_64bits_withSeed(regs.data() + ContextFirst, ContextCount * sizeof(u32), hash);
-    return XXH3_64bits_withSeed(regs.data() + PrimitiveFirst, PrimitiveCount * sizeof(u32), hash);
+    hash = XXH3_64bits_withSeed(context.data(), sizeof(context), hash);
+    return XXH3_64bits_withSeed(primitive.data(), sizeof(primitive), hash);
 }
 
 ReadAheadStates::ReadAheadStates(size_t capacity_) : capacity{capacity_} {}

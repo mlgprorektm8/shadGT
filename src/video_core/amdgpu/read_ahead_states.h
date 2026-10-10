@@ -66,28 +66,47 @@ public:
         return in_stage >= 0xC && in_stage < 0xC + 16;
     }
 
-    /// Whether writing [first, first + count) can change what PipelineStateHash hashes.
-    static constexpr bool AffectsPipeline(u32 first, u32 count) {
-        const u32 end = first + count;
-        if (first < ContextFirst + ContextCount && end > ContextFirst) {
-            return true;
-        }
-        if (first < PrimitiveFirst + PrimitiveCount && end > PrimitiveFirst) {
-            return true;
-        }
-        const u32 sh_first = std::max(first, ShGfxFirst);
-        const u32 sh_end = std::min(end, ShGfxFirst + ShGfxCount);
-        for (u32 reg = sh_first; reg < sh_end; ++reg) {
-            if (!IsUserData(reg)) {
+    /// PERF-037: registers the draw packets themselves write on the command thread (index base
+    /// and size, the draw initiator, the index count). They differ on nearly every draw and no
+    /// pipeline key reads them; the scan-ahead (ScanPackets) never sees them either. Hashing
+    /// them made every decoded draw a new state (3.5 million evaluated in one session for
+    /// 2,204 builds). Liverpool checks these against the Regs fields.
+    static constexpr std::array<u32, 5> PerDrawRegisters{
+        0xA1F9, 0xA1FA, // index_base_address
+        0xA1FC,         // draw_initiator
+        0xA29E,         // max_index_size
+        0xC24C,         // num_indices
+    };
+    static constexpr bool IsPerDraw(u32 reg) {
+        for (const u32 per_draw : PerDrawRegisters) {
+            if (reg == per_draw) {
                 return true;
             }
         }
         return false;
     }
 
+    /// Whether writing [first, first + count) can change what PipelineStateHash hashes.
+    static constexpr bool AffectsPipeline(u32 first, u32 count) {
+        const u32 end = first + count;
+        const auto any_in = [&](u32 range_first, u32 range_count, auto&& ignored) {
+            const u32 lo = std::max(first, range_first);
+            const u32 hi = std::min(end, range_first + range_count);
+            for (u32 reg = lo; reg < hi; ++reg) {
+                if (!ignored(reg)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        return any_in(ContextFirst, ContextCount, IsPerDraw) ||
+               any_in(PrimitiveFirst, PrimitiveCount, IsPerDraw) ||
+               any_in(ShGfxFirst, ShGfxCount, IsUserData);
+    }
+
     /// What decides a draw's pipeline that commands can change (PERF-021): the graphics shader
     /// registers without user data (PERF-022: per-draw constants and resource pointers), the
-    /// context registers and the primitive registers.
+    /// context registers and the primitive registers, without the per-draw packet registers.
     static u64 PipelineStateHash(std::span<const u32> regs);
 
     explicit ReadAheadStates(size_t capacity = 512);

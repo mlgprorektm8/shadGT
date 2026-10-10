@@ -150,3 +150,19 @@ TEST(ReadAheadStates, StatesArriveInOrderAcrossThreads) {
     EXPECT_TRUE(states.Empty());
     EXPECT_EQ(states.TakeOffered(), Count);
 }
+
+TEST(ReadAheadStates, DrawPacketRegistersDoNotMakeANewState) {
+    // PERF-037: index base and size, the draw initiator and the index count change per draw.
+    ReadAheadStates states;
+    auto regs = RegisterFile();
+    ASSERT_TRUE(states.Offer(regs));
+    for (const u32 reg : ReadAheadStates::PerDrawRegisters) {
+        EXPECT_FALSE(ReadAheadStates::AffectsPipeline(reg, 1)) << std::hex << reg;
+        regs[reg] = 0x1234 + reg;
+        EXPECT_FALSE(states.Offer(regs)) << std::hex << reg;
+    }
+    // The index type next to max_index_size still counts.
+    EXPECT_TRUE(ReadAheadStates::AffectsPipeline(0xA29F, 1));
+    regs[0xA29F] = 1;
+    EXPECT_TRUE(states.Offer(regs));
+}

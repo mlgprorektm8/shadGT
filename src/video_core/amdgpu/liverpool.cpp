@@ -343,6 +343,15 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute) {
     ReportDrawPipe();
 }
 
+// PERF-037: the registers the draw packets write, left out of the read-ahead state hash.
+#define REG_DWORD(field) (offsetof(Regs, field) / sizeof(u32))
+static_assert(REG_DWORD(index_base_address) == ReadAheadStates::PerDrawRegisters[0] &&
+              REG_DWORD(draw_initiator) == ReadAheadStates::PerDrawRegisters[2] &&
+              REG_DWORD(max_index_size) == ReadAheadStates::PerDrawRegisters[3] &&
+              REG_DWORD(num_indices) == ReadAheadStates::PerDrawRegisters[4] &&
+              sizeof(Regs::index_base_address) == 2 * sizeof(u32));
+#undef REG_DWORD
+
 // FIX-014: draws the rasterizer filters out (Rasterizer::FilterDraw) never get a pipeline.
 static bool FilteredDraw(const Regs& state) {
     using OperationMode = ColorControl::OperationMode;
@@ -363,7 +372,9 @@ void Liverpool::OfferDrawState() {
     }
     // A pipeline miss on the recorder: new pipelines are appearing, so the draws after this
     // one are read now, not only from the next command buffer on.
-    if (read_ahead_states->TakeNewMiss() || read_ahead_stopped_early) {
+    // A read-ahead that stopped on a full queue goes on once a quarter of it is free again.
+    if (read_ahead_states->TakeNewMiss() ||
+        (read_ahead_stopped_early && read_ahead_states->Space() >= 128)) {
         PipeReadAhead();
     }
 }
