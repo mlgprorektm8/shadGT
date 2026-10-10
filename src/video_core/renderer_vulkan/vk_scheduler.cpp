@@ -178,6 +178,13 @@ void Scheduler::Wait(u64 tick, std::source_location loc) {
 
 void Scheduler::PopPendingOperations() {
     std::unique_lock lk(pending_ops_mutex);
+    // PERF-045: called before every draw; reading the timeline semaphore is a driver call, so
+    // only when an operation waits for the GPU. Submits and Scheduler::IsFree refresh it too.
+    // -DisablePerf 57 reads it every time.
+    static const bool skip_idle_refresh = Common::PerfFeatureEnabled(57);
+    if (skip_idle_refresh && pending_ops.empty()) {
+        return;
+    }
     work_semaphore.Refresh();
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
