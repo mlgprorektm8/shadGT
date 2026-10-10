@@ -274,6 +274,26 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
     }
 }
 
+std::vector<std::pair<std::string, std::filesystem::file_time_type>> DataBase::ListBlobs(
+    BlobType type) const {
+    std::vector<std::pair<std::string, std::filesystem::file_time_type>> blobs;
+    if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
+        return blobs;
+    }
+    const auto ext = "." + GetBlobFileExtension(type);
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
+        const auto& path = entry.path();
+        if (path.extension().string() != ext) {
+            continue;
+        }
+        std::error_code time_ec;
+        const auto time = entry.last_write_time(time_ec);
+        blobs.emplace_back(path.stem().string(), time_ec ? std::filesystem::file_time_type{} : time);
+    }
+    return blobs;
+}
+
 void DataBase::FinishPreload() {
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());

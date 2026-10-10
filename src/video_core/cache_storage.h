@@ -42,6 +42,10 @@ public:
     [[nodiscard]] bool Exists(BlobType type, const std::string& name) const;
 
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
+    /// PERF-038: names (without extension) and modification times of the stored blobs of a
+    /// type. Empty for an archived store.
+    std::vector<std::pair<std::string, std::filesystem::file_time_type>> ListBlobs(
+        BlobType type) const;
 
 private:
     std::jthread io_worker{};

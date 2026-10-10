@@ -76,6 +76,27 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
                                        fmt::format("g_{:#018x}", hash), ar.TakeOff());
 }
 
+bool LoadStoredGraphicsPipeline(std::vector<u8>&& blob, GraphicsPipelineKey& key,
+                                GraphicsPipeline::SerializationSupport& sdata) {
+    if (blob.size() < 2 * sizeof(u32) + sizeof(GraphicsPipelineKey)) {
+        return false;
+    }
+    Serialization::Archive ar{std::move(blob)};
+    Serialization::Reader pldata{ar};
+    u32 version{};
+    pldata.Read(version);
+    if (version != Serialization::PipelineKeyVersion) {
+        return false;
+    }
+    u32 is_compute{};
+    pldata.Read(is_compute);
+    if (is_compute != 0) {
+        return false;
+    }
+    key.Deserialize(ar);
+    return sdata.Deserialize(ar);
+}
+
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash,

@@ -3,8 +3,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -106,6 +110,15 @@ private:
     /// PERF-034: with the draw pipe, starts builds for the upcoming draw states the command
     /// thread queued. During a draw (`restore`), its key is computed again afterwards.
     void BuildQueuedStates(const DrawIndirectParams params, bool restore);
+    /// PERF-038: queues a stored pipeline's build behind all other builds.
+    void QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build);
+    /// PERF-038: on this thread, between draws: takes stored pipelines the reader thread
+    /// prepared and queues their background builds.
+    void InstallPrewarmed();
+    struct PrewarmRecord;
+    bool InstallPrewarmRecord(PrewarmRecord& record);
+    void PrewarmRead(std::stop_token stop);
+    void ReportPrewarm(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
     /// command thread queues meanwhile. Returns at once if no worker took the build, which
     /// FinishBuild then does on this thread.
@@ -171,6 +184,19 @@ private:
     /// precompile), and new ones are stored.
     bool use_stored_shaders{};
     void ListStoredPermutations(u64 pgm_hash, Program& program);
+    /// PERF-038: a program's stored permutations as read from the store (any thread), and their
+    /// insertion into the program (this thread).
+    struct StoredListing {
+        u64 pgm_hash{};
+        struct Entry {
+            size_t perm_idx;
+            std::vector<u8> meta;
+            bool has_spv;
+        };
+        std::vector<Entry> entries;
+    };
+    static StoredListing ReadStoredListing(u64 pgm_hash);
+    void ApplyStoredListing(StoredListing&& listing, Program& program);
     vk::ShaderModule LoadStoredModule(u64 pgm_hash, size_t perm_idx);
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
@@ -227,6 +253,27 @@ private:
         std::chrono::steady_clock::time_point since{};
     } queued_state_stats;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
+    // PERF-038: stored pipelines built in the background (opt-in, SHADGT_PREWARM=1).
+    bool prewarm_enabled{};
+    std::mutex prewarm_mutex;
+    std::condition_variable_any prewarm_cv;
+    std::deque<std::unique_ptr<PrewarmRecord>> prewarm_records;
+    std::atomic<size_t> prewarm_queued{};
+    std::atomic<u64> prewarm_built{};
+    std::atomic<u64> prewarm_read{};
+    std::atomic<u64> prewarm_total{};
+    std::atomic<bool> prewarm_reader_done{};
+    struct PrewarmStats {
+        u64 installed{};
+        u64 skipped{};
+        u64 hits{};
+        u64 cancelled{};
+        u64 promoted{};
+        u64 built_before{};
+        double ms{};
+        std::chrono::steady_clock::time_point since{};
+    } prewarm_stats;
+    std::jthread prewarm_reader;
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
 };

@@ -29,6 +29,7 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
+#include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/spirv_check.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -39,13 +40,11 @@
 namespace Vulkan {
 
 // PERF-019: worker threads that build graphics pipelines ahead of the draws that need them.
+// PERF-038: stored pipelines are built in the background on a few of them, at low priority.
 class PipelineCache::PipelineBuildWorkers {
 public:
-    PipelineBuildWorkers() {
-        const u32 cores = std::max(std::thread::hardware_concurrency(), 4u);
-        // PERF-021: all but two cores (the command thread and the game's own main thread).
-        const u32 count = std::clamp(cores - 2, 2u, 14u);
-        for (u32 i = 0; i < count; ++i) {
+    PipelineBuildWorkers() : queue{std::max(1u, NumWorkers() / 4)} {
+        for (u32 i = 0; i < NumWorkers(); ++i) {
             threads.emplace_back([this](std::stop_token stop) { Work(stop); });
         }
     }
@@ -53,42 +52,51 @@ public:
         for (auto& thread : threads) {
             thread.request_stop();
         }
-        cv.notify_all();
+        queue.NotifyAll();
     }
 
     void Push(std::function<void()>&& job, bool urgent) {
-        {
-            std::scoped_lock lk{mutex};
-            if (urgent) {
-                jobs.push_front(std::move(job));
-            } else {
-                jobs.push_back(std::move(job));
-            }
-        }
-        cv.notify_one();
+        queue.Push(std::move(job), urgent ? BuildQueue::Kind::Urgent : BuildQueue::Kind::Normal);
+    }
+    void PushBackground(std::function<void()>&& job) {
+        queue.Push(std::move(job), BuildQueue::Kind::Background);
+    }
+    void PauseBackground(BuildQueue::Clock::time_point until) {
+        queue.PauseBackground(until);
+    }
+    size_t BackgroundQueued() {
+        return queue.BackgroundQueued();
     }
 
 private:
+    static u32 NumWorkers() {
+        const u32 cores = std::max(std::thread::hardware_concurrency(), 4u);
+        // PERF-021: all but two cores (the command thread and the game's own main thread).
+        return std::clamp(cores - 2, 2u, 14u);
+    }
+
     void Work(std::stop_token stop) {
         Common::SetCurrentThreadName("shadGT:PipelineBuild");
+        bool low_priority = false;
         while (true) {
-            std::function<void()> job;
-            {
-                std::unique_lock lk{mutex};
-                cv.wait(lk, stop, [this] { return !jobs.empty(); });
-                if (stop.stop_requested()) {
-                    return;
-                }
-                job = std::move(jobs.front());
-                jobs.pop_front();
+            BuildQueue::Job job;
+            bool background = false;
+            if (!queue.Pop(job, background, stop)) {
+                return;
+            }
+            if (background != low_priority) {
+                low_priority = background;
+                Common::SetCurrentThreadPriority(low_priority ? Common::ThreadPriority::Low
+                                                              : Common::ThreadPriority::Normal);
             }
             job();
+            if (background) {
+                queue.FinishedBackground();
+            }
         }
     }
 
-    std::mutex mutex;
-    std::condition_variable_any cv;
-    std::deque<std::function<void()>> jobs;
+    BuildQueue queue;
     std::vector<std::jthread> threads;
 };
 
@@ -108,6 +116,8 @@ struct PipelineCache::PipelineBuild {
     std::shared_future<void> done;
     std::chrono::steady_clock::time_point queued;
     bool urgent{};
+    // PERF-038: a stored pipeline built in the background (no runtime shader state needed).
+    bool preloading{};
     // Whoever sets this first builds the pipeline: a worker, or the command thread when a
     // draw needs it before a worker got to it.
     std::atomic<bool> started{};
@@ -436,6 +446,20 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             use_stored_shaders = true;
             LOG_WARNING(Render_Vulkan,
                         "PERF-032: shader translations are loaded from the store on first use");
+            // PERF-038: opt-in (SHADGT_PREWARM=1): the stored pipelines are built in the
+            // background while the game runs, most recently used first. -DisablePerf 52.
+            const char* prewarm = std::getenv("SHADGT_PREWARM");
+            if (prewarm && prewarm[0] == '1' && Common::PerfFeatureEnabled(52)) {
+                if (!instance.IsVertexInputDynamicState()) {
+                    LOG_WARNING(Render_Vulkan, "PERF-038: background pipeline builds need dynamic "
+                                               "vertex input; not available here");
+                } else {
+                    prewarm_enabled = true;
+                    prewarm_stats.since = std::chrono::steady_clock::now();
+                    prewarm_reader =
+                        std::jthread{[this](std::stop_token stop) { PrewarmRead(stop); }};
+                }
+            }
         }
     }
 }
@@ -630,7 +654,8 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
     if (!build.started.exchange(true)) {
         build.pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
-            build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules, build.sdata);
+            build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules, build.sdata,
+            build.preloading);
         // The copies were only needed while building; draws use the cached infos.
         build.pipeline->SetStageInfos(build.canonical);
         build.info_copies = {};
@@ -657,6 +682,18 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(
     build->urgent = urgent;
     QueueBuild(build, urgent);
     return build;
+}
+
+void PipelineCache::QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build) {
+    if (!build_workers) {
+        build_workers = std::make_unique<PipelineBuildWorkers>();
+    }
+    build_workers->PushBackground([this, build] {
+        if (!build->started.load()) {
+            FinishBuild(*build);
+            ++prewarm_built;
+        }
+    });
 }
 
 void PipelineCache::ReadAheadAtBufferStart() {
@@ -786,12 +823,26 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         draw_indirect_params = {};
         const bool valid = RefreshGraphicsKey();
         regs_override = nullptr;
-        if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(graphics_key) ||
-            pending_builds.contains(graphics_key)) {
+        if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(graphics_key)) {
+            continue;
+        }
+        if (const auto pending = pending_builds.find(graphics_key);
+            pending != pending_builds.end()) {
+            // PERF-038: a stored pipeline still waiting in the background queue is needed soon;
+            // build it now from this draw's state instead.
+            if (pending->second->preloading && !pending->second->started.exchange(true)) {
+                pending.value() = StartPipelineBuild(false);
+                ++prewarm_stats.promoted;
+                ++started;
+            }
             continue;
         }
         pending_builds.emplace(graphics_key, StartPipelineBuild(false));
         ++started;
+    }
+    if (started > 0 && build_workers) {
+        // PERF-038: the game needs pipelines; background builds wait.
+        build_workers->PauseBackground(std::chrono::steady_clock::now() + std::chrono::seconds{2});
     }
     draw_indirect_params = params;
     if (restore && evaluated > 0) {
@@ -835,6 +886,8 @@ void PipelineCache::WaitForBuild(PipelineBuild& build, const DrawIndirectParams 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     // PERF-034: builds for the upcoming draws the command thread read ahead start first.
     BuildQueuedStates(params, false);
+    // PERF-038: then, while no draw waits for pipelines, stored ones go to the background.
+    InstallPrewarmed();
     draw_indirect_params = params;
     ++draws_since_scan;
     if (!RefreshGraphicsKey()) {
@@ -869,7 +922,31 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         // build at the same time on other cores.
         std::shared_ptr<PipelineBuild> build;
         bool predicted = false;
-        const auto pending = pending_builds.find(graphics_key);
+        auto pending = pending_builds.find(graphics_key);
+        if (pending != pending_builds.end() && pending->second->preloading) {
+            auto stored = pending->second;
+            if (stored->done.wait_for(std::chrono::seconds{0}) == std::future_status::ready) {
+                // PERF-038: built in the background before the draw needed it; no miss.
+                pending_builds.erase(pending);
+                stored->pipeline->SetStageInfos(infos);
+                sdata = stored->sdata;
+                it.value() = std::move(stored->pipeline);
+                ++prewarm_stats.hits;
+                // Stored again, so the next session builds it among the first.
+                RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+                return it->second.get();
+            }
+            if (!stored->started.exchange(true)) {
+                // Not started in the background yet: built now the usual way.
+                pending_builds.erase(pending);
+                pending = pending_builds.end();
+                ++prewarm_stats.cancelled;
+            }
+        }
+        if (build_workers) {
+            build_workers->PauseBackground(std::chrono::steady_clock::now() +
+                                           std::chrono::seconds{2});
+        }
         ++Common::GetWorkCounters().pipelines_compiled;
         last_pipeline_miss = std::chrono::steady_clock::now();
         GraphicsPipeline::NotePipelineMiss();
@@ -1418,13 +1495,12 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
-void PipelineCache::ListStoredPermutations(u64 pgm_hash, Program& program) {
+PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash) {
     // Each permutation is stored as <perm hash>.meta (key and shader info) and
     // <program hash>_<index>.spv; indices are dense from 0 (PERF-013 numbers runtime ones after
-    // the stored ones), so the listing stops after a run of missing indices.
-    static u64 programs = 0;
-    static u64 listed = 0;
-    static u64 stale = 0;
+    // the stored ones), so the listing stops after a run of missing indices. Only file reads, so
+    // the PERF-038 reader thread can do it too.
+    StoredListing listing{.pgm_hash = pgm_hash};
     auto& store = Storage::DataBase::Instance();
     u32 missing = 0;
     for (size_t perm_idx = 0; perm_idx < 512 && missing < 8; ++perm_idx) {
@@ -1434,13 +1510,27 @@ void PipelineCache::ListStoredPermutations(u64 pgm_hash, Program& program) {
             continue;
         }
         missing = 0;
-        std::vector<u8> blob;
-        store.Load(Storage::BlobType::ShaderMeta, name, blob);
+        auto& entry = listing.entries.emplace_back();
+        entry.perm_idx = perm_idx;
+        store.Load(Storage::BlobType::ShaderMeta, name, entry.meta);
+        entry.has_spv = store.Exists(Storage::BlobType::ShaderBinary,
+                                     fmt::format("{:#018x}_{}", pgm_hash, perm_idx));
+    }
+    return listing;
+}
+
+void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program) {
+    static u64 programs = 0;
+    static u64 listed = 0;
+    static u64 stale = 0;
+    const u64 pgm_hash = listing.pgm_hash;
+    for (auto& entry : listing.entries) {
+        const size_t perm_idx = entry.perm_idx;
         auto info = std::make_unique<Shader::Info>();
         Shader::StageSpecialization spec{};
         spec.info = info.get();
         size_t stored_idx{};
-        Serialization::Archive ar{std::move(blob)};
+        Serialization::Archive ar{std::move(entry.meta)};
         // Entries of another format version, cut short, or for another program are skipped.
         bool valid = false;
         try {
@@ -1460,8 +1550,10 @@ void PipelineCache::ListStoredPermutations(u64 pgm_hash, Program& program) {
             fixed != else_scope_fixed.end() && perm_idx < fixed->second.boundary) {
             continue;
         }
-        if (!store.Exists(Storage::BlobType::ShaderBinary,
-                          fmt::format("{:#018x}_{}", pgm_hash, perm_idx))) {
+        if (!entry.has_spv) {
+            continue;
+        }
+        if (perm_idx < program.modules.size() && program.modules[perm_idx].info) {
             continue;
         }
         program.InsertPermut({}, std::move(spec), std::move(info), perm_idx);
@@ -1474,6 +1566,249 @@ void PipelineCache::ListStoredPermutations(u64 pgm_hash, Program& program) {
                     "listed, {} entries of another version skipped",
                     programs, listed, stale);
     }
+}
+
+void PipelineCache::ListStoredPermutations(u64 pgm_hash, Program& program) {
+    ApplyStoredListing(ReadStoredListing(pgm_hash), program);
+}
+
+// PERF-038: one stored pipeline, read and parsed by the reader thread.
+struct PipelineCache::PrewarmRecord {
+    GraphicsPipelineKey key{};
+    GraphicsPipeline::SerializationSupport sdata{};
+    std::array<u64, MaxShaderStages> pgm{};
+    std::array<size_t, MaxShaderStages> perm{};
+    std::array<std::vector<u32>, MaxShaderStages> spv{};
+    std::vector<StoredListing> listings;
+};
+
+void PipelineCache::PrewarmRead(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:PrewarmRead");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    auto& store = Storage::DataBase::Instance();
+    // Stored translations made for another device or driver profile are not built.
+    std::vector<u8> stored_profile;
+    if (store.Exists(Storage::BlobType::ShaderProfile, "profile")) {
+        store.Load(Storage::BlobType::ShaderProfile, "profile", stored_profile);
+    }
+    if (!stored_profile.empty() && (stored_profile.size() != sizeof(profile) ||
+                                    std::memcmp(stored_profile.data(), &profile, sizeof(profile)))) {
+        LOG_WARNING(Render_Vulkan, "PERF-038: the stored pipelines were made for another shader "
+                                   "profile; none are built in the background");
+        prewarm_reader_done = true;
+        return;
+    }
+    auto keys = store.ListBlobs(Storage::BlobType::PipelineKey);
+    std::erase_if(keys, [](const auto& key) { return !key.first.starts_with("g_"); });
+    // Most recently used first: a pipeline's key is stored again each session that uses it.
+    std::ranges::sort(keys, [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (const char* limit = std::getenv("SHADGT_PREWARM_LIMIT"); limit && *limit) {
+        keys.resize(std::min<size_t>(keys.size(), std::strtoull(limit, nullptr, 10)));
+    }
+    prewarm_total = keys.size();
+    LOG_WARNING(Render_Vulkan, "PERF-038: building {} stored pipelines in the background",
+                keys.size());
+    std::unordered_set<u64> listed;
+    u64 skipped = 0;
+    for (const auto& [name, time] : keys) {
+        if (stop.stop_requested()) {
+            return;
+        }
+        ++prewarm_read;
+        auto record = std::make_unique<PrewarmRecord>();
+        bool valid = false;
+        try {
+            Common::RecoverableScope recoverable;
+            std::vector<u8> blob;
+            store.Load(Storage::BlobType::PipelineKey, name, blob);
+            valid = LoadStoredGraphicsPipeline(std::move(blob), record->key, record->sdata);
+            // Only pipelines whose every stage input is stored (see InstallPrewarmRecord).
+            valid = valid && record->key.stage_hashes[u32(SwStage::Vertex)] != 0 &&
+                    record->key.stage_hashes[u32(SwStage::Fragment)] != 0;
+            for (u32 stage = 0; valid && stage < MaxShaderStages; ++stage) {
+                const u64 perm_hash = record->key.stage_hashes[stage];
+                if (perm_hash == 0) {
+                    continue;
+                }
+                std::vector<u8> meta_blob;
+                store.Load(Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", perm_hash),
+                           meta_blob);
+                Shader::Info info{};
+                Shader::StageSpecialization spec{};
+                spec.info = &info;
+                size_t perm_idx{};
+                Serialization::Archive meta{std::move(meta_blob)};
+                if (meta.SizeBytes() < 24 || !LoadShaderMeta(meta, info, spec, perm_idx) ||
+                    HashCombine(info.pgm_hash, perm_idx) != perm_hash) {
+                    valid = false;
+                    break;
+                }
+                record->pgm[stage] = info.pgm_hash;
+                record->perm[stage] = perm_idx;
+                if (listed.insert(info.pgm_hash).second) {
+                    record->listings.push_back(ReadStoredListing(info.pgm_hash));
+                }
+                store.Load(Storage::BlobType::ShaderBinary,
+                           fmt::format("{:#018x}_{}", info.pgm_hash, perm_idx), record->spv[stage]);
+            }
+        } catch (const Common::RecoverableFailure&) {
+            valid = false;
+        }
+        if (!valid) {
+            ++skipped;
+            continue;
+        }
+        std::unique_lock lk{prewarm_mutex};
+        prewarm_cv.wait(lk, stop, [this] { return prewarm_records.size() < 32; });
+        if (stop.stop_requested()) {
+            return;
+        }
+        prewarm_records.push_back(std::move(record));
+        ++prewarm_queued;
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PERF-038: reader done: {} stored pipelines read, {} skipped (other key version, "
+                "missing stages or files)",
+                keys.size(), skipped);
+    prewarm_reader_done = true;
+}
+
+void PipelineCache::InstallPrewarmed() {
+    if (!prewarm_enabled) {
+        return;
+    }
+    using namespace std::chrono_literals;
+    const auto start = std::chrono::steady_clock::now();
+    ReportPrewarm(start);
+    // Not while new pipelines are being needed: the draws come first.
+    if (prewarm_queued.load(std::memory_order_relaxed) == 0 || start - last_pipeline_miss < 2s) {
+        return;
+    }
+    // The members a key is computed in are restored, so the draw sees what it would have.
+    const auto saved_key = graphics_key;
+    const auto saved_infos = infos;
+    const auto saved_modules = modules;
+    const auto saved_runtime_infos = runtime_infos;
+    auto* const saved_fetch = fetch_shader;
+    const auto budget = start + 300us;
+    do {
+        std::unique_ptr<PrewarmRecord> record;
+        {
+            std::scoped_lock lk{prewarm_mutex};
+            if (prewarm_records.empty()) {
+                break;
+            }
+            record = std::move(prewarm_records.front());
+            prewarm_records.pop_front();
+        }
+        --prewarm_queued;
+        prewarm_cv.notify_one();
+        if (InstallPrewarmRecord(*record)) {
+            ++prewarm_stats.installed;
+        } else {
+            ++prewarm_stats.skipped;
+        }
+    } while (std::chrono::steady_clock::now() < budget);
+    graphics_key = saved_key;
+    infos = saved_infos;
+    modules = saved_modules;
+    runtime_infos = saved_runtime_infos;
+    fetch_shader = saved_fetch;
+    prewarm_stats.ms +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
+    for (auto& listing : record.listings) {
+        auto [it, is_new] = program_cache.try_emplace(listing.pgm_hash);
+        if (is_new) {
+            it.value() = std::make_unique<Program>();
+            ApplyStoredListing(std::move(listing), *it.value());
+        }
+    }
+    if (graphics_pipelines.contains(record.key) || pending_builds.contains(record.key)) {
+        return false;
+    }
+    const bool tess_emulated = record.key.prim_type == AmdGpu::PrimitiveType::RectList ||
+                               record.key.prim_type == AmdGpu::PrimitiveType::QuadList;
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader = nullptr;
+    for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
+        if (record.pgm[stage] == 0) {
+            continue;
+        }
+        const auto it = program_cache.find(record.pgm[stage]);
+        if (it == program_cache.end() || record.perm[stage] >= it->second->modules.size()) {
+            return false;
+        }
+        auto& permutation = it->second->modules[record.perm[stage]];
+        if (!permutation.info) {
+            return false;
+        }
+        if (permutation.stored) {
+            // The same SPIR-V a draw's first use would load (PERF-032), read on the reader thread.
+            if (!IsCompleteSpirv(record.spv[stage])) {
+                return false;
+            }
+            permutation.module = CompileSPV(record.spv[stage], instance.GetDevice());
+            permutation.stored = false;
+        }
+        if (!permutation.module) {
+            return false;
+        }
+        // Tessellation helpers are made from the vertex outputs, which old metadata lacks; a draw
+        // recovers them from the guest code, a background build cannot.
+        if (tess_emulated && stage == u32(SwStage::Vertex) &&
+            !permutation.info->attribute_flags_known) {
+            return false;
+        }
+        // A mip fallback indexed at runtime takes its descriptor count from the draw's T#.
+        if (std::ranges::any_of(permutation.info->images, [](const auto& image) {
+                return image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex;
+            })) {
+            return false;
+        }
+        infos[stage] = permutation.info.get();
+        modules[stage] = permutation.module;
+        // The runtime info a draw passes is the one the permutation was specialized with.
+        runtime_infos[stage] = permutation.spec.runtime_info;
+        if (auto& fetch = permutation.spec.fetch_shader_data; !fetch.Empty()) {
+            fetch_shader = &fetch;
+        }
+    }
+    graphics_key = record.key;
+    auto build = MakePipelineBuild();
+    build->preloading = true;
+    build->sdata = record.sdata;
+    pending_builds.emplace(record.key, build);
+    QueueBackgroundBuild(build);
+    return true;
+}
+
+void PipelineCache::ReportPrewarm(std::chrono::steady_clock::time_point now) {
+    auto& stats = prewarm_stats;
+    if (now - stats.since < std::chrono::seconds{2}) {
+        return;
+    }
+    const u64 built = prewarm_built.load();
+    if (stats.installed + stats.hits + stats.cancelled + stats.promoted != 0 ||
+        built != stats.built_before) {
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-038 background builds in {:.1f} s: {} queued ({} skipped, {:.1f} ms on "
+                    "this thread), {} built ({} in all), {} used by draws without waiting, {} "
+                    "built for a draw instead, {} moved ahead by the read-ahead; {} waiting; "
+                    "reader {}/{}{}",
+                    std::chrono::duration<double>(now - stats.since).count(), stats.installed,
+                    stats.skipped, stats.ms, built - stats.built_before, built, stats.hits,
+                    stats.cancelled, stats.promoted,
+                    build_workers ? build_workers->BackgroundQueued() : 0, prewarm_read.load(),
+                    prewarm_total.load(), prewarm_reader_done.load() ? " (done)" : "");
+    }
+    const u64 built_now = built;
+    stats = {};
+    stats.built_before = built_now;
+    stats.since = now;
 }
 
 vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx) {

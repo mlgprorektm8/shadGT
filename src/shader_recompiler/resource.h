@@ -189,9 +189,13 @@ struct ImageResource {
     }
 
     u32 NumBindings(const auto& info) const {
+        // PERF-038: the T# is read only when it decides the count (a background pipeline build
+        // has no user data to read it from).
+        if (mip_fallback_mode != MipStorageFallbackMode::DynamicIndex) {
+            return 1;
+        }
         const AmdGpu::Image tsharp = GetSharp(info);
-        if (mip_fallback_mode != MipStorageFallbackMode::DynamicIndex ||
-            tsharp.last_level < tsharp.base_level) {
+        if (tsharp.last_level < tsharp.base_level) {
             return 1;
         }
         return tsharp.last_level - tsharp.base_level + 1;
