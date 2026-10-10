@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "common/spin_mutex.h"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -74,7 +76,7 @@ public:
     /// PERF-047: with pipelines selected on the command thread, both GPU threads look pipelines
     /// up; every GetGraphicsPipeline/GetComputePipeline call holds this lock, and so does any
     /// read of the infos below or copy of a cached info.
-    std::mutex& LookupMutex() {
+    Common::SpinMutex& LookupMutex() {
         return lookup_mutex;
     }
     /// The infos the last GetGraphicsPipeline selected, with that draw's user data.
@@ -287,7 +289,7 @@ private:
         std::chrono::steady_clock::time_point since{};
     } prewarm_stats;
     std::jthread prewarm_reader;
-    std::mutex lookup_mutex; // PERF-047
+    Common::SpinMutex lookup_mutex; // PERF-047, PERF-060
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
 };

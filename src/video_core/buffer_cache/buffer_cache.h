@@ -202,6 +202,9 @@ private:
         /// Bytes an earlier fault released before this one reached guest memory: the CPU may
         /// have written them since, so they are not written again (fault_downloads_mutex).
         std::vector<std::pair<VAddr, VAddr>> released;
+        /// Guest bytes of each copy when the download was recorded; a byte the CPU changed
+        /// since is newer than the GPU's and is not written (PERF-052b).
+        std::vector<std::vector<u8>> snapshots;
         std::atomic<bool> applied{};
         std::binary_semaphore done{0};
     };
@@ -289,7 +292,7 @@ private:
         u32 size{};
         u64 generation{};
     };
-    std::array<NoImageRange, 4096> no_image_memo{};
+    std::vector<NoImageRange> no_image_memo = std::vector<NoImageRange>(65536);
     std::atomic<u64> hot_pages_unchanged{};
     std::atomic<u64> hot_pages_uploaded{};
     // PERF-049: hot-page hashes taken ahead on a background thread.

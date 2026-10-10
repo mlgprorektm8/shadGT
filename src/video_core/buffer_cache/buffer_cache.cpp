@@ -758,9 +758,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     // GPU order on the scheduler's completion thread. Off by default: the later write-back can
     // land over bytes the CPU wrote meanwhile on unprotected (hot) pages. In the Nurburgring
     // benchmark it corrupted a command buffer ("Invalid PM4 type 0") on the way to the race.
+    // PERF-052b: on by default again with the snapshot guard below; the "Invalid PM4" crash
+    // first blamed on it was FIX-049 (fence order). SHADGT_ASYNC_FAULTS=0 or -DisablePerf 64
+    // turns it off.
     static const bool async_flush = [] {
         const char* env = std::getenv("SHADGT_ASYNC_FAULTS");
-        return env && env[0] == '1' && Common::PerfFeatureEnabled(64);
+        return !(env && env[0] == '0') && Common::PerfFeatureEnabled(64);
     }();
     if (async_flush && liverpool->Pipelined()) {
         std::shared_ptr<FaultDownload> fault;
@@ -865,6 +868,11 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
         copy.dstOffset += fault->download.offset;
     }
     runtime.CopyBuffer(arena, fault->download.buffer, fault->copies);
+    fault->snapshots.reserve(fault->copies.size());
+    for (const auto& copy : fault->copies) {
+        const u8* guest = std::bit_cast<const u8*>(arena_base + copy.srcOffset);
+        fault->snapshots.emplace_back(guest, guest + copy.size);
+    }
     // A readback recorded before this download must not complete over it.
     InvalidateAsyncReadbacks(window_start, window_end - window_start);
     fault->seq = gpu_write_seq;
@@ -878,12 +886,31 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
     scheduler.DeferPriorityOperation([this, fault, arena_base] {
         fault->download.buffer->Invalidate(fault->download.offset, fault->download.size);
         std::scoped_lock lk{fault_downloads_mutex};
-        for (const auto& copy : fault->copies) {
+        for (size_t c = 0; c < fault->copies.size(); ++c) {
+            const auto& copy = fault->copies[c];
             const VAddr start = arena_base + copy.srcOffset;
             const u8* src = fault->download.mapped + (copy.dstOffset - fault->download.offset);
+            const u8* snapshot = fault->snapshots[c].data();
+            const u8* guest = std::bit_cast<const u8*>(start);
             for (const auto& [s, e] : PartsWithoutNewerWrites(start, start + copy.size,
                                                               fault->released)) {
-                memory->TryWriteBacking(std::bit_cast<u8*>(s), src + (s - start), e - s);
+                // PERF-052b: only bytes still as they were when the download was recorded; a
+                // byte the CPU wrote since (an unprotected page) keeps the CPU's value.
+                VAddr run = s;
+                while (run < e) {
+                    while (run < e && guest[run - start] != snapshot[run - start]) {
+                        ++run;
+                    }
+                    VAddr run_end = run;
+                    while (run_end < e && guest[run_end - start] == snapshot[run_end - start]) {
+                        ++run_end;
+                    }
+                    if (run_end > run) {
+                        memory->TryWriteBacking(std::bit_cast<u8*>(run), src + (run - start),
+                                                run_end - run);
+                    }
+                    run = run_end;
+                }
             }
         }
         fault->applied.store(true, std::memory_order_release);

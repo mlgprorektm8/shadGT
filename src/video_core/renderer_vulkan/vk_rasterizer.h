@@ -279,7 +279,7 @@ private:
         std::chrono::steady_clock::time_point since;
     } select_stats{};
     u64 select_verify_count{};
-    Common::Recycler<SelectedPipeline> selected_recycler; // PERF-056
+    Common::Recycler<SelectedPipeline, 4096> selected_recycler; // PERF-056
     /// The pipeline of a graphics draw: the one selected ahead when it still fits the memory the
     /// recorder sees, else looked up here. With PERF-047 the draw's infos are the copies.
     const GraphicsPipeline* AcquireGraphicsPipeline(const DrawIndirectParams& params,

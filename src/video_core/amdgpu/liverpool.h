@@ -372,7 +372,7 @@ private:
     u64 waits_moved_after_turns{};
     std::atomic<u64> diag_moved_waits_checked{}; // DIAG-054
     std::atomic<u64> diag_moved_waits_changed{};
-    Common::Recycler<std::vector<u32>> delta_recycler; // PERF-056
+    Common::Recycler<std::vector<u32>, 4096> delta_recycler; // PERF-056
     // DIAG-051: graphics submissions through the pipeline: game submit, decoded, recorded,
     // GPU done (microseconds after the submit), and the gap between game submits.
     struct SubmitTiming {
@@ -391,6 +391,8 @@ private:
         u64 gap_us{};
         u64 gaps{};
         u64 max_gpu_us{};
+        u64 eop_to_submit_us{};
+        u64 eop_to_submit_count{};
     } submit_stats;
     // DIAG-050: CPU fault flushes and how long the faulting threads waited for them.
     std::atomic<u64> fault_flushes{};

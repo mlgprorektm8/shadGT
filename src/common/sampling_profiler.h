@@ -28,4 +28,7 @@ std::string DescribeCode(u64 address);
 /// The calling thread's return addresses (up to 24), each as " module+offset" (Windows only).
 std::string DescribeStack();
 
+/// True on the profiler's own thread, whose faults while unwinding it handles itself.
+bool IsProfilerThread();
+
 } // namespace Common::SamplingProfiler

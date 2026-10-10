@@ -48,6 +48,53 @@ struct SampledThread {
     std::map<std::vector<u64>, u64> stacks;  // function starts, innermost first -> samples
 };
 
+// Unwinds a suspended thread. The registers of a thread stopped at an arbitrary instruction can
+// lead the unwinder to read garbage addresses; such a fault ends the walk (the profiler thread's
+// faults are left to this handler, see IsProfilerThread).
+static u32 WalkStack(HANDLE handle, ULONG_PTR stack_low, ULONG_PTR stack_high, u64* frames,
+                     u32 max_frames) {
+    u32 depth = 0;
+    __try {
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+        if (!GetThreadContext(handle, &context)) {
+            return 0;
+        }
+        frames[depth++] = context.Rip;
+        u64 last_rsp = 0;
+        for (u32 frame = 0; frame < max_frames - 1 && context.Rip != 0; ++frame) {
+            if (context.Rsp < stack_low || context.Rsp + 8 > stack_high ||
+                context.Rsp <= last_rsp) {
+                break;
+            }
+            last_rsp = context.Rsp;
+            DWORD64 image_base{};
+            const auto* entry = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+            if (!entry) {
+                // A leaf without unwind data: its return address is on top of the stack.
+                if (frame != 0) {
+                    break;
+                }
+                context.Rip = *reinterpret_cast<const u64*>(context.Rsp);
+                context.Rsp += 8;
+            } else {
+                void* handler_data{};
+                DWORD64 establisher_frame{};
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip,
+                                 const_cast<PRUNTIME_FUNCTION>(entry), &context, &handler_data,
+                                 &establisher_frame, nullptr);
+            }
+            if (context.Rip != 0) {
+                frames[depth++] = context.Rip;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return depth;
+}
+
+thread_local bool t_profiler_thread = false;
+
 class Sampler {
 public:
     static Sampler& Instance() {
@@ -78,6 +125,7 @@ public:
 private:
     void Run(std::stop_token stop) {
         SetCurrentThreadName("shadGT:Profiler");
+        t_profiler_thread = true;
         SetCurrentThreadPriority(ThreadPriority::High);
         timeBeginPeriod(1);
         auto report_at = std::chrono::steady_clock::now() + std::chrono::seconds{10};
@@ -106,43 +154,11 @@ private:
         // runs until it is resumed: the frames go to a local array first.
         constexpr u32 MaxFrames = 16;
         u64 frames[MaxFrames];
-        u32 depth = 0;
         if (SuspendThread(thread.handle) == static_cast<DWORD>(-1)) {
             return; // exited
         }
-        CONTEXT context{};
-        context.ContextFlags = CONTEXT_FULL;
-        if (GetThreadContext(thread.handle, &context)) {
-            frames[depth++] = context.Rip;
-            u64 last_rsp = 0;
-            for (u32 frame = 0; frame < MaxFrames - 1 && context.Rip != 0; ++frame) {
-                // Only the thread's own stack is read.
-                if (context.Rsp < thread.stack_low || context.Rsp + 8 > thread.stack_high ||
-                    context.Rsp <= last_rsp) {
-                    break;
-                }
-                last_rsp = context.Rsp;
-                DWORD64 image_base{};
-                const auto* entry = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
-                if (!entry) {
-                    // A leaf without unwind data: its return address is on top of the stack.
-                    if (frame != 0) {
-                        break;
-                    }
-                    context.Rip = *reinterpret_cast<const u64*>(context.Rsp);
-                    context.Rsp += 8;
-                } else {
-                    void* handler_data{};
-                    DWORD64 establisher_frame{};
-                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip,
-                                     const_cast<PRUNTIME_FUNCTION>(entry), &context,
-                                     &handler_data, &establisher_frame, nullptr);
-                }
-                if (context.Rip != 0) {
-                    frames[depth++] = context.Rip;
-                }
-            }
-        }
+        const u32 depth = WalkStack(thread.handle, thread.stack_low, thread.stack_high, frames,
+                                    MaxFrames);
         ResumeThread(thread.handle);
         if (depth == 0) {
             return;
@@ -216,7 +232,7 @@ private:
                     sorted.emplace_back(count, &stack);
                 }
                 std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.first > b.first; });
-                for (size_t i = 0; i < std::min<size_t>(sorted.size(), 60); ++i) {
+                for (size_t i = 0; i < std::min<size_t>(sorted.size(), 250); ++i) {
                     std::string path;
                     for (const u64 function : *sorted[i].second) {
                         path += ' ' + Describe(function);
@@ -270,6 +286,10 @@ std::string DescribeCode(u64 address) {
     return Sampler::Describe(address);
 }
 
+bool IsProfilerThread() {
+    return t_profiler_thread;
+}
+
 std::string DescribeStack() {
     void* frames[24];
     const USHORT count = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
@@ -294,6 +314,9 @@ std::string DescribeCode(u64 address) {
 }
 std::string DescribeStack() {
     return {};
+}
+bool IsProfilerThread() {
+    return false;
 }
 } // namespace Common::SamplingProfiler
 

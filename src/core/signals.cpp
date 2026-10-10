@@ -12,6 +12,7 @@
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/memory.h"
+#include "common/sampling_profiler.h"
 #include "core/signals.h"
 #include "emulator.h"
 
@@ -32,6 +33,9 @@ namespace Core {
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
+    if (Common::SamplingProfiler::IsProfilerThread()) {
+        return EXCEPTION_CONTINUE_SEARCH; // DIAG-048: the profiler's unwinder handles its faults
+    }
     const auto* signals = Signals::Instance();
 
     const bool use_static_windows_guest_red_zone_protection =

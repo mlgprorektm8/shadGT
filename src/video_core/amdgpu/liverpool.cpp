@@ -43,6 +43,16 @@ namespace AmdGpu {
 static std::mutex g_deferred_fence_writes_mutex;
 static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> g_deferred_fence_writes;
 
+// DIAG-055: graphics end-of-pipe interrupts and the game's next submission.
+static std::atomic<s64> g_last_eop_ns{0};
+static std::atomic<u64> g_eops_deferred{0};
+static std::atomic<u64> g_eops_immediate{0};
+static s64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 static void WriteDeferredFence(void* address, const void* data, u32 num_bytes) {
     {
         std::scoped_lock lk{g_deferred_fence_writes_mutex};
@@ -559,10 +569,15 @@ void Liverpool::ReportDrawPipe() {
         if (t.count != 0) {
             read_ahead += fmt::format(
                 "; DIAG-051: {} gfx submits, after the game's submit: decoded {:.2f} ms, recorded "
-                "{:.2f} ms, GPU done {:.2f} ms (max {:.1f}); game submits every {:.2f} ms",
+                "{:.2f} ms, GPU done {:.2f} ms (max {:.1f}); game submits every {:.2f} ms; "
+                "DIAG-055: submits come {:.2f} ms after the last EOP interrupt; EOPs {} deferred, "
+                "{} at once",
                 t.count, t.decode_us / 1000.0 / t.count, t.record_us / 1000.0 / t.count,
                 t.gpu_count ? t.gpu_us / 1000.0 / t.gpu_count : 0.0, t.max_gpu_us / 1000.0,
-                t.gaps ? t.gap_us / 1000.0 / t.gaps : 0.0);
+                t.gaps ? t.gap_us / 1000.0 / t.gaps : 0.0,
+                t.eop_to_submit_count ? t.eop_to_submit_us / 1000.0 / t.eop_to_submit_count
+                                      : 0.0,
+                g_eops_deferred.exchange(0), g_eops_immediate.exchange(0));
         }
         submit_stats = {};
     }
@@ -1538,6 +1553,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                             WriteDeferredFence(address, &data, num_bytes);
                                         },
                                         [] {
+                                            g_last_eop_ns.store(NowNs());
+                                            ++g_eops_deferred;
                                             Platform::IrqC::Instance()->Signal(
                                                 Platform::InterruptId::GfxEop);
                                         });
@@ -1555,6 +1572,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                                 },
                                 [] {
+                                    g_last_eop_ns.store(NowNs());
+                                    ++g_eops_immediate;
                                     Platform::IrqC::Instance()->Signal(
                                         Platform::InterruptId::GfxEop);
                                 });
@@ -2555,6 +2574,13 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         const auto now = std::chrono::steady_clock::now();
         std::scoped_lock lk{submit_timing_mutex};
         gfx_submit_times.push_back(now);
+        if (const s64 eop = g_last_eop_ns.load(); eop != 0) {
+            const s64 since = NowNs() - eop;
+            if (since >= 0 && since < 100'000'000) {
+                submit_stats.eop_to_submit_us += static_cast<u64>(since / 1000);
+                ++submit_stats.eop_to_submit_count;
+            }
+        }
         if (last_gfx_submit != std::chrono::steady_clock::time_point{}) {
             submit_stats.gap_us += static_cast<u64>(
                 std::chrono::duration_cast<std::chrono::microseconds>(now - last_gfx_submit)

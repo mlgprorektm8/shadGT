@@ -319,10 +319,19 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
         std::copy_n(selected.user_data.begin(), selected.num_user_data, shadow.user_data.begin());
         info.user_data = std::span<const u32>{shadow.user_data.data(), selected.num_user_data};
         info.pgm_base = selected.pgm_base;
-        // The sharps are read again from the memory as the recorder sees it now.
-        info.RefreshFlatBuf();
-        if (validate && info.flattened_ud_buf != selected.flattened) {
-            return false;
+        // PERF-061: the flattened user data the command thread read is used as is; the
+        // recorder no longer walks the shader resource tables again to check it (in millions of
+        // checks it never differed). -DisablePerf 69 reads them again and compares.
+        static const bool trust_selection = Common::PerfFeatureEnabled(69);
+        if (validate && trust_selection) {
+            info.flattened_ud_buf = selected.flattened;
+            info.flattened_ud_src.assign(info.flattened_ud_buf.size(), 0);
+        } else {
+            // The sharps are read again from the memory as the recorder sees it now.
+            info.RefreshFlatBuf();
+            if (validate && info.flattened_ud_buf != selected.flattened) {
+                return false;
+            }
         }
         draw_stages[stage] = &info;
     }
@@ -1306,7 +1315,16 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         std::scoped_lock lk{deferred_fences_mutex};
         address_pending = deferred_fence_addresses.contains(address);
     }
-    if (!readbacks_pending && !address_pending) {
+    // FIX-049: fences reach memory in order, as on hardware. A fence signaled now while an
+    // earlier one is still deferred would let the game see the later fence first, reuse memory
+    // the earlier fence's label lives in, and then have that label written over the new data:
+    // in the Nurburgring benchmark a deferred label landed on a command buffer the game had
+    // refilled, which stopped the emulator with "Invalid PM4 type 0" (also in runs of October 8
+    // and 9). The deferred operations run in GPU order, so deferring this one keeps the order.
+    // -DisablePerf 68 signals other addresses at once as before.
+    static const bool keep_order = Common::PerfFeatureEnabled(68);
+    const bool earlier_deferred = keep_order && deferred_fences.load() != 0;
+    if (!readbacks_pending && !address_pending && !earlier_deferred) {
         return false;
     }
     texture_cache.ReleaseFinishedReadbacks();
