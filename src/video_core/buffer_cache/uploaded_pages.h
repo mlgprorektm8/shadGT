@@ -34,6 +34,11 @@ public:
         pages[page] = Entry{hash_before, generation};
     }
 
+    /// PERF-062: whether the page has an upload record.
+    bool Contains(VAddr page) const {
+        return pages.contains(page);
+    }
+
     void Forget(VAddr page) {
         pages.erase(page);
     }

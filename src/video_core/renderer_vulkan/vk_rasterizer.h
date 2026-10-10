@@ -79,6 +79,13 @@ public:
     std::optional<SelectedPipeline> SelectPipelineAhead();
     /// PERF-055: the same for a direct dispatch it is decoding (-DisablePerf 66: none).
     std::optional<SelectedPipeline> SelectComputePipelineAhead();
+    /// PERF-062 (command thread): hashes the pages of the selected draw's read-only buffers for
+    /// the upload epoch it is decoded in.
+    void HashDrawPagesAhead(const SelectedPipeline& selected, u32 epoch);
+    /// PERF-062 (recorder): the upload epoch of the draw being recorded (0 after it).
+    void SetDrawEpoch(u32 epoch) {
+        buffer_cache.SetDrawEpoch(epoch);
+    }
     /// PERF-047: on the recorder thread, around the draw it selected the pipeline for.
     void SetSelectedPipeline(const SelectedPipeline* selected) {
         selected_pipeline = selected;

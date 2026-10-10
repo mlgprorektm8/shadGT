@@ -351,9 +351,16 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         selected = compute ? rasterizer->SelectComputePipelineAhead()
                            : rasterizer->SelectPipelineAhead();
     }
+    // PERF-062: the upload epoch this draw is decoded in; its pages are hashed now, on this
+    // thread, and the recorder uses those hashes for this draw.
+    const u32 decode_epoch = VideoCore::g_upload_epoch.load(std::memory_order_acquire);
+    if (selected) {
+        rasterizer->HashDrawPagesAhead(*selected, decode_epoch);
+    }
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
-                     selected = std::move(selected), draw = std::move(draw)]() mutable {
+                     selected = std::move(selected), draw = std::move(draw),
+                     decode_epoch]() mutable {
         auto& state = *recorder;
         RegsDelta<Regs::NumRegs>::Apply(delta, std::span<u32, Regs::NumRegs>{state.regs.reg_array});
         if (cs) {
@@ -365,7 +372,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
             VerifyRecorderRegs(*expected);
         }
         rasterizer->SetSelectedPipeline(selected ? &*selected : nullptr);
+        rasterizer->SetDrawEpoch(selected ? decode_epoch : 0);
         draw();
+        rasterizer->SetDrawEpoch(0);
         rasterizer->SetSelectedPipeline(nullptr);
         delta_recycler.Give(std::move(delta));
         if (selected) {

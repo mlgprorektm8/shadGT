@@ -23,6 +23,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "video_core/buffer_cache/page_hash_table.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/uploaded_pages.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -104,6 +105,15 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false,
                     u64 exact_write_size = 0);
+
+    /// PERF-062 (command thread): hashes the recorded pages lying wholly inside these read
+    /// ranges for the upload epoch the draw was decoded in, so the recorder need not.
+    void HashPagesAhead(std::span<const std::pair<VAddr, u64>> ranges, u32 epoch);
+
+    /// PERF-062 (recorder): the upload epoch the draw being recorded was decoded in (0: none).
+    void SetDrawEpoch(u32 epoch) {
+        draw_epoch = epoch;
+    }
 
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
@@ -295,6 +305,12 @@ private:
     std::vector<NoImageRange> no_image_memo = std::vector<NoImageRange>(65536);
     std::atomic<u64> hot_pages_unchanged{};
     std::atomic<u64> hot_pages_uploaded{};
+    // PERF-062: hot-page hashes taken by the command thread as it decodes draws.
+    PageHashTable ahead_hashes;
+    u32 draw_epoch{};
+    std::atomic<u64> ahead_hashed{};
+    u64 ahead_hits{};
+    u64 ahead_misses{};
     // PERF-049: hot-page hashes taken ahead on a background thread.
     std::unique_ptr<HotPagePrehasher> prehasher;
     u64 prehashed_hits{};

@@ -435,6 +435,14 @@ void BufferCache::LogHotPageStats() {
     }
     prehashed_hits = 0;
     prehashed_misses = 0;
+    if (ahead_hits + ahead_misses != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-062: hot-page hashes taken by the command thread: {} used, {} hashed "
+                    "here; {} hashed ahead",
+                    ahead_hits, ahead_misses, ahead_hashed.exchange(0));
+    }
+    ahead_hits = 0;
+    ahead_misses = 0;
     if (const u64 flushes = async_fault_flushes.exchange(0); flushes != 0) {
         const u64 wait_us = async_fault_wait_us.exchange(0);
         LOG_WARNING(Render_Vulkan,
@@ -1245,6 +1253,38 @@ static void HashPages(size_t count, PageAt&& page_at, std::span<u64> hashes) {
     }
 }
 
+void BufferCache::HashPagesAhead(std::span<const std::pair<VAddr, u64>> ranges, u32 epoch) {
+    // Pages that have an upload record are the ones SynchronizeMemory hashes (when hot); others
+    // are uploaded whole anyway. Each page is hashed once per epoch.
+    constexpr size_t MaxPages = 2048;
+    boost::container::small_vector<VAddr, 64> pages;
+    {
+        std::scoped_lock lk{uploaded_pages_mutex};
+        for (const auto& [address, size] : ranges) {
+            for (VAddr page = Common::AlignUp(address, BYTES_PER_PAGE);
+                 page + BYTES_PER_PAGE <= address + size && pages.size() < MaxPages;
+                 page += BYTES_PER_PAGE) {
+                if (!ahead_hashes.Has(page, epoch) && uploaded_page_contents.Contains(page)) {
+                    pages.push_back(page);
+                }
+            }
+        }
+    }
+    if (pages.empty()) {
+        return;
+    }
+    // No mapping can go away while the pages are read.
+    memory->WithMappingsStable([&] {
+        for (const VAddr page : pages) {
+            if (memory->IsMappedAddress(page)) {
+                ahead_hashes.Store(page, epoch,
+                                   XXH3_64bits(std::bit_cast<const void*>(page), BYTES_PER_PAGE));
+            }
+        }
+    });
+    ahead_hashed.fetch_add(pages.size(), std::memory_order_relaxed);
+}
+
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
@@ -1360,7 +1400,25 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         range_end.push_back(hot.size());
     }
     hot_hashes.resize(hot.size());
-    if (prehasher && !hot.empty()) {
+    if (draw_epoch != 0 && !hot.empty()) {
+        // PERF-062: hashes the command thread took when it decoded this draw, in its epoch.
+        auto& misses = scratch.misses;
+        misses.clear();
+        for (size_t i = 0; i < hot.size(); ++i) {
+            if (!ahead_hashes.Lookup(hot[i].first, draw_epoch, hot_hashes[i])) {
+                misses.push_back(i);
+            }
+        }
+        ahead_hits += hot.size() - misses.size();
+        ahead_misses += misses.size();
+        auto& miss_hashes = scratch.miss_hashes;
+        miss_hashes.resize(misses.size());
+        HashPages(misses.size(), [&](size_t j) { return hot[misses[j]].first; },
+                  std::span<u64>{miss_hashes.data(), miss_hashes.size()});
+        for (size_t j = 0; j < misses.size(); ++j) {
+            hot_hashes[misses[j]] = miss_hashes[j];
+        }
+    } else if (prehasher && !hot.empty()) {
         // PERF-049: hashes taken ahead in the current epoch; the rest are hashed here.
         const u32 epoch = g_upload_epoch.load(std::memory_order_acquire);
         const auto batch = prehasher->Current();

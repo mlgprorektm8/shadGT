@@ -289,6 +289,57 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
     return pipeline;
 }
 
+void Rasterizer::HashDrawPagesAhead(const SelectedPipeline& selected, u32 epoch) {
+    static const bool enabled = Common::PerfFeatureEnabled(70) &&
+                                EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Precise;
+    if (!enabled) {
+        return;
+    }
+    const Pipeline* pipeline = selected.is_compute
+                                   ? static_cast<const Pipeline*>(selected.compute)
+                                   : static_cast<const Pipeline*>(selected.pipeline);
+    if (!pipeline) {
+        return;
+    }
+    struct FlatView {
+        const std::vector<u32>& flattened_ud_buf;
+        VAddr pgm_base;
+    };
+    boost::container::small_vector<std::pair<VAddr, u64>, 16> ranges;
+    const auto& canonical = pipeline->CanonicalStages();
+    for (u32 stage = 0; stage < Shader::MaxStageTypes; ++stage) {
+        const auto& sel = selected.stages[stage];
+        const Shader::Info* info = canonical[stage];
+        if (!info || !sel.present) {
+            continue;
+        }
+        const FlatView view{sel.flattened, sel.pgm_base};
+        for (const auto& desc : info->buffers) {
+            if (desc.IsSpecial() || desc.is_written) {
+                continue;
+            }
+            if (!desc.sharp_fetch.FitsIn(sel.flattened.size())) {
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(view);
+            if (vsharp.base_address == 0 || vsharp.GetSize() == 0 ||
+                !IsMappedStart(vsharp.base_address)) {
+                continue;
+            }
+            // Open-ended (scalar pointer) ranges are clamped to their mapping, as BindBuffers
+            // does before binding them.
+            const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+            if (size == 0 || size > 64_MB) {
+                continue;
+            }
+            ranges.emplace_back(vsharp.base_address, size);
+        }
+    }
+    if (!ranges.empty()) {
+        buffer_cache.HashPagesAhead(std::span{ranges.data(), ranges.size()}, epoch);
+    }
+}
+
 Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical) {
     auto& shadow = shadow_infos[canonical];
     // A cached info's identity never changes; a different one means the address was reused.

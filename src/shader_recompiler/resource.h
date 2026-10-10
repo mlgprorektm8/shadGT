@@ -39,6 +39,23 @@ struct SharpFetch {
 
     bool operator==(const SharpFetch&) const = default;
 
+    /// PERF-062: whether every dword Fetch reads lies within a flattened buffer of this size.
+    constexpr bool FitsIn(size_t num_flat_dwords) const {
+        if (summary == Summary::SingleLoad) {
+            return size_t(offsets[0]) + N <= num_flat_dwords;
+        }
+        if (summary == Summary::Invalid) {
+            return true;
+        }
+        u8 mask = load_mask;
+        for (u32 i = 0; i < N; i++, mask >>= 1) {
+            if ((mask & 1) && size_t(offsets[i]) >= num_flat_dwords) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     template <u32 num_dwords = N>
         requires(num_dwords <= N)
     constexpr bool Fetch(const u32* flatbuf, T* out) const {
