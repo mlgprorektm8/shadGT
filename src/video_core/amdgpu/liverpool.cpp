@@ -512,10 +512,11 @@ bool Liverpool::EarlyFenceAllowed() {
         return false;
     }
     if (early_fences_mode == 1) {
-        // The game read GPU results with a recent fence (image readbacks): keep fences in
-        // step with the recorder for a while, so it does not read them before they exist.
+        // The game reads GPU results back (images queued for download, fences waiting for
+        // readbacks) in the last 10 s: fences stay in step with the recorder, so it does not
+        // read them before they exist (car select flickered with 2 s and no download check).
         const s64 last = rasterizer->LastReadbackFenceNs();
-        if (last != 0 && NowNs() - last < 2'000'000'000) {
+        if (last != 0 && NowNs() - last < 10'000'000'000) {
             ++early_stats.recent_readbacks;
             return false;
         }

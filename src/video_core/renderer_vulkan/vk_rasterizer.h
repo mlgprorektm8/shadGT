@@ -126,7 +126,10 @@ public:
     }
     /// PERF-063 (any thread): when a fence last waited for readbacks (steady clock ns), or 0.
     s64 LastReadbackFenceNs() const noexcept {
-        return last_readback_fence_ns.load(std::memory_order_relaxed);
+        // An early fence skips the deferral that notes readbacks: images queued for download
+        // count too.
+        return std::max(last_readback_fence_ns.load(std::memory_order_relaxed),
+                        texture_cache.LastReadbackQueuedNs());
     }
     /// PERF-063: a CPU fault on a game thread; waits while work the game was told is done
     /// (an early fence) and that reads the page is not recorded yet.

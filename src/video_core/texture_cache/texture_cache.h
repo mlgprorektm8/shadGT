@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <mutex>
 #include <shared_mutex>
@@ -408,6 +410,18 @@ private:
 public:
     /// True when GPU-written images are waiting to be read back to guest memory.
     bool HasPendingReadbacks();
+
+    /// PERF-063: when an image the CPU reads back was last queued for download (steady clock
+    /// ns), or 0. Early fences stay off for a while after it.
+    s64 LastReadbackQueuedNs() const noexcept {
+        return last_readback_queued_ns.load(std::memory_order_relaxed);
+    }
+    void NoteReadbackQueued() noexcept {
+        last_readback_queued_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count(),
+                                      std::memory_order_relaxed);
+    }
     /// DIAG-044: whether the slot still holds the image with this uid.
     bool IsImageAlive(ImageId image_id, u64 uid) {
         return image_id && slot_images.IsAllocated(image_id) &&
@@ -438,6 +452,7 @@ private:
 
     const bool readback_linear_images;
     std::mutex download_images_mutex;
+    std::atomic<s64> last_readback_queued_ns{};
     struct MetaDataInfo {
         MetaType type;
         s32 clear_mask = -1;

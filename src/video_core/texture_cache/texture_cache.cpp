@@ -1064,6 +1064,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         image.MarkGpuModified();
         if (ShouldReadBack(image)) {
             LogReadbackImage(image_id, image, "storage image");
+            NoteReadbackQueued();
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
         }
@@ -1077,6 +1078,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     image.MarkGpuModified();
     if (ShouldReadBack(image)) {
         LogReadbackImage(image_id, image, "render target");
+        NoteReadbackQueued();
         // DIAG-037: drawn into (queued for readback), in the crash report's write history.
         static constexpr u32 NoData = 0;
         Core::MemoryManager::NoteEmulatorWrite(image.info.guest_address, 0, &NoData);
