@@ -375,16 +375,17 @@ void Liverpool::Record(Common::UniqueFunction<void>&& work, const char* reason) 
 }
 
 void Liverpool::RecordDma(Common::UniqueFunction<void>&& work, VAddr src, u64 src_bytes,
-                          bool writes_memory) {
+                          VAddr dst, u64 dst_bytes) {
+    const bool writes_memory = dst != 0 && dst_bytes != 0;
     if (!early_fences_mode || !draw_pipe || !rasterizer) {
         Record(std::move(work), "dma");
         return;
     }
     // PERF-063: the bytes it reads are captured now like a draw's; a write to guest memory
     // the CPU may read before it is recorded keeps the window uncovered in mode 1.
-    if (writes_memory && early_fences_mode == 1) {
-        Record(std::move(work), "dma writing memory");
-        return;
+    if (writes_memory) {
+        // PERF-070: the CPU cannot read it before the copy is recorded.
+        GuardGpuWrite(dst, dst_bytes);
     }
     if (!window_capture) {
         window_capture = TakeCapture();
@@ -446,7 +447,44 @@ void Liverpool::UnsafeWindow(const char* reason) {
     }
 }
 
+void Liverpool::GuardGpuWrite(VAddr address, u64 size) {
+    if (!early_fences_mode || !rasterizer || size == 0) {
+        return;
+    }
+    rasterizer->GetPageManager().Guard(address, size);
+    window_guards.emplace_back(address, size);
+}
+
+void Liverpool::WaitForGuard(VAddr page) {
+    if (!early_fences_mode || !rasterizer || !rasterizer->GetPageManager().IsGuarded(page)) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    while (rasterizer->GetPageManager().IsGuarded(page)) {
+        if (recorder_in_wait.load(std::memory_order_acquire)) {
+            // The recorder waits for memory a CPU thread writes; it may be this one.
+            rasterizer->GetPageManager().DropGuards(page);
+            rasterizer->NoteGuardDropped();
+            break;
+        }
+        std::this_thread::yield();
+    }
+    ++guard_waits_070;
+    guard_wait_us_070 += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                              std::chrono::steady_clock::now() - start)
+                                              .count());
+}
+
 void Liverpool::NewWindow() {
+    if (!window_guards.empty()) {
+        // PERF-070: the window's GPU writes are recorded once this runs.
+        RecordSafe([this, guards = std::move(window_guards)] {
+            for (const auto& [address, size] : guards) {
+                rasterizer->GetPageManager().Unguard(address, size);
+            }
+        });
+        window_guards.clear();
+    }
     if (window_capture) {
         ++early_stats.windows_captured;
         early_stats.pages_captured += window_capture->NumPages();
@@ -587,13 +625,16 @@ void Liverpool::ReportEarlyFences() {
                 "PERF-063 early fences in {:.1f} s: {} signaled at decode, {} in step with the "
                 "recorder (windows not covered:{}; earlier fence pending {}, deferred fences {}, "
                 "recent readbacks {}); {} windows captured, {:.1f} pages each, {} full; CPU "
-                "faults waited {} times, {:.1f} ms ({} not waited: recorder in a wait)",
+                "faults waited {} times, {:.1f} ms ({} not waited: recorder in a wait); "
+                "PERF-070: guarded GPU writes waited for {} times, {:.1f} ms, {} guards dropped "
+                "for emulator threads",
                 std::chrono::duration<double>(now - early_report).count(), st.early, st.normal,
                 unsafe.empty() ? " none" : unsafe, st.earlier_fence_pending, st.deferred_pending,
                 st.recent_readbacks, st.windows_captured,
                 st.windows_captured ? double(st.pages_captured) / st.windows_captured : 0.0,
                 st.full, guard_waits.exchange(0), guard_wait_us.exchange(0) / 1000.0,
-                guard_skipped_in_wait.exchange(0));
+                guard_skipped_in_wait.exchange(0), guard_waits_070.exchange(0),
+                guard_wait_us_070.exchange(0) / 1000.0, rasterizer->TakeGuardsDropped());
     st = {};
     early_report = now;
 }
@@ -650,6 +691,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
             if (rasterizer->CaptureDrawReads(*selected, *window_capture, index_address,
                                              index_size)) {
                 capture = window_capture;
+                for (const auto& [address, size] : rasterizer->CaptureWrites()) {
+                    GuardGpuWrite(address, size);
+                }
             } else {
                 UnsafeWindow(rasterizer->CaptureFailure());
             }
@@ -2056,7 +2100,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                         u32(dma_data->src_sel), u32(dma_data->dst_sel));
                     }
                 }, src_memory ? dma.SrcAddress<VAddr>() : 0, src_memory ? dma.NumBytes() : 0,
-                          to_memory);
+                          to_memory ? dma.DstAddress<VAddr>() : 0, to_memory ? dma.NumBytes() : 0);
                 if (to_memory && WritesLiveCommands(dma.DstAddress<VAddr>(), dma.NumBytes())) {
                     SyncRecorder("dma into commands");
                 }
@@ -2648,14 +2692,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 RecordDma(
                     [this, dst = dma_data->DstAddress<VAddr>(), bytes = dma_data->NumBytes(),
                      value = dma_data->data] { rasterizer->FillBuffer(dst, bytes, value, false); },
-                    0, 0, true);
+                    0, 0, dma_data->DstAddress<VAddr>(), dma_data->NumBytes());
             } else if (dma_data->src_sel == DmaDataSrc::Gds &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
                 RecordDma([this, dst = dma_data->DstAddress<VAddr>(), src = dma_data->src_addr_lo,
                         bytes = dma_data->NumBytes()] {
                     rasterizer->CopyBuffer(dst, src, bytes, false, true);
-                }, 0, 0, true);
+                }, 0, 0, dma_data->DstAddress<VAddr>(), dma_data->NumBytes());
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
@@ -2672,7 +2716,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 } else {
                     RecordDma([this, dst_addr, src_addr, num_bytes] {
                         rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
-                    }, src_addr, num_bytes, true);
+                    }, src_addr, num_bytes, dst_addr, num_bytes);
                 }
             } else {
                 UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),

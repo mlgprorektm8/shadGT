@@ -396,6 +396,7 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
                                    ? static_cast<const Pipeline*>(selected.compute)
                                    : static_cast<const Pipeline*>(selected.pipeline);
     capture_failure = nullptr;
+    capture_writes.clear();
     if (!pipeline) {
         capture_failure = "no pipeline";
         return false;
@@ -497,6 +498,13 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
                 return false;
             }
             capture_range(vsharp.base_address, vsharp.GetSize());
+            if (desc.is_written && vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
+                IsMappedStart(vsharp.base_address)) {
+                // PERF-070: guarded until recorded, so the CPU does not read it before.
+                capture_writes.emplace_back(
+                    vsharp.base_address,
+                    memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
+            }
         }
         for (const auto& desc : info->images) {
             if (!desc.sharp_fetch.FitsIn(sel.flattened.size())) {
@@ -3517,6 +3525,10 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks, u64 e
 
 void Rasterizer::WaitForEarlyFences(VAddr page) {
     liverpool->WaitForEarlyFences(page);
+}
+
+void Rasterizer::WaitForGuard(VAddr page) {
+    liverpool->WaitForGuard(page);
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {

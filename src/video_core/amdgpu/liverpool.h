@@ -352,6 +352,9 @@ private:
     // window is signaled at decode.
     int early_fences_mode{};
     std::shared_ptr<Common::ReadCapture> window_capture;
+    std::vector<std::pair<VAddr, u64>> window_guards; // PERF-070
+    std::atomic<u64> guard_waits_070{};
+    std::atomic<u64> guard_wait_us_070{};
     // Captures are reused (a table per window is large); see TakeCapture.
     static std::shared_ptr<Common::ReadCapture> TakeCapture();
     bool window_safe{true};
@@ -475,7 +478,9 @@ private:
     /// PERF-063: a CP DMA; `src`/`src_bytes` the guest memory it reads (0: none),
     /// `writes_memory` whether it writes guest memory (GPU data the CPU may read).
     void RecordDma(Common::UniqueFunction<void>&& work, VAddr src = 0, u64 src_bytes = 0,
-                   bool writes_memory = false);
+                   VAddr dst = 0, u64 dst_bytes = 0);
+    /// PERF-070: guards a range GPU work of the current window writes, until it is recorded.
+    void GuardGpuWrite(VAddr address, u64 size);
     /// PERF-063: queues work that reads no guest memory and writes none the CPU reads
     /// (submission bookkeeping, markers, fence-ordered waits); it keeps the window safe.
     void RecordSafe(Common::UniqueFunction<void>&& work);
@@ -496,6 +501,8 @@ private:
 public:
     /// PERF-063: a CPU fault on a game thread (see Rasterizer::WaitForEarlyFences).
     void WaitForEarlyFences(VAddr page);
+    /// PERF-070: a CPU fault on a game thread on a guarded page waits for the recorder.
+    void WaitForGuard(VAddr page);
 
 private:
     /// Records a draw or dispatch together with the registers written since the previous one.

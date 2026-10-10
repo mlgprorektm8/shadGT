@@ -44,6 +44,8 @@ struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers;
         u8 num_read_watchers;
+        // PERF-070: guards of GPU writes decoded but not recorded yet (no CPU access at all).
+        u8 num_guards;
 
         Core::MemoryPermission WritePerm() const noexcept {
             return num_write_watchers == 0 ? Core::MemoryPermission::Write
@@ -56,6 +58,9 @@ struct PageManager::Impl {
         }
 
         Core::MemoryPermission Perms() const noexcept {
+            if (num_guards != 0) {
+                return Core::MemoryPermission::None;
+            }
             return ReadPerm() | WritePerm();
         }
 
@@ -116,6 +121,56 @@ struct PageManager::Impl {
         const size_t end_page = end >> PM_PAGE_BITS;
         cached_pages.reserve(start_page, end_page);
         locks.reserve(start_page, end_page);
+    }
+
+    /// PERF-070: adds (or removes) a guard on each tracked page of the range and applies the
+    /// resulting protection. Returns the number of pages guarded.
+    u64 Guard(VAddr addr, u64 size, bool add) {
+        const u64 page_start = addr >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        u64 guarded = 0;
+        for (u64 page = page_start; page != page_end; ++page) {
+            PageState* state = cached_pages.find(page);
+            if (!state) {
+                continue;
+            }
+            std::scoped_lock lk{locks[page]};
+            const auto old_perms = state->Perms();
+            if (add) {
+                if (state->num_guards == 255) {
+                    continue;
+                }
+                ++state->num_guards;
+            } else {
+                if (state->num_guards == 0) {
+                    continue;
+                }
+                --state->num_guards;
+            }
+            ++guarded;
+            if (const auto new_perms = state->Perms(); new_perms != old_perms) {
+                Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, new_perms);
+            }
+        }
+        return guarded;
+    }
+
+    /// PERF-070: every guard on the page goes (an emulator thread must access it).
+    void DropGuards(VAddr page_addr) {
+        const u64 page = page_addr >> PM_PAGE_BITS;
+        PageState* state = cached_pages.find(page);
+        if (!state) {
+            return;
+        }
+        std::scoped_lock lk{locks[page]};
+        if (state->num_guards == 0) {
+            return;
+        }
+        const auto old_perms = state->Perms();
+        state->num_guards = 0;
+        if (const auto new_perms = state->Perms(); new_perms != old_perms) {
+            Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, new_perms);
+        }
     }
 
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
@@ -520,10 +575,18 @@ struct SignalImpl : public PageManager::Impl {
                             Common::SamplingProfiler::DescribeStack());
             }
         }
+        const VAddr fault_page = PageManager::GetPageAddr(addr);
         if (!is_gpu_thread) {
             // PERF-063: the game was told work is done (an early fence) that the recorder has
             // not recorded yet; if it reads this page, the access waits for it.
-            rasterizer->WaitForEarlyFences(PageManager::GetPageAddr(addr));
+            rasterizer->WaitForEarlyFences(fault_page);
+            // PERF-070: a page a decoded GPU write guards opens once the write is recorded.
+            rasterizer->WaitForGuard(fault_page);
+        } else if (rasterizer->GetPageManager().IsGuarded(fault_page)) {
+            // PERF-070: an emulator thread reads or writes a guarded page itself: open it.
+            rasterizer->GetPageManager().DropGuards(fault_page);
+            rasterizer->NoteGuardDropped();
+            return true;
         }
         // PERF-054: the command thread's fault is flushed as urgent work on the recorder,
         // which then holds the caches; otherwise this thread drains the recorder and uses them.
@@ -559,9 +622,27 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 
 PageManager::~PageManager() = default;
 
+u64 PageManager::Guard(VAddr address, u64 size) {
+    return impl->Guard(address, size, true);
+}
+
+void PageManager::Unguard(VAddr address, u64 size) {
+    impl->Guard(address, size, false);
+}
+
+bool PageManager::IsGuarded(VAddr page) const {
+    const auto* state = impl->cached_pages.find(page >> PM_PAGE_BITS);
+    return state && state->num_guards != 0;
+}
+
 bool PageManager::IsUnwatched(VAddr page) const {
     const auto* state = impl->cached_pages.find(page >> PM_PAGE_BITS);
-    return !state || (state->num_write_watchers == 0 && state->num_read_watchers == 0);
+    return !state || (state->num_write_watchers == 0 && state->num_read_watchers == 0 &&
+                      state->num_guards == 0);
+}
+
+void PageManager::DropGuards(VAddr page) {
+    impl->DropGuards(page);
 }
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {

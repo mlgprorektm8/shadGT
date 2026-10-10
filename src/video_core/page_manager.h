@@ -46,6 +46,13 @@ public:
                                      const RegionBits& write_mask, const RegionBits& read_mask,
                                      PageOp write_op, PageOp read_op) const;
 
+    /// PERF-070: no CPU access to the tracked pages of the range until Unguard (GPU writes
+    /// decoded ahead of the recorder). Returns how many pages were guarded.
+    u64 Guard(VAddr address, u64 size);
+    void Unguard(VAddr address, u64 size);
+    bool IsGuarded(VAddr page) const;
+    void DropGuards(VAddr page);
+
     /// PERF-063: whether a CPU write to the page goes unnoticed (no write or read watcher, so
     /// the page is neither write- nor read-protected). Any thread; a racy but word-sized read.
     bool IsUnwatched(VAddr page) const;

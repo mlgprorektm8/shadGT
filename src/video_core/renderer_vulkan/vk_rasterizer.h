@@ -100,6 +100,22 @@ public:
     }
     /// PERF-063 (command thread): the same for one guest range (a DMA source).
     bool CaptureGuestRange(Common::ReadCapture& capture, VAddr address, u64 size);
+    /// PERF-070
+    VideoCore::PageManager& GetPageManager() {
+        return page_manager;
+    }
+    void WaitForGuard(VAddr page);
+    void NoteGuardDropped() {
+        guards_dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+    u64 TakeGuardsDropped() {
+        return guards_dropped.exchange(0);
+    }
+    /// PERF-070 (command thread): the buffer ranges the last captured draw writes.
+    std::span<const std::pair<VAddr, u64>> CaptureWrites() const {
+        return capture_writes;
+    }
+
     /// PERF-069 (any thread): whether a CPU write to the page goes unnoticed.
     bool IsUnwatchedPage(VAddr page) const {
         return page_manager.IsUnwatched(page);
@@ -357,6 +373,8 @@ private:
     Common::Recycler<SelectedPipeline, 4096> selected_recycler;
     const Common::ReadCapture* read_capture{}; // PERF-063
     const char* capture_failure{};
+    std::vector<std::pair<VAddr, u64>> capture_writes; // PERF-070
+    std::atomic<u64> guards_dropped{};
     // PERF-067
     BufferPlan* buffer_plan{};
     std::array<std::atomic<u64>, 3> plan_refusals{};
