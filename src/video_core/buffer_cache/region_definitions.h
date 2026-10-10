@@ -29,9 +29,14 @@ constexpr u64 NUM_REGION_PAGES = HIGHER_PAGE_SIZE / BYTES_PER_PAGE;
 /// CPU or another queue writes, and command processor writes to guest memory. Within one epoch
 /// the memory a submitted command buffer reads is stable, as it must be for the real GPU.
 inline std::atomic<u32> g_upload_epoch{1};
+/// PERF-049: told of each new epoch (the hot-page prehasher).
+inline std::atomic<void (*)(u32)> g_upload_epoch_listener{nullptr};
 inline void BumpUploadEpoch() {
-    g_upload_epoch.fetch_add(1, std::memory_order_acq_rel);
+    const u32 epoch = g_upload_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     Common::GetWorkCounters().upload_epochs.fetch_add(1, std::memory_order_relaxed);
+    if (const auto listener = g_upload_epoch_listener.load(std::memory_order_acquire)) {
+        listener(epoch);
+    }
 }
 constexpr u64 NUM_REGION_WORDS = HIGHER_PAGE_SIZE / BYTES_PER_WORD;
 

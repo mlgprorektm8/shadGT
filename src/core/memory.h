@@ -5,6 +5,7 @@
 
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <source_location>
 #include <string>
 #include <string_view>
@@ -257,6 +258,13 @@ public:
         if (have_run) {
             func(run_start, end - run_start, run_exec);
         }
+    }
+
+    /// PERF-049: runs func while no mapping can change (a shared hold of the map's lock).
+    template <typename Func>
+    void WithMappingsStable(Func&& func) {
+        std::shared_lock lk{mutex};
+        func();
     }
 
     bool IsValidMapping(const VAddr virtual_addr, const u64 size = 0) {

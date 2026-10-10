@@ -21,6 +21,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "video_core/buffer_cache/hot_page_prehasher.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/uploaded_pages.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -246,6 +247,10 @@ private:
     std::mutex uploaded_pages_mutex;
     std::atomic<u64> hot_pages_unchanged{};
     std::atomic<u64> hot_pages_uploaded{};
+    // PERF-049: hot-page hashes taken ahead on a background thread.
+    std::unique_ptr<HotPagePrehasher> prehasher;
+    u64 prehashed_hits{};
+    u64 prehashed_misses{};
     std::atomic<u32> num_tracked_async_readbacks{};
 
     struct ArenaBinds {

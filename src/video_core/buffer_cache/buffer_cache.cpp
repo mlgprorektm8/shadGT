@@ -18,6 +18,7 @@
 #include "common/alignment.h"
 #include "common/io_file.h"
 #include "common/perf_monitor.h"
+#include "core/emulator_settings.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
@@ -141,6 +142,8 @@ private:
 };
 } // namespace
 
+static std::atomic<HotPagePrehasher*> s_prehasher{nullptr}; // PERF-049
+
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 
@@ -214,9 +217,36 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
+
+    // PERF-049: not in precise readback mode, where GPU-written pages are read-protected and
+    // the prehasher could fault on one. -DisablePerf 61 hashes on the recorder only.
+    if (Common::PerfFeatureEnabled(61) &&
+        EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Precise) {
+        prehasher = std::make_unique<HotPagePrehasher>(
+            1, BYTES_PER_PAGE, g_upload_epoch,
+            [this](std::vector<VAddr>& pages) {
+                std::scoped_lock lk{uploaded_pages_mutex};
+                pages.reserve(uploaded_page_contents.Size());
+                uploaded_page_contents.ForEachPage([&](VAddr page) { pages.push_back(page); });
+            },
+            [this](const std::function<void()>& func) { memory->WithMappingsStable(func); },
+            [this](VAddr page) { return memory->IsMappedAddress(page); });
+        s_prehasher = prehasher.get();
+        g_upload_epoch_listener.store(
+            [](u32 epoch) {
+                if (auto* hasher = s_prehasher.load(std::memory_order_acquire)) {
+                    hasher->OnEpoch(epoch);
+                }
+            },
+            std::memory_order_release);
+    }
 }
 
-BufferCache::~BufferCache() = default;
+BufferCache::~BufferCache() {
+    g_upload_epoch_listener.store(nullptr, std::memory_order_release);
+    s_prehasher.store(nullptr, std::memory_order_release);
+    prehasher.reset();
+}
 
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
@@ -393,9 +423,12 @@ void BufferCache::LogHotPageStats() {
     if (unchanged + uploaded != 0) {
         LOG_WARNING(Render_Vulkan,
                     "PERF-033 hot pages in 2.0 s: {} unchanged and not uploaded ({} MB), {} "
-                    "uploaded",
-                    unchanged, unchanged * BYTES_PER_PAGE >> 20, uploaded);
+                    "uploaded; PERF-049: {} hashes taken ahead, {} on the recorder",
+                    unchanged, unchanged * BYTES_PER_PAGE >> 20, uploaded, prehashed_hits,
+                    prehashed_misses);
     }
+    prehashed_hits = 0;
+    prehashed_misses = 0;
     stats.page_only_faults = 0;
     stats.drain_reports = 0;
     stats.split_faults = 0;
@@ -1044,8 +1077,28 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         range_end.push_back(hot.size());
     }
     boost::container::small_vector<u64, 64> hot_hashes(hot.size());
-    HashPages(hot.size(), [&](size_t i) { return hot[i].first; },
-              std::span<u64>{hot_hashes.data(), hot_hashes.size()});
+    if (prehasher && !hot.empty()) {
+        // PERF-049: hashes taken ahead in the current epoch; the rest are hashed here.
+        const u32 epoch = g_upload_epoch.load(std::memory_order_acquire);
+        const auto batch = prehasher->Current();
+        boost::container::small_vector<size_t, 64> misses;
+        for (size_t i = 0; i < hot.size(); ++i) {
+            if (!batch || !batch->Lookup(hot[i].first, epoch, hot_hashes[i])) {
+                misses.push_back(i);
+            }
+        }
+        prehashed_hits += hot.size() - misses.size();
+        prehashed_misses += misses.size();
+        boost::container::small_vector<u64, 64> miss_hashes(misses.size());
+        HashPages(misses.size(), [&](size_t j) { return hot[misses[j]].first; },
+                  std::span<u64>{miss_hashes.data(), miss_hashes.size()});
+        for (size_t j = 0; j < misses.size(); ++j) {
+            hot_hashes[misses[j]] = miss_hashes[j];
+        }
+    } else {
+        HashPages(hot.size(), [&](size_t i) { return hot[i].first; },
+                  std::span<u64>{hot_hashes.data(), hot_hashes.size()});
+    }
     size_t hot_index = 0;
     for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
         const auto [addr, range_size] = ranges[range_index];

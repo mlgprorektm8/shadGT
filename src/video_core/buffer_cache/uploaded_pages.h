@@ -38,6 +38,14 @@ public:
         pages.erase(page);
     }
 
+    /// Calls func(page) for each recorded page.
+    template <typename Func>
+    void ForEachPage(Func&& func) const {
+        for (const auto& [page, entry] : pages) {
+            func(page);
+        }
+    }
+
     size_t Size() const {
         return pages.size();
     }
