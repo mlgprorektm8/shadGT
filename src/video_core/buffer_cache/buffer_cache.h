@@ -10,8 +10,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <span>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -184,6 +186,38 @@ public:
     std::string DescribeRange(VAddr address, u64 size);
 
 private:
+    /// PERF-052: a game-thread fault's download, recorded on the recorder; the GPU wait and the
+    /// write to guest memory happen off the recorder, in GPU order with async readbacks.
+    struct FaultDownload {
+        VAddr device_addr{};
+        u64 size{};
+        bool is_write{};
+        VAddr window_start{};
+        VAddr window_end{};
+        u64 tick{};
+        u64 seq{}; // GPU writes logged after this one are newer than the download
+        Vulkan::StagingBufferRef download{};
+        boost::container::small_vector<vk::BufferCopy, 4> copies;
+        boost::container::small_vector<std::pair<VAddr, VAddr>, 4> ranges;
+        std::atomic<bool> applied{};
+        std::binary_semaphore done{0};
+    };
+    /// Recorder. Null when nothing had to come from the GPU (the flush is complete).
+    std::shared_ptr<FaultDownload> BeginFaultFlush(VAddr device_addr, u64 size, bool is_write,
+                                                   u64 exact_write_size);
+    /// Recorder, once the download reached guest memory.
+    void FinishFaultFlush(FaultDownload& fault);
+    /// Recorder: guest writes of fault downloads older than tick have happened.
+    void WaitForFaultWritebacks(u64 tick);
+    void NoteGpuWrite(VAddr address, u64 size);
+    std::mutex fault_downloads_mutex;
+    std::deque<std::shared_ptr<FaultDownload>> fault_downloads;
+    std::atomic<u32> num_fault_downloads{};
+    u64 gpu_write_seq{};
+    std::vector<std::tuple<u64, VAddr, VAddr>> gpu_write_log; // while downloads are pending
+    std::atomic<u64> async_fault_flushes{};
+    std::atomic<u64> async_fault_wait_us{};
+
     void InvalidateAsyncReadbacks(VAddr address, u64 size);
     /// PERF-011: handles a CPU write fault on a page with GPU-written bytes that the write does
     /// not touch, without waiting for the GPU. Returns false when the exact path is needed.

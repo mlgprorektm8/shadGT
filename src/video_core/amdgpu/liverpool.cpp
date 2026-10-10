@@ -2352,6 +2352,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     if (rasterizer) {
                         rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::AscReleaseMem);
                     }
+                    // PERF-051: the value goes to guest memory through the backing, as graphics
+                    // EOP/EOS fences do, instead of a store that faults on a tracked page and
+                    // makes the recorder wait for the whole GPU. -DisablePerf 63 stores directly.
+                    static const bool write_backing = Common::PerfFeatureEnabled(63);
                     release_mem->SignalFence(
                         [pipe_id] {
                             Platform::IrqC::Instance()->Signal(
@@ -2360,6 +2364,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         [this](VAddr dst, u16 gds_index, u16 num_dwords) {
                             rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
                                                    true);
+                        },
+                        [](void* address, u64 data, u32 num_bytes) {
+                            auto* memory = Core::Memory::Instance();
+                            if (!write_backing ||
+                                !memory->TryWriteBacking(address, &data, num_bytes)) {
+                                std::memcpy(address, &data, num_bytes);
+                            }
                         });
                 });
             break;

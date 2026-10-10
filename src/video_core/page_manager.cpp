@@ -510,8 +510,9 @@ struct SignalImpl : public PageManager::Impl {
         if (is_gpu_thread) {
             // DIAG-049: which GPU-thread code touched protected guest memory. A fault on the
             // command thread drains the recorder and may wait for the GPU.
-            static std::atomic<u32> logged{};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+            // Per thread, so the recorder's faults do not hide the command thread's.
+            static thread_local u32 logged = 0;
+            if (logged++ < 48) {
                 LOG_WARNING(Render, "DIAG-049 GPU-thread {} fault at {:#x} from {}; stack:{}",
                             Common::IsWriteError(context) ? "write" : "read", addr,
                             Common::SamplingProfiler::DescribeCode(

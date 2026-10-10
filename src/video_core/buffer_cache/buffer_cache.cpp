@@ -19,6 +19,7 @@
 #include "common/io_file.h"
 #include "common/perf_monitor.h"
 #include "core/emulator_settings.h"
+#include "video_core/buffer_cache/fault_download_ranges.h"
 #include "video_core/buffer_cache/hot_page_prehasher.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -430,6 +431,13 @@ void BufferCache::LogHotPageStats() {
     }
     prehashed_hits = 0;
     prehashed_misses = 0;
+    if (const u64 flushes = async_fault_flushes.exchange(0); flushes != 0) {
+        const u64 wait_us = async_fault_wait_us.exchange(0);
+        LOG_WARNING(Render_Vulkan,
+                    "PERF-052: {} fault downloads waited for off the recorder, {:.1f} ms in total "
+                    "(avg {:.2f} ms)",
+                    flushes, wait_us / 1000.0, wait_us / 1000.0 / flushes);
+    }
     stats.page_only_faults = 0;
     stats.drain_reports = 0;
     stats.split_faults = 0;
@@ -717,8 +725,178 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     };
     if (assume_locks) {
         flush_request();
+        return;
+    }
+    // PERF-052: with the draw pipe, the recorder records the download and goes on; this thread
+    // waits for the GPU, and the write to guest memory runs in GPU order on the scheduler's
+    // completion thread. -DisablePerf 64 waits on the recorder as before.
+    static const bool async_flush = Common::PerfFeatureEnabled(64);
+    if (async_flush && liverpool->Pipelined()) {
+        std::shared_ptr<FaultDownload> fault;
+        liverpool->SendFaultCommand(
+            [&] { fault = BeginFaultFlush(device_addr, size, is_write, exact_write_size); });
+        if (!fault) {
+            return;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        fault->done.acquire();
+        async_fault_wait_us.fetch_add(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count()),
+            std::memory_order_relaxed);
+        async_fault_flushes.fetch_add(1, std::memory_order_relaxed);
+        liverpool->SendFaultCommand([&] { FinishFaultFlush(*fault); });
+        return;
+    }
+    liverpool->SendFaultCommand(std::move(flush_request));
+}
+
+void BufferCache::NoteGpuWrite(VAddr address, u64 size) {
+    // PERF-052: only needed while fault downloads are pending.
+    if (num_fault_downloads.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    gpu_write_log.emplace_back(++gpu_write_seq, address, address + size);
+}
+
+void BufferCache::WaitForFaultWritebacks(u64 tick) {
+    if (num_fault_downloads.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    std::vector<std::shared_ptr<FaultDownload>> older;
+    {
+        std::scoped_lock lk{fault_downloads_mutex};
+        for (const auto& fault : fault_downloads) {
+            if (fault->tick < tick) {
+                older.push_back(fault);
+            }
+        }
+    }
+    for (const auto& fault : older) {
+        while (!fault->applied.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr device_addr,
+                                                                         u64 size, bool is_write,
+                                                                         u64 exact_write_size) {
+    // As ReadMemory's flush_request up to DownloadMemory's GPU wait.
+    const u32 first_block = device_addr >> block_shift;
+    const u32 last_block = (device_addr + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    constexpr u64 WindowSize = 512_KB;
+    const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
+    const VAddr window_start =
+        std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
+    const VAddr window_end =
+        std::min<VAddr>(std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+    ApplyCompletedReadbacks();
+    NoteCpuReadFault(device_addr, size, exact_write_size);
+    if (is_write && (TrySplitGdsWriteFault(device_addr, exact_write_size) ||
+                     TrySplitWriteFault(arena, device_addr, size, window_start, window_end,
+                                        exact_write_size))) {
+        memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        return nullptr;
+    }
+    auto fault = std::make_shared<FaultDownload>();
+    u64 total_size_bytes = 0;
+    const VAddr arena_base = arena->cpu_addr;
+    memory_tracker->ForEachDownloadRange<false>(
+        window_start, window_end - window_start, [&](u64 address, u64 range_size) {
+            gpu_modified_ranges.ForEachInRange(address, range_size, [&](VAddr start, VAddr end) {
+                fault->copies.push_back(vk::BufferCopy{
+                    .srcOffset = start - arena_base,
+                    .dstOffset = total_size_bytes,
+                    .size = end - start,
+                });
+                fault->ranges.emplace_back(start, end);
+                total_size_bytes += Common::AlignUp(end - start, 64);
+            });
+        });
+    if (total_size_bytes == 0) {
+        // Nothing GPU-written: DownloadMemory would return at once.
+        if (is_write) {
+            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        }
+        return nullptr;
+    }
+    fault->device_addr = device_addr;
+    fault->size = size;
+    fault->is_write = is_write;
+    fault->window_start = window_start;
+    fault->window_end = window_end;
+    fault->download =
+        staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached, 0, true);
+    for (auto& copy : fault->copies) {
+        copy.dstOffset += fault->download.offset;
+    }
+    runtime.CopyBuffer(arena, fault->download.buffer, fault->copies);
+    // A readback recorded before this download must not complete over it.
+    InvalidateAsyncReadbacks(window_start, window_end - window_start);
+    fault->seq = gpu_write_seq;
+    fault->tick = scheduler.CurrentTick();
+    {
+        std::scoped_lock lk{fault_downloads_mutex};
+        fault_downloads.push_back(fault);
+        num_fault_downloads.store(static_cast<u32>(fault_downloads.size()),
+                                  std::memory_order_release);
+    }
+    scheduler.DeferPriorityOperation([this, fault, arena_base] {
+        fault->download.buffer->Invalidate(fault->download.offset, fault->download.size);
+        for (const auto& copy : fault->copies) {
+            auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
+            memory->TryWriteBacking(
+                dst_addr, fault->download.mapped + (copy.dstOffset - fault->download.offset),
+                copy.size);
+        }
+        fault->applied.store(true, std::memory_order_release);
+        fault->done.release();
+    });
+    scheduler.Flush();
+    last_drain = std::chrono::steady_clock::now();
+    return fault;
+}
+
+void BufferCache::FinishFaultFlush(FaultDownload& fault) {
+    // The rest of DownloadMemory and of the flush, for the bytes no GPU write has changed since
+    // the download: those stay GPU-written and their guest copy is stale, as for any GPU write.
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 8> newer;
+    for (const auto& [seq, start, end] : gpu_write_log) {
+        if (seq > fault.seq && start < fault.window_end && fault.window_start < end) {
+            newer.emplace_back(start, end);
+        }
+    }
+    const std::span<const std::pair<VAddr, VAddr>> newer_writes{newer.data(), newer.size()};
+    for (const auto& [start, end] : fault.ranges) {
+        for (const auto& [s, e] : PartsWithoutNewerWrites(start, end, newer_writes)) {
+            gpu_modified_ranges.Subtract(s, e - s);
+        }
+    }
+    if (newer.empty()) {
+        memory_tracker->UnmarkRegionAsGpuModified(fault.window_start,
+                                                  fault.window_end - fault.window_start, false);
     } else {
-        liverpool->SendFaultCommand(std::move(flush_request));
+        for (VAddr page = Common::AlignDown(fault.window_start, 4_KB); page < fault.window_end;
+             page += 4_KB) {
+            const VAddr start = std::max(page, fault.window_start);
+            const VAddr end = std::min<VAddr>(page + 4_KB, fault.window_end);
+            if (!TouchedByNewerWrite(page, page + 4_KB, newer_writes)) {
+                memory_tracker->UnmarkRegionAsGpuModified(start, end - start, false);
+            }
+        }
+    }
+    if (fault.is_write) {
+        memory_tracker->MarkRegionAsCpuModified(fault.device_addr, fault.size);
+    }
+    staging_pool.FreeDeferred(fault.download);
+    std::scoped_lock lk{fault_downloads_mutex};
+    std::erase_if(fault_downloads, [&](const auto& f) { return f.get() == &fault; });
+    num_fault_downloads.store(static_cast<u32>(fault_downloads.size()), std::memory_order_release);
+    if (fault_downloads.empty()) {
+        gpu_write_log.clear();
     }
 }
 
@@ -751,7 +929,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         copy.dstOffset += download.offset;
     }
     runtime.CopyBuffer(arena, download.buffer, copies);
+    const u64 download_tick = scheduler.CurrentTick();
     scheduler.Finish();
+    // PERF-052: older fault downloads reach guest memory first, so they cannot land over this.
+    WaitForFaultWritebacks(download_tick);
     last_drain = std::chrono::steady_clock::now();
     // This download is current; a readback recorded earlier must not complete over it after the
     // CPU has written the range.
@@ -795,6 +976,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        NoteGpuWrite(device_addr, size);
         if (size <= 4_KB) {
             if (small_gpu_writers.size() > 65536) {
                 small_gpu_writers.clear();
@@ -1469,6 +1651,7 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
         ApplyCompletedReadbacks();
         memory_tracker->MarkRegionAsGpuModified(export_image.address, export_image.size);
         gpu_modified_ranges.Add(export_image.address, export_image.size);
+        NoteGpuWrite(export_image.address, export_image.size);
         if (large_gpu_writers.size() > 16384) {
             large_gpu_writers.clear();
         }

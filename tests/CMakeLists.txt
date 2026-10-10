@@ -135,6 +135,12 @@ target_link_libraries(shadps4_hot_page_prehasher_test PRIVATE GTest::gtest_main 
                       tsl::robin_map)
 gtest_discover_tests(shadps4_hot_page_prehasher_test)
 
+add_executable(shadps4_fault_download_ranges_test test_fault_download_ranges.cpp)
+target_include_directories(shadps4_fault_download_ranges_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_fault_download_ranges_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_fault_download_ranges_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_fault_download_ranges_test)
+
 add_executable(shadps4_guest_clock_test test_guest_clock.cpp)
 target_include_directories(shadps4_guest_clock_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_guest_clock_test PRIVATE cxx_std_23)
