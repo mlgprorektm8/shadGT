@@ -25,6 +25,8 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/ce_de_counter.h"
 #include "video_core/amdgpu/draw_pipe.h"
+#include <xxhash.h>
+
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/pm4_rewind.h"
@@ -542,10 +544,27 @@ void Liverpool::ReportDrawPipe() {
                                   labels_written_while_waiting);
         labels_written_while_waiting = 0;
     }
+    if (const u64 checked = diag_moved_waits_checked.exchange(0); checked != 0) {
+        read_ahead += fmt::format("; DIAG-054: {} moved waits checked, {} with changed commands",
+                                  checked, diag_moved_waits_changed.exchange(0));
+    }
     if (waits_moved_after_turns != 0) {
         read_ahead += fmt::format("; {} waits moved after the other queues decoded",
                                   waits_moved_after_turns);
         waits_moved_after_turns = 0;
+    }
+    {
+        std::scoped_lock lk{submit_timing_mutex};
+        const auto& t = submit_stats;
+        if (t.count != 0) {
+            read_ahead += fmt::format(
+                "; DIAG-051: {} gfx submits, after the game's submit: decoded {:.2f} ms, recorded "
+                "{:.2f} ms, GPU done {:.2f} ms (max {:.1f}); game submits every {:.2f} ms",
+                t.count, t.decode_us / 1000.0 / t.count, t.record_us / 1000.0 / t.count,
+                t.gpu_count ? t.gpu_us / 1000.0 / t.gpu_count : 0.0, t.max_gpu_us / 1000.0,
+                t.gaps ? t.gap_us / 1000.0 / t.gaps : 0.0);
+        }
+        submit_stats = {};
     }
     if (const u64 flushes = fault_flushes.exchange(0); flushes != 0) {
         const u64 wait_us = fault_flush_wait_us.exchange(0);
@@ -709,9 +728,39 @@ void Liverpool::Process(std::stop_token stoken) {
                     queue.submits.pop();
                 }
                 --num_tasks;
+                // DIAG-051: a graphics submission is decoded; time it through the pipeline.
+                std::optional<std::chrono::steady_clock::time_point> submitted;
+                if (curr_qid == GfxQueueId) {
+                    std::scoped_lock lk{submit_timing_mutex};
+                    if (!gfx_submit_times.empty()) {
+                        submitted = gfx_submit_times.front();
+                        gfx_submit_times.pop_front();
+                    }
+                }
+                const auto decoded = std::chrono::steady_clock::now();
                 // PERF-031: the submission is finished once its recorded work is.
-                Record([this] {
+                Record([this, submitted, decoded] {
                     --num_submits;
+                    if (submitted && rasterizer) {
+                        const auto recorded = std::chrono::steady_clock::now();
+                        const auto us = [&](auto d) {
+                            return static_cast<u64>(
+                                std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+                        };
+                        {
+                            std::scoped_lock lk{submit_timing_mutex};
+                            ++submit_stats.count;
+                            submit_stats.decode_us += us(decoded - *submitted);
+                            submit_stats.record_us += us(recorded - *submitted);
+                        }
+                        rasterizer->WhenGpuDone([this, start = *submitted, us] {
+                            const u64 gpu = us(std::chrono::steady_clock::now() - start);
+                            std::scoped_lock lk{submit_timing_mutex};
+                            submit_stats.gpu_us += gpu;
+                            ++submit_stats.gpu_count;
+                            submit_stats.max_gpu_us = std::max(submit_stats.max_gpu_us, gpu);
+                        });
+                    }
                     std::scoped_lock lock2{submit_mutex};
                     submit_cv.notify_all();
                 });
@@ -860,11 +909,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const auto submitted_dcb = dcb;
     const auto live_dcb = original_dcb.empty() ? submitted_dcb : original_dcb;
     live_cmd_buffers.push_back(live_dcb);
+    // DIAG-052: the last packets decoded, for an invalid-packet report.
+    std::array<std::pair<u32, u32>, 16> recent_packets{};
+    u32 num_recent = 0;
     while (!dcb.empty()) {
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
+        recent_packets[num_recent++ % recent_packets.size()] = {
+            static_cast<u32>(dcb.data() - submitted_dcb.data()), header->raw};
 
         switch (type) {
         default:
@@ -881,6 +935,28 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                              "Invalid PM4 submission base={:#x}, dword offset={}, context starts "
                              "at dword {}: {:#010x}",
                              base_addr, word_offset, start, fmt::join(context, " "));
+                // DIAG-052: the packets before it (dword offset:header), the submission's size,
+                // whether the live buffer still holds the same words, and a wider context.
+                std::string recent;
+                for (u32 i = 0; i < std::min<u32>(num_recent, 16); ++i) {
+                    const auto& [offset, raw] =
+                        recent_packets[(num_recent - 1 - i) % recent_packets.size()];
+                    recent += fmt::format(" {}:{:#010x}", offset, raw);
+                }
+                const size_t wide_start = word_offset > 96 ? word_offset - 96 : 0;
+                const auto wide = submitted_dcb.subspan(
+                    wide_start, std::min<size_t>(112, submitted_dcb.size() - wide_start));
+                const bool same = live_dcb.size() == submitted_dcb.size() &&
+                                  std::equal(live_dcb.begin(), live_dcb.end(), submitted_dcb.begin());
+                LOG_CRITICAL(Render,
+                             "DIAG-052: submission of {} dwords (copied: {}, live buffer still "
+                             "equal: {}); last packets (newest first):{}; dwords from {}: {:#010x}",
+                             submitted_dcb.size(), !original_dcb.empty(), same, recent, wide_start,
+                             fmt::join(wide, " "));
+                // DIAG-052: the emulator's own recent writes near the packets before it.
+                const VAddr bad = reinterpret_cast<VAddr>(dcb.data());
+                LOG_CRITICAL(Render, "DIAG-052: emulator writes within 256 bytes of {:#x}:{}",
+                             bad, Core::Memory::Instance()->DescribeBackingWrites(bad - 128, 256));
             }
             ASSERT_MSG(write.has_value(),
                        "Invalid PM4 type 0 at {:#x}: header={:#x}, remaining dwords={}",
@@ -1697,7 +1773,30 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         // and decoding goes on.
                         ++waits_moved;
                         waits_moved_after_turns += yielded;
-                        Record([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
+                        // DIAG-054: the commands decoded after the wait, as read now; checked
+                        // again once the wait is really satisfied.
+                        const u32* after = dcb.data() + header->type3.NumWords() + 1;
+                        const size_t after_dwords = std::min<size_t>(
+                            512, dcb.size() > header->type3.NumWords() + 1
+                                     ? dcb.size() - header->type3.NumWords() - 1
+                                     : 0);
+                        const u64 after_hash = XXH3_64bits(after, after_dwords * sizeof(u32));
+                        Record([this, wait = *wait_reg_mem, after, after_dwords, after_hash] {
+                            RecorderWaitRegMem(wait);
+                            ++diag_moved_waits_checked;
+                            if (XXH3_64bits(after, after_dwords * sizeof(u32)) != after_hash) {
+                                static std::atomic<u32> logged{};
+                                ++diag_moved_waits_changed;
+                                if (logged.fetch_add(1) < 20) {
+                                    LOG_ERROR(Render,
+                                              "DIAG-054: commands after a moved WAIT_REG_MEM "
+                                              "(label {:#x}) changed between decoding and the "
+                                              "label being written: {:#x}+{} dwords",
+                                              reinterpret_cast<uintptr_t>(wait.Address<u32*>()),
+                                              reinterpret_cast<uintptr_t>(after), after_dwords);
+                                }
+                            }
+                        });
                         break;
                     }
                     if (!wait_reg_mem->Test(regs.reg_array)) {
@@ -2451,6 +2550,19 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 
     // PERF-012: memory written before this submission must be uploaded again.
     VideoCore::BumpUploadEpoch();
+    {
+        // DIAG-051
+        const auto now = std::chrono::steady_clock::now();
+        std::scoped_lock lk{submit_timing_mutex};
+        gfx_submit_times.push_back(now);
+        if (last_gfx_submit != std::chrono::steady_clock::time_point{}) {
+            submit_stats.gap_us += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(now - last_gfx_submit)
+                    .count());
+            ++submit_stats.gaps;
+        }
+        last_gfx_submit = now;
+    }
     auto task = ProcessGraphics(dcb, ccb, original_dcb);
     {
         std::scoped_lock lock{queue.m_access};

@@ -1209,6 +1209,10 @@ static void RecheckTonemapConstants() {
     std::erase_if(g_tonemap_checks, [](const auto& check) { return check.checks_left == 0; });
 }
 
+void Rasterizer::WhenGpuDone(Common::UniqueFunction<void>&& func) {
+    scheduler.DeferPriorityOperation(std::move(func));
+}
+
 void Rasterizer::OnSubmit() {
     RecheckTonemapConstants();
     texture_cache.ReleaseFinishedReadbacks();
@@ -1422,6 +1426,20 @@ void Rasterizer::SubmitChunkIfNeeded() {
     // readbacks or deferred fences are pending. Otherwise each extra submit is pure overhead
     // (about 14% of the GPU thread in GT Sport), so batch normally.
     static constexpr u32 DrawsPerSubmit = 128;
+    // PERF-059 (experiment, SHADGT_CHUNK_DRAWS=N): submit every N draws whatever is pending. GT
+    // Sport waits for each submission's GPU completion before it submits the next (DIAG-051), so
+    // GPU work that starts only after the whole submission is recorded adds to every frame.
+    static const u32 always_chunk = [] {
+        const char* env = std::getenv("SHADGT_CHUNK_DRAWS");
+        return env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
+    }();
+    if (always_chunk != 0) {
+        if (++draws_since_submit >= always_chunk) {
+            draws_since_submit = 0;
+            scheduler.Flush();
+        }
+        return;
+    }
     if (!texture_cache.ReadbackLinearImages()) {
         return;
     }

@@ -212,6 +212,17 @@ public:
         }
         return found;
     }
+    /// DIAG-053: a recent graphics command buffer overlapping a range (racy; diagnostics only).
+    std::optional<ConstDumpRecord> OverlappingRecentCmdBuffer(VAddr address, u64 size) const {
+        std::optional<ConstDumpRecord> found;
+        for (const auto& range : recent_cmd_buffers) {
+            if (range.size != 0 && address < range.address + range.size &&
+                range.address < address + size && (!found || range.sequence > found->sequence)) {
+                found = range;
+            }
+        }
+        return found;
+    }
     u64 CmdBufferSequence() const {
         return cmd_buffer_sequence;
     }
@@ -359,7 +370,28 @@ private:
     u64 commands_recorded{};
     // PERF-048: waits on labels another queue writes, found after letting it decode first.
     u64 waits_moved_after_turns{};
+    std::atomic<u64> diag_moved_waits_checked{}; // DIAG-054
+    std::atomic<u64> diag_moved_waits_changed{};
     Common::Recycler<std::vector<u32>> delta_recycler; // PERF-056
+    // DIAG-051: graphics submissions through the pipeline: game submit, decoded, recorded,
+    // GPU done (microseconds after the submit), and the gap between game submits.
+    struct SubmitTiming {
+        std::chrono::steady_clock::time_point submitted;
+        std::chrono::steady_clock::time_point decoded;
+    };
+    std::deque<std::chrono::steady_clock::time_point> gfx_submit_times;
+    std::chrono::steady_clock::time_point last_gfx_submit{};
+    std::mutex submit_timing_mutex;
+    struct SubmitStats {
+        u64 count{};
+        u64 decode_us{};
+        u64 record_us{};
+        u64 gpu_us{};
+        u64 gpu_count{};
+        u64 gap_us{};
+        u64 gaps{};
+        u64 max_gpu_us{};
+    } submit_stats;
     // DIAG-050: CPU fault flushes and how long the faulting threads waited for them.
     std::atomic<u64> fault_flushes{};
     std::atomic<u64> fault_flush_wait_us{};

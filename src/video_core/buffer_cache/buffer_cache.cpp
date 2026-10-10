@@ -454,6 +454,26 @@ void BufferCache::LogHotPageStats() {
     stats.recorded_bytes = 0;
 }
 
+// DIAG-053: GPU data written back into guest memory over a recent command buffer.
+static void NoteWritebackOverCommands(AmdGpu::Liverpool* liverpool, const char* writer,
+                                      VAddr address, u64 size) {
+    if (!liverpool) {
+        return;
+    }
+    const auto cmd = liverpool->OverlappingRecentCmdBuffer(address, size);
+    if (!cmd) {
+        return;
+    }
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-053: {} wrote GPU data {:#x}+{:#x} over command buffer {:#x}+{:#x} "
+                    "({} buffers ago)",
+                    writer, address, size, cmd->address, cmd->size,
+                    liverpool->CmdBufferSequence() - cmd->sequence);
+    }
+}
+
 void BufferCache::CompleteAsyncReadbacks(
     std::span<const std::shared_ptr<AsyncReadback>> readbacks) {
     std::scoped_lock lk{async_readbacks_mutex};
@@ -470,6 +490,8 @@ void BufferCache::CompleteAsyncReadbacks(
             ++hot_page_stats.cpu_overwrote;
         } else if (readback->valid && memory->IsValidMapping(readback->address, readback->size)) {
             readback->download.Invalidate();
+            NoteWritebackOverCommands(liverpool, "async readback", readback->address,
+                                      readback->size);
             memory->TryWriteBacking(std::bit_cast<void*>(readback->address),
                                     readback->download.mapped, readback->size);
             completed_readback_ranges.emplace_back(readback->address, readback->size);
@@ -966,6 +988,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     download.buffer->Invalidate(download.offset, download.size);
     for (const auto& copy : copies) {
         auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
+        NoteWritebackOverCommands(liverpool, "fault download", arena_base + copy.srcOffset,
+                                  copy.size);
         memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
                                 copy.size);
     }

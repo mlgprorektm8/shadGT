@@ -77,7 +77,14 @@ static void ExitThread() {
     curthread->tid.notify_all();
     curthread->join_wait_cv.notify_all();
 
+#ifdef _WIN64
+    // FIX-048: once TryCollect has made this thread collectable, another thread may reuse its
+    // Pthread (ThreadState::Alloc) and replace native_thr, so it must not be touched here: an
+    // audio thread crashed reading a null native_thr. On Windows exiting needs nothing from it.
+    ::ExitThread(0);
+#else
     curthread->native_thr->Exit();
+#endif
     UNREACHABLE();
     /* Never reach! */
 }

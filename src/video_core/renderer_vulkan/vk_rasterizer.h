@@ -126,6 +126,8 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
+    /// DIAG-051: runs func once the GPU has finished everything recorded so far.
+    void WhenGpuDone(Common::UniqueFunction<void>&& func);
     [[nodiscard]] bool HasPendingAsyncReadbacks() const {
         return buffer_cache.HasPendingAsyncReadbacks();
     }

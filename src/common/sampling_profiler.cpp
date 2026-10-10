@@ -104,7 +104,7 @@ private:
     static void Sample(SampledThread& thread) {
         // Nothing that could take a lock the suspended thread holds (the heap's included)
         // runs until it is resumed: the frames go to a local array first.
-        constexpr u32 MaxFrames = 20;
+        constexpr u32 MaxFrames = 16;
         u64 frames[MaxFrames];
         u32 depth = 0;
         if (SuspendThread(thread.handle) == static_cast<DWORD>(-1)) {
@@ -114,11 +114,14 @@ private:
         context.ContextFlags = CONTEXT_FULL;
         if (GetThreadContext(thread.handle, &context)) {
             frames[depth++] = context.Rip;
+            u64 last_rsp = 0;
             for (u32 frame = 0; frame < MaxFrames - 1 && context.Rip != 0; ++frame) {
                 // Only the thread's own stack is read.
-                if (context.Rsp < thread.stack_low || context.Rsp + 8 > thread.stack_high) {
+                if (context.Rsp < thread.stack_low || context.Rsp + 8 > thread.stack_high ||
+                    context.Rsp <= last_rsp) {
                     break;
                 }
+                last_rsp = context.Rsp;
                 DWORD64 image_base{};
                 const auto* entry = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
                 if (!entry) {
