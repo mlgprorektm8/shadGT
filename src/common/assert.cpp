@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <thread>
+#include "common/logging/log.h"
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/recoverable.h"
@@ -28,6 +31,11 @@ void assert_fail_impl() {
         throw Common::RecoverableFailure("assertion failed (see the log line above)");
     }
     Core::Signals::Instance()->RemoveHandlers();
+    // The log is written by an asynchronous sink: give it a moment, so the failed check reaches
+    // shad_log.txt and not only the console (two October 9 crashes left no trace in the file).
+    Common::Log::Flush();
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    Common::Log::Flush();
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     Crash();
 }
