@@ -290,7 +290,21 @@ const char* RoleName(DiagRole role) {
 }
 } // namespace
 
+// PERF-039: the per-draw history behind DIAG-041/043 (the thumbnail investigation) and the
+// empty-binding notes it carries cost every draw a record, image lookups and a lock. It is kept
+// only with SHADGT_DIAG_HISTORY=1.
+static bool DiagHistoryEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_DIAG_HISTORY");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
 void Rasterizer::RecordDiagHistory(const Pipeline* pipeline, bool compute, u32 count) {
+    if (!DiagHistoryEnabled()) {
+        return;
+    }
     DiagDrawRecord record{};
     record.compute = compute;
     record.count = count;
@@ -1732,10 +1746,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0 || impossible) {
                 // DIAG-041: empty buffer bindings of the draw.
-                diag_empty_bindings +=
-                    fmt::format(" | EMPTY buf {} of {:#x}: base={:#x} stride={} records={:#x}",
-                                buffer_infos.size(), stage.pgm_hash, u64(vsharp.base_address),
-                                vsharp.GetStride(), vsharp.num_records);
+                if (DiagHistoryEnabled()) {
+                    diag_empty_bindings += fmt::format(
+                        " | EMPTY buf {} of {:#x}: base={:#x} stride={} records={:#x}",
+                        buffer_infos.size(), stage.pgm_hash, u64(vsharp.base_address),
+                        vsharp.GetStride(), vsharp.num_records);
+                }
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
@@ -2125,7 +2141,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         auto& [image_id, desc] = image_bindings[i];
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
-            diag_empty_bindings += fmt::format(" | EMPTY img {} of {:#x}", i, stage.pgm_hash);
+            if (DiagHistoryEnabled()) {
+                diag_empty_bindings += fmt::format(" | EMPTY img {} of {:#x}", i, stage.pgm_hash);
+            }
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
