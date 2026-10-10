@@ -1396,3 +1396,53 @@ decoding, so the read-ahead was off with the pipe. Now the two threads split the
   16-bit shifts, and some SCC carry cases. They test the shader recompiler, which this work does
   not change.
 - `-DisablePerf 49` turns PERF-034 off, and `-DisablePerf 50` turns PERF-035 off.
+
+## Lance's 19:25 pipe race, and PERF-036 to PERF-039 (October 10, branch `perf-parallel-gpu`)
+
+Lance: the stalls are "a lot milder than before but still unplayable". In that run, 211 frames
+took 100 ms or more, 60.5 s in total. 3,016 pipelines were built: 2,205 read ahead, 811 on
+demand.
+
+### Causes found
+
+| Cause | Effect | Fix |
+|---|---|---|
+| PERF-034 hashed the draw packets' own registers (index base and size, draw initiator, index count) | 3.5 million states queued and evaluated for 2,204 builds; 29 s of recorder time, tens of thousands per 2 s at scene changes; a full queue dropped needed states | PERF-037 |
+| Driver pipeline cache (3.4 GB) read out on the recorder every 30 s | 7-9 single frames of 1.0-1.3 s | PERF-036 |
+| Pipelines compiled the first time a draw needs them, each session | Bursts at scene changes. Driver builds take a median of 2.4 ms, but about 100 ms each when 14 workers contend | PERF-038, opt-in |
+| Per-draw DIAG-041/043 history | Recorder time on every draw | PERF-039 |
+
+- The pipeline set repeats across sessions. 1,947 of the 2,059 pipelines from the 16:54 run came
+  back at 19:25. The store holds 55,529 graphics keys.
+
+### Fixes
+
+- **PERF-036 (perf id 51).** The driver cache is read and written on its own thread. A save that
+  is still running is not waited for.
+- **PERF-037.** The per-draw registers are left out of the state hash, which is checked against
+  the Regs fields at compile time. A read-ahead stopped by a full queue resumes once a quarter of
+  the queue is free.
+- **PERF-038 (perf id 52), opt-in with `SHADGT_PREWARM=1`.** Lance chose this. Stored pipelines
+  are built in the background, most recently used first. A reader thread does the file I/O.
+  - **Where the work runs.** The GPU thread spends at most 0.3 ms between draws inserting the
+    programs and queuing builds, and only when no pipeline miss has happened in the last 2 s.
+  - **How builds are scheduled.** Background builds use at most a quarter of the workers, at low
+    priority, behind all other builds. They pause for 2 s after any miss or read-ahead build.
+  - **When a draw needs one.**
+    - A pipeline that is already built is used without a miss.
+    - One still queued is built the usual way instead.
+    - The read-ahead does the same for the ones it meets.
+  - **Exact rebuilds only.** Each stage's stored specialization supplies its runtime info.
+    Pipelines are skipped when they cannot be rebuilt exactly:
+    - another key version;
+    - a missing vertex or fragment stage;
+    - tessellation helpers without stored attribute flags;
+    - runtime-indexed mip fallbacks;
+    - no dynamic vertex input.
+- **PERF-039.** The diagnostic history is kept only with `SHADGT_DIAG_HISTORY=1`.
+
+### Checked offline
+
+- Unit tests: 530 non-GCN tests pass, including `shadps4_build_queue_test` (4) and the
+  read-ahead test for the per-draw registers.
+- The 45 GCN instruction tests fail as before.
