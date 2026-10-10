@@ -506,17 +506,22 @@ void PipelineCache::SaveDriverCache(bool wait) {
     if (driver_cache_path.empty() || !pipeline_cache) {
         return;
     }
-    auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
-    if (result != vk::Result::eSuccess || data.empty()) {
+    // PERF-036: GT Sport's driver cache grows to several GB (3.4 GB on October 9). Reading it out
+    // with vkGetPipelineCacheData took about 1.1 s on the GPU thread every 30 s, a frozen frame
+    // each time. The read and the write now run on their own thread; a save still running is
+    // not waited for, the next one comes later. Pipeline caches are internally synchronized, so
+    // builds go on meanwhile. -DisablePerf 51 reads it here as before.
+    static const bool off_thread = Common::PerfFeatureEnabled(51);
+    if (!wait && driver_cache_writing.load()) {
         return;
     }
-    pipelines_at_driver_save = num_new_pipelines;
-    driver_cache_saved_at = std::chrono::steady_clock::now();
     if (driver_cache_writer.joinable()) {
         driver_cache_writer.join();
     }
-    // Write beside the file and rename, so an interrupted write never leaves a broken cache.
-    driver_cache_writer = std::jthread([path = driver_cache_path, data = std::move(data)] {
+    pipelines_at_driver_save = num_new_pipelines;
+    driver_cache_saved_at = std::chrono::steady_clock::now();
+    const auto write = [path = driver_cache_path](std::vector<u8> data) {
+        // Write beside the file and rename, so an interrupted write never leaves a broken cache.
         auto temp = path;
         temp += ".tmp";
         {
@@ -527,7 +532,41 @@ void PipelineCache::SaveDriverCache(bool wait) {
         }
         std::error_code ec;
         std::filesystem::rename(temp, path, ec);
-    });
+    };
+    const vk::Device device = instance.GetDevice();
+    const vk::PipelineCache cache = *pipeline_cache;
+    if (off_thread) {
+        driver_cache_writing = true;
+        driver_cache_writer = std::jthread([this, device, cache, write] {
+            Common::SetCurrentThreadName("shadGT:DriverCacheSave");
+            const auto start = std::chrono::steady_clock::now();
+            auto [result, data] = device.getPipelineCacheData(cache);
+            const auto read_end = std::chrono::steady_clock::now();
+            if (result == vk::Result::eSuccess && !data.empty()) {
+                const size_t size = data.size();
+                write(std::move(data));
+                LOG_WARNING(Render_Vulkan,
+                            "PERF-036: driver pipeline cache saved off the GPU thread: {} MB, "
+                            "read {:.0f} ms, written {:.0f} ms",
+                            size >> 20,
+                            std::chrono::duration<double, std::milli>(read_end - start).count(),
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - read_end)
+                                .count());
+            }
+            driver_cache_writing = false;
+        });
+    } else {
+        auto [result, data] = device.getPipelineCacheData(cache);
+        if (result != vk::Result::eSuccess || data.empty()) {
+            return;
+        }
+        driver_cache_writing = true;
+        driver_cache_writer = std::jthread([this, write, data = std::move(data)]() mutable {
+            write(std::move(data));
+            driver_cache_writing = false;
+        });
+    }
     if (wait) {
         driver_cache_writer.join();
     }

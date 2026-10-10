@@ -190,6 +190,7 @@ private:
     std::filesystem::path driver_cache_path;
     u32 pipelines_at_driver_save{};
     std::chrono::steady_clock::time_point driver_cache_saved_at{};
+    std::atomic<bool> driver_cache_writing{}; // PERF-036
     std::jthread driver_cache_writer;
 
     std::unordered_set<u64> logged_swizzled_blends;
