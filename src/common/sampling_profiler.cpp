@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -30,7 +31,7 @@ namespace {
 bool Enabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("SHADGT_PROFILE");
-        return env && env[0] == '1';
+        return env && (env[0] == '1' || env[0] == '2');
     }();
     return enabled;
 }
@@ -44,6 +45,7 @@ struct SampledThread {
     u32 period{1}; // sampled every this many ticks (1 ms)
     std::unordered_map<u64, u64> self;      // address -> samples it was the current address
     std::unordered_map<u64, u64> inclusive; // function start -> samples it was on the stack
+    std::map<std::vector<u64>, u64> stacks;  // function starts, innermost first -> samples
 };
 
 class Sampler {
@@ -102,7 +104,8 @@ private:
     static void Sample(SampledThread& thread) {
         // Nothing that could take a lock the suspended thread holds (the heap's included)
         // runs until it is resumed: the frames go to a local array first.
-        u64 frames[16];
+        constexpr u32 MaxFrames = 20;
+        u64 frames[MaxFrames];
         u32 depth = 0;
         if (SuspendThread(thread.handle) == static_cast<DWORD>(-1)) {
             return; // exited
@@ -111,7 +114,7 @@ private:
         context.ContextFlags = CONTEXT_FULL;
         if (GetThreadContext(thread.handle, &context)) {
             frames[depth++] = context.Rip;
-            for (u32 frame = 0; frame < 15 && context.Rip != 0; ++frame) {
+            for (u32 frame = 0; frame < MaxFrames - 1 && context.Rip != 0; ++frame) {
                 // Only the thread's own stack is read.
                 if (context.Rsp < thread.stack_low || context.Rsp + 8 > thread.stack_high) {
                     break;
@@ -143,17 +146,25 @@ private:
         }
         ++thread.samples;
         ++thread.self[frames[0]];
-        u64 seen[16];
+        u64 seen[MaxFrames];
         u32 unique = 0;
+        std::vector<u64> stack;
+        stack.reserve(depth);
         for (u32 i = 0; i < depth; ++i) {
             DWORD64 image_base{};
             const auto* entry = RtlLookupFunctionEntry(frames[i], &image_base, nullptr);
             const u64 function = entry ? image_base + entry->BeginAddress : frames[i];
+            stack.push_back(function);
             if (std::find(seen, seen + unique, function) == seen + unique) {
                 seen[unique++] = function;
                 ++thread.inclusive[function];
             }
         }
+        // Call paths: the innermost 12 functions.
+        if (stack.size() > 12) {
+            stack.resize(12);
+        }
+        ++thread.stacks[std::move(stack)];
     }
 
 public:
@@ -196,9 +207,26 @@ private:
                         thread->samples, Top(thread->self, thread->samples, guest ? 12 : 40));
             LOG_WARNING(Debug, "DIAG-048 profile {} ({} samples), inclusive:{}", thread->name,
                         thread->samples, Top(thread->inclusive, thread->samples, guest ? 20 : 60));
+            if (!guest) {
+                std::vector<std::pair<u64, const std::vector<u64>*>> sorted;
+                for (const auto& [stack, count] : thread->stacks) {
+                    sorted.emplace_back(count, &stack);
+                }
+                std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.first > b.first; });
+                for (size_t i = 0; i < std::min<size_t>(sorted.size(), 60); ++i) {
+                    std::string path;
+                    for (const u64 function : *sorted[i].second) {
+                        path += ' ' + Describe(function);
+                    }
+                    LOG_WARNING(Debug, "DIAG-048 stack {} ({} samples) {:.1f}%:{}", thread->name,
+                                thread->samples,
+                                100.0 * sorted[i].first / std::max<u64>(thread->samples, 1), path);
+                }
+            }
             thread->samples = 0;
             thread->self.clear();
             thread->inclusive.clear();
+            thread->stacks.clear();
         }
     }
 
@@ -219,7 +247,12 @@ void RegisterCurrentThread(const char* name) {
 }
 
 void RegisterGuestThread(const char* name, const void* stack_low, const void* stack_high) {
-    if (Enabled()) {
+    // Game threads only with SHADGT_PROFILE=2: sampling them costs time.
+    static const bool guests = [] {
+        const char* env = std::getenv("SHADGT_PROFILE");
+        return env && env[0] == '2';
+    }();
+    if (Enabled() && guests) {
         // Game threads run on their own stacks, and there are many: sampled every 4 ms.
         ULONG_PTR low = reinterpret_cast<ULONG_PTR>(stack_low);
         ULONG_PTR high = reinterpret_cast<ULONG_PTR>(stack_high);

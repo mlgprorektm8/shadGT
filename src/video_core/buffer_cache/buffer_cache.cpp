@@ -220,9 +220,13 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
 
-    // PERF-049: not in precise readback mode, where GPU-written pages are read-protected and
-    // the prehasher could fault on one. -DisablePerf 61 hashes on the recorder only.
-    if (Common::PerfFeatureEnabled(61) &&
+    // PERF-049 (opt-in, SHADGT_PREHASH=1): not in precise readback mode, where GPU-written pages
+    // are read-protected and the prehasher could fault on one. Off by default: in the Nurburgring
+    // benchmark only about 11% of its hashes were used (epochs change faster than the recorder
+    // reaches them), and the recorder waited on its lock while it built each batch (18% of the
+    // recorder's samples in RefreshReadPages).
+    const char* prehash_env = std::getenv("SHADGT_PREHASH");
+    if (prehash_env && prehash_env[0] == '1' && Common::PerfFeatureEnabled(61) &&
         EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Precise) {
         prehasher = std::make_unique<HotPagePrehasher>(
             1, BYTES_PER_PAGE, g_upload_epoch,
@@ -727,10 +731,15 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         flush_request();
         return;
     }
-    // PERF-052: with the draw pipe, the recorder records the download and goes on; this thread
-    // waits for the GPU, and the write to guest memory runs in GPU order on the scheduler's
-    // completion thread. -DisablePerf 64 waits on the recorder as before.
-    static const bool async_flush = Common::PerfFeatureEnabled(64);
+    // PERF-052 (opt-in, SHADGT_ASYNC_FAULTS=1): with the draw pipe, the recorder records the
+    // download and goes on; this thread waits for the GPU, and the write to guest memory runs in
+    // GPU order on the scheduler's completion thread. Off by default: the later write-back can
+    // land over bytes the CPU wrote meanwhile on unprotected (hot) pages. In the Nurburgring
+    // benchmark it corrupted a command buffer ("Invalid PM4 type 0") on the way to the race.
+    static const bool async_flush = [] {
+        const char* env = std::getenv("SHADGT_ASYNC_FAULTS");
+        return env && env[0] == '1' && Common::PerfFeatureEnabled(64);
+    }();
     if (async_flush && liverpool->Pipelined()) {
         std::shared_ptr<FaultDownload> fault;
         liverpool->SendFaultCommand(
