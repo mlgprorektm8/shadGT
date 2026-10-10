@@ -11,6 +11,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/sampling_profiler.h"
 #include "common/debug.h"
 #include "common/guest_clock.h"
 #include "common/perf_monitor.h"
@@ -284,6 +285,7 @@ void Liverpool::StartDrawPipe() {
     }
     draw_pipe = std::make_unique<DrawPipe>([this] {
         Common::SetCurrentThreadName("shadGT:GpuRecorder");
+        Common::SamplingProfiler::RegisterCurrentThread("GpuRecorder"); // DIAG-048
         // FIX-044: shader and pipeline compiles on this thread hold the guest clocks too.
         Common::GuestClock::MarkGpuCommandThread();
         recorder_state = recorder.get();
@@ -608,6 +610,7 @@ void Liverpool::ProcessCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadGT:GpuCommandProcessor");
     Common::GuestClock::MarkGpuCommandThread(); // FIX-044
+    Common::SamplingProfiler::RegisterCurrentThread("GpuCommandProcessor"); // DIAG-048
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();

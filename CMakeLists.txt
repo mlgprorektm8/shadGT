@@ -801,6 +801,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/string_literal.h
            src/common/string_util.cpp
            src/common/string_util.h
+           src/common/sampling_profiler.cpp
+           src/common/sampling_profiler.h
            src/common/perf_monitor.cpp
            src/common/perf_monitor.h
            src/common/thread.cpp
