@@ -122,6 +122,12 @@ target_compile_features(shadps4_build_queue_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_build_queue_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_build_queue_test)
 
+add_executable(shadps4_parallel_hasher_test test_parallel_hasher.cpp)
+target_include_directories(shadps4_parallel_hasher_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_parallel_hasher_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_parallel_hasher_test PRIVATE GTest::gtest_main xxHash::xxhash)
+gtest_discover_tests(shadps4_parallel_hasher_test)
+
 add_executable(shadps4_guest_clock_test test_guest_clock.cpp)
 target_include_directories(shadps4_guest_clock_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_guest_clock_test PRIVATE cxx_std_23)

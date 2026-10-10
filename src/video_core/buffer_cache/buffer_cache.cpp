@@ -24,6 +24,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/parallel_hasher.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -919,6 +920,30 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
 }
 
+// PERF-046: hashes count pages (page_at(i) gives each address) into hashes, on several
+// threads from 128 pages (512 KB) on; -DisablePerf 58 hashes them on this thread.
+template <typename PageAt>
+static void HashPages(size_t count, PageAt&& page_at, std::span<u64> hashes) {
+    static constexpr size_t ParallelFrom = 128;
+    static const bool parallel = Common::PerfFeatureEnabled(58);
+    static std::mutex hasher_mutex;
+    std::unique_lock hasher_lock{hasher_mutex, std::defer_lock};
+    if (parallel && count >= ParallelFrom && hasher_lock.try_lock()) {
+        static VideoCore::ParallelPageHasher hasher{
+            std::clamp(std::max(std::thread::hardware_concurrency(), 4u) / 4, 1u, 3u)};
+        static std::vector<const u8*> pointers;
+        pointers.resize(count);
+        for (size_t i = 0; i < count; ++i) {
+            pointers[i] = std::bit_cast<const u8*>(page_at(i));
+        }
+        hasher.Hash(pointers, BYTES_PER_PAGE, hashes.first(count));
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        hashes[i] = XXH3_64bits(std::bit_cast<const void*>(page_at(i)), BYTES_PER_PAGE);
+    }
+}
+
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
@@ -998,16 +1023,27 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             return gds.first < page + BYTES_PER_PAGE && page < gds.second;
         });
     };
+    // PERF-046: the hot pages of all ranges are hashed first, on several threads when many.
+    boost::container::small_vector<std::pair<VAddr, u16>, 64> hot;
+    boost::container::small_vector<size_t, 8> range_end; // one past each range's hot pages
     for (const auto& [addr, range_size] : ranges) {
-        boost::container::small_vector<std::pair<VAddr, u16>, 16> hot;
         memory_tracker->ForEachHotPage(addr, range_size, [&](VAddr page, u16 generation) {
             if (page >= addr && page + BYTES_PER_PAGE <= addr + range_size) {
                 hot.emplace_back(page, generation);
             }
         });
+        range_end.push_back(hot.size());
+    }
+    boost::container::small_vector<u64, 64> hot_hashes(hot.size());
+    HashPages(hot.size(), [&](size_t i) { return hot[i].first; },
+              std::span<u64>{hot_hashes.data(), hot_hashes.size()});
+    size_t hot_index = 0;
+    for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
+        const auto [addr, range_size] = ranges[range_index];
         VAddr cursor = addr;
-        for (const auto& [page, generation] : hot) {
-            const u64 hash = XXH3_64bits(std::bit_cast<const void*>(page), BYTES_PER_PAGE);
+        for (; hot_index < range_end[range_index]; ++hot_index) {
+            const auto [page, generation] = hot[hot_index];
+            const u64 hash = hot_hashes[hot_index];
             bool unchanged;
             {
                 std::scoped_lock lk{uploaded_pages_mutex};
@@ -1073,10 +1109,13 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     }
     if (!hot_uploads.empty()) {
         // A page the CPU wrote while it was copied gets no record and is uploaded next time.
+        boost::container::small_vector<u64, 16> after(hot_uploads.size());
+        HashPages(hot_uploads.size(), [&](size_t i) { return hot_uploads[i].page; },
+                  std::span<u64>{after.data(), after.size()});
         std::scoped_lock lk{uploaded_pages_mutex};
-        for (const auto& upload : hot_uploads) {
-            const u64 after = XXH3_64bits(std::bit_cast<const void*>(upload.page), BYTES_PER_PAGE);
-            uploaded_page_contents.Record(upload.page, upload.generation, upload.hash, after);
+        for (size_t i = 0; i < hot_uploads.size(); ++i) {
+            const auto& upload = hot_uploads[i];
+            uploaded_page_contents.Record(upload.page, upload.generation, upload.hash, after[i]);
         }
         hot_pages_uploaded += hot_uploads.size();
     }
