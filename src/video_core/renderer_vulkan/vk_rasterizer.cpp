@@ -395,7 +395,9 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
     const Pipeline* pipeline = selected.is_compute
                                    ? static_cast<const Pipeline*>(selected.compute)
                                    : static_cast<const Pipeline*>(selected.pipeline);
+    capture_failure = nullptr;
     if (!pipeline) {
+        capture_failure = "no pipeline";
         return false;
     }
     auto& scan = capture_scan;
@@ -410,14 +412,15 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
         if (address == 0 || size == 0) {
             return;
         }
-        if (size > 64_MB || !IsMappedStart(address)) {
-            // Not read by the recorder either (bound null), or too large to cover.
-            if (size > 64_MB) {
-                complete = false;
-            }
-            return;
+        if (!IsMappedStart(address)) {
+            return; // Not read by the recorder either (bound null).
         }
         size = memory->ClampRangeSize(address, size);
+        if (size > 64_MB) {
+            complete = false;
+            capture_failure = "range over 64 MB";
+            return;
+        }
         const u64 key = (address * 0x9E3779B97F4A7C15ull) ^ size;
         if (!scan.ranges.insert(key).second) {
             return;
@@ -431,6 +434,7 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
                 // during play) are not listed, to keep the list small.
                 if (size <= 8_MB && !capture.AddWatched(page)) {
                     complete = false;
+                    capture_failure = "capture full";
                     return;
                 }
                 continue;
@@ -441,6 +445,7 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
             memory->CopySparseMemory(page, page_bytes.data(), page_bytes.size());
             if (!capture.Add(page, page_bytes.data())) {
                 complete = false;
+                capture_failure = "capture full";
                 return;
             }
         }
@@ -457,6 +462,7 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
             continue;
         }
         if (info->hw_stage == Shader::HwStage::Hull) {
+            capture_failure = "tessellation";
             return false; // Tessellation constants are read through a pointer; not covered.
         }
         const FlatView view{sel.flattened, sel.pgm_base};
@@ -465,16 +471,16 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
                 continue;
             }
             if (!desc.sharp_fetch.FitsIn(sel.flattened.size())) {
+                capture_failure = "sharp outside the flattened data";
                 return false;
             }
             const auto vsharp = desc.GetSharp(view);
-            if (vsharp.num_records == UINT32_MAX) {
-                return false;
-            }
+            // An open-ended V# (max records) is bound clamped to the mapped memory.
             capture_range(vsharp.base_address, vsharp.GetSize());
         }
         for (const auto& desc : info->images) {
             if (!desc.sharp_fetch.FitsIn(sel.flattened.size())) {
+                capture_failure = "sharp outside the flattened data";
                 return false;
             }
             const auto tsharp = desc.GetSharp(view);
@@ -501,11 +507,13 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
         const auto& fetch = selected.pipeline->GetFetchShader();
         const auto& vs = selected.stages[u32(Shader::SwStage::Vertex)];
         if (!fetch.attributes.empty() && !vs.present) {
+            capture_failure = "vertex stage missing";
             return false;
         }
         for (const auto& attrib : fetch.attributes) {
             if (attrib.sgpr_base == Shader::IR::NumScalarRegs ||
                 attrib.sgpr_base + 1u >= vs.num_user_data) {
+                capture_failure = "vertex table outside user data";
                 return false;
             }
             VAddr table;
@@ -514,6 +522,9 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
             const VAddr entry = table + attrib.dword_offset * sizeof(u32);
             capture_range(entry, sizeof(AmdGpu::Buffer));
             if (!complete || !IsMappedStart(entry)) {
+                if (complete) {
+                    capture_failure = "vertex table unmapped";
+                }
                 return false;
             }
             AmdGpu::Buffer vsharp;

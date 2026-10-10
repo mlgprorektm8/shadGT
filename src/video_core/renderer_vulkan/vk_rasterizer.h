@@ -94,6 +94,10 @@ public:
     /// covered by the capture.
     bool CaptureDrawReads(const SelectedPipeline& selected, Common::ReadCapture& capture,
                           VAddr index_address, u64 index_size);
+    /// PERF-063: why the last CaptureDrawReads returned false.
+    const char* CaptureFailure() const {
+        return capture_failure ? capture_failure : "draw not captured";
+    }
     /// PERF-063 (command thread): the same for one guest range (a DMA source).
     bool CaptureGuestRange(Common::ReadCapture& capture, VAddr address, u64 size);
     /// PERF-069 (any thread): whether a CPU write to the page goes unnoticed.
@@ -352,6 +356,7 @@ private:
     u64 select_verify_count{};
     Common::Recycler<SelectedPipeline, 4096> selected_recycler;
     const Common::ReadCapture* read_capture{}; // PERF-063
+    const char* capture_failure{};
     // PERF-067
     BufferPlan* buffer_plan{};
     std::array<std::atomic<u64>, 3> plan_refusals{};

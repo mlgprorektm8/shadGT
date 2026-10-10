@@ -598,6 +598,9 @@ void Liverpool::ReportEarlyFences() {
     early_report = now;
 }
 
+// FIX-014 (below): draws the rasterizer filters out.
+static bool FilteredDraw(const Regs& state);
+
 void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw) {
     if (!draw_pipe) {
         draw();
@@ -648,12 +651,14 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                                              index_size)) {
                 capture = window_capture;
             } else {
-                UnsafeWindow("draw not captured");
+                UnsafeWindow(rasterizer->CaptureFailure());
             }
+        } else if (direct_draw && !compute && FilteredDraw(regs)) {
+            // Clears, resolves, depth copies: GPU images only, no guest memory read.
         } else {
             UnsafeWindow(!direct_draw ? (compute ? "indirect dispatch" : "indirect draw")
                          : compute ? "dispatch not selected ahead"
-                                   : "draw not selected ahead (quad list)");
+                                   : "draw not selected ahead");
         }
     }
     // PERF-067: with the buffer stage, the selection and the buffers obtained for it are shared
@@ -1038,7 +1043,13 @@ void Liverpool::ProcessCommands() {
         }
         if (record) {
             ++commands_recorded;
-            Record(std::move(callback), "queued command (flip, fault)");
+            // PERF-063: flips and fault flushes read no guest memory for the window's work (a
+            // barrier for the buffer stage all the same).
+            if (draw_pipe) {
+                draw_pipe->Push(std::move(callback));
+            } else {
+                callback();
+            }
         } else {
             callback();
         }
