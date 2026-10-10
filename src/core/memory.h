@@ -214,6 +214,19 @@ public:
     }
 
     /// FIX-027: whether the address is inside a mapped area (not free or only reserved).
+    /// PERF-058: the end of the mapped area containing virtual_addr, or 0 when it is not mapped
+    /// (as IsMappedAddress decides). Lock-free like IsMappedAddress.
+    VAddr MappedAreaEnd(VAddr virtual_addr) {
+        if (vma_map.empty() || virtual_addr < vma_map.begin()->first) {
+            return 0;
+        }
+        const auto& vma = FindVMA(virtual_addr)->second;
+        if (!vma.Contains(virtual_addr, 1) || !vma.IsMapped()) {
+            return 0;
+        }
+        return vma.base + vma.size;
+    }
+
     bool IsMappedAddress(VAddr virtual_addr) {
         if (vma_map.empty() || virtual_addr < vma_map.begin()->first) {
             return false;

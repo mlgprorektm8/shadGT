@@ -283,6 +283,13 @@ private:
     // PERF-033: hot pages whose bytes match their last upload are not uploaded again.
     UploadedPageContents uploaded_page_contents;
     std::mutex uploaded_pages_mutex;
+    // PERF-057: ranges SynchronizeMemoryFromImage found free of images.
+    struct NoImageRange {
+        VAddr address{};
+        u32 size{};
+        u64 generation{};
+    };
+    std::array<NoImageRange, 4096> no_image_memo{};
     std::atomic<u64> hot_pages_unchanged{};
     std::atomic<u64> hot_pages_uploaded{};
     // PERF-049: hot-page hashes taken ahead on a background thread.

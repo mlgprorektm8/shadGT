@@ -1526,3 +1526,33 @@ All of these are on `perf-parallel-gpu`; the number in brackets is the `-Disable
 - **PERF-054 [65]: command-thread faults as urgent work.** A command-thread fault is flushed as urgent work instead of draining the recorder, unless the command thread already owns the caches.
 
 Literal multi-threaded recording is not part of this. Each draw's cache work changes the state the next draw depends on, so recording draws on several threads would need concurrent buffer and texture caches.
+
+## All runs compared, and PERF-055 to PERF-058 (October 10, branch `perf-parallel-gpu`)
+
+`allruns.py`, `phases.py` and `eras.py` (scratchpad) went through all 187 run logs since October 7. Race windows are those with more than 1,000 draws per frame. The table gives medians over runs with at least 20 race windows.
+
+| Era | Race FPS | Draws/frame | Frame µs/draw | Recorder µs/draw | Buffers µs/draw | µs/dispatch |
+|---|---|---|---|---|---|---|
+| Oct 7, main | 29-33 | 1,800-2,030 | 16.6-16.8 | 8.9-10.7 | 3.0-3.4 | 13.6-14.2 |
+| Oct 8, main | 28 | 1,906 | 18.1 | 10.8 | 3.6 | 16.2 |
+| Oct 9, pipe PERF-031..038 | 29 | 1,700 | 20.1 | 11.3 | 4.8 | 17.4 |
+| Oct 9-10, pipe PERF-039..048 | 24 | 1,862 | 21.4 | 10.4 | 4.8 | 24.5 |
+
+- **The pipe builds did not speed up races.** Per draw, the frame cost rose about 20%.
+- **Buffer cost per draw rose by half.** It went from 3.0 to 4.8 µs, even though uploads fell from 36 to about 5 MB per frame. The rise comes from hashing and the readback/fault machinery.
+- **Dispatches got slower.** They went from 14 to 24 µs once PERF-047 made every dispatch take the lookup lock that the command thread holds while selecting.
+
+### What changed
+
+- **PERF-055 [66]: compute pipelines selected ahead.** Direct dispatches get their compute pipeline selected on the command thread and installed through checked stage copies. Indirect dispatches install fresh copies on the recorder.
+- **PERF-056: cross-thread blocks recycled.** UniqueFunction callables, register deltas and pipeline selections go back to per-size free lists or recyclers instead of the Windows heap.
+- **PERF-057 [67]: no-image memo.** SynchronizeMemoryFromImage remembers ranges it found free of images, until the texture cache registers or unregisters an image.
+- **PERF-058: fewer map lookups.** RefreshReadPages looks up each mapped area once instead of each page twice.
+
+### Estimate
+
+Lance's profile against these changes:
+
+- **Recorder work.** It falls from about 31 ms to about 16-17 ms per race frame: fault waits about -6 ms, hashing about -2.5 ms, heap about -1.5 ms, image scans about -1.8 ms, others about -2 ms.
+- **Recorder-bound rate.** If the fault chain no longer leaves the recorder idle, that is about 55-60 FPS.
+- **GPU bound.** The GPU's busy figure at 25 FPS (31-47%) puts its own limit somewhere between 52 and 80 FPS.

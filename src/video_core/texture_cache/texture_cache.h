@@ -242,6 +242,12 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// PERF-057: changes whenever an image is registered or unregistered, i.e. whenever
+    /// ForEachImageInRegion could find a different set of images.
+    u64 RegistryGeneration() const {
+        return registry_generation;
+    }
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -344,6 +350,7 @@ private:
     BufferCache& buffer_cache;
     PageManager& tracker;
     PageTable page_table;
+    u64 registry_generation{1}; // PERF-057
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     Common::SlotVector<Sampler> slot_samplers;

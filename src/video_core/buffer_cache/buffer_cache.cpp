@@ -1563,12 +1563,20 @@ void BufferCache::RefreshReadPages(VAddr address, u64 size, u64 shader_hash, boo
     // PERF-049: hashes taken ahead in the current epoch are used here too.
     const u32 epoch = g_upload_epoch.load(std::memory_order_acquire);
     const auto prehashed = prehasher ? prehasher->Current() : nullptr;
+    VAddr mapped_from = 0;
+    VAddr mapped_until = 0;
     for (VAddr page = Common::AlignDown(address, WatchedPageSize); page < address + size;
          page += WatchedPageSize) {
         // FIX-038: ClampRangeSize does not look up mappings below 1 GB, and IsValidMapping
         // accepts free areas, so an unmapped page (a buffer of the dealership shader's garbage
         // V#s) was hashed and faulted.
-        if (!memory->IsValidMapping(page, WatchedPageSize) || !memory->IsMappedAddress(page) ||
+        // PERF-058: one map lookup per mapped area rather than two per page. A page counts as
+        // mapped when the area containing its start, a mapped one, extends over all of it.
+        if (page < mapped_from || page + WatchedPageSize > mapped_until) {
+            mapped_from = page;
+            mapped_until = memory->MappedAreaEnd(page);
+        }
+        if (page + WatchedPageSize > mapped_until ||
             memory_tracker->IsRegionGpuModified(page, WatchedPageSize)) {
             continue;
         }
@@ -1640,6 +1648,15 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     if (size == 0) {
         return false;
     }
+    // PERF-057: a range found free of images stays so until an image is registered or
+    // unregistered. -DisablePerf 67 walks the texture cache every time.
+    static const bool memo = Common::PerfFeatureEnabled(67);
+    const u64 generation = texture_cache.RegistryGeneration();
+    auto& slot =
+        no_image_memo[((device_addr >> 6) ^ (device_addr >> 21) ^ size) % no_image_memo.size()];
+    if (memo && slot.address == device_addr && slot.size == size && slot.generation == generation) {
+        return false;
+    }
     std::vector<ImageId> image_ids;
     const auto collect = [&](ImageId id, Image&) {
         if (std::ranges::find(image_ids, id) == image_ids.end()) {
@@ -1649,6 +1666,7 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     texture_cache.ForEachImageInRegion(device_addr, size, collect);
     const size_t requested_images = image_ids.size();
     if (requested_images == 0) {
+        slot = {device_addr, size, generation};
         return false;
     }
     // Full exports must also consider aliases outside the requested buffer slice.
