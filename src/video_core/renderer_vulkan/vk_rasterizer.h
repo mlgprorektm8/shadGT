@@ -71,6 +71,11 @@ public:
         bool is_compute{};
         const ComputePipeline* compute{};
         std::array<SelectedStage, Shader::MaxStageTypes> stages{};
+        /// PERF-068: a quad list's pipeline when the recorder tessellates its quads (the
+        /// triangle one is `pipeline`); the recorder decides which it draws with.
+        bool is_quad_list{};
+        const GraphicsPipeline* quad_tess_pipeline{};
+        std::array<SelectedStage, Shader::MaxStageTypes> quad_tess_stages{};
     };
     /// PERF-047: whether pipelines are selected on the command thread (draw pipe on and
     /// -DisablePerf 59 not given).
@@ -89,6 +94,8 @@ public:
     /// covered by the capture.
     bool CaptureDrawReads(const SelectedPipeline& selected, Common::ReadCapture& capture,
                           VAddr index_address, u64 index_size);
+    /// PERF-063 (command thread): the same for one guest range (a DMA source).
+    bool CaptureGuestRange(Common::ReadCapture& capture, VAddr address, u64 size);
     /// PERF-063 (any thread): fences waiting for the GPU to finish (deferred) right now.
     bool DeferredFencesPending() const noexcept {
         return deferred_fences.load(std::memory_order_acquire) != 0;

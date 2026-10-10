@@ -171,16 +171,21 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
     const auto& regs = liverpool->DrawRegs();
     bool depth_copy;
     bool stencil_copy;
+    const bool quad_list = regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
+    // PERF-068: a quad list's pipeline depends on whether its indices are GPU-written, which
+    // only the recorder's buffer cache knows: both are selected, the recorder takes its one.
+    // -DisablePerf 75 leaves quad lists to the recorder.
+    static const bool select_quads = Common::PerfFeatureEnabled(75);
     if (ClassifyDraw(regs, depth_copy, stencil_copy) != DrawFilter::Draw ||
-        regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
-        // A quad list's pipeline depends on whether its indices are GPU-written, which only
-        // the recorder's buffer cache knows.
+        (quad_list && !select_quads)) {
         return std::nullopt;
     }
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
     SelectedPipeline selected = selected_recycler.Take(); // PERF-056
     selected.is_compute = false;
     selected.compute = nullptr;
+    selected.is_quad_list = quad_list;
+    selected.quad_tess_pipeline = nullptr;
     std::scoped_lock lk{pipeline_cache.LookupMutex()};
     selected.pipeline = pipeline_cache.GetGraphicsPipeline({
         .vertex_sgpr_offset = 0,
@@ -189,6 +194,16 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
     });
     if (selected.pipeline) {
         CopySelectedStages(selected.stages);
+    }
+    if (quad_list) {
+        selected.quad_tess_pipeline = pipeline_cache.GetGraphicsPipeline({
+            .vertex_sgpr_offset = 0,
+            .instance_sgpr_offset = 0,
+            .tessellate_quads = true,
+        });
+        if (selected.quad_tess_pipeline) {
+            CopySelectedStages(selected.quad_tess_stages);
+        }
     }
     return selected;
 }
@@ -344,6 +359,34 @@ void Rasterizer::HashDrawPagesAhead(const SelectedPipeline& selected, u32 epoch)
     if (!ranges.empty()) {
         buffer_cache.HashPagesAhead(std::span{ranges.data(), ranges.size()}, epoch);
     }
+}
+
+bool Rasterizer::CaptureGuestRange(Common::ReadCapture& capture, VAddr address, u64 size) {
+    if (address == 0 || size == 0) {
+        return true;
+    }
+    if (size > 64_MB || !IsMappedStart(address)) {
+        return size <= 64_MB; // An unmapped source reads nothing from guest memory.
+    }
+    size = memory->ClampRangeSize(address, size);
+    thread_local std::array<u8, Common::ReadCapture::PageSize> bytes;
+    for (VAddr page = Common::AlignDown(address, Common::ReadCapture::PageSize);
+         page < address + size; page += Common::ReadCapture::PageSize) {
+        if (!page_manager.IsUnwatched(page)) {
+            if (!capture.AddWatched(page)) {
+                return false;
+            }
+            continue;
+        }
+        if (capture.Has(page)) {
+            continue;
+        }
+        memory->CopySparseMemory(page, bytes.data(), bytes.size());
+        if (!capture.Add(page, bytes.data())) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
@@ -671,13 +714,19 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
         stats = {};
         stats.since = now;
     }
-    if (selected_allowed && selected_pipeline) {
-        const auto* pipeline = selected_pipeline->pipeline;
+    // PERF-068: a quad list's selection holds both of its pipelines.
+    const bool quad_selection = selected_pipeline && selected_pipeline->is_quad_list;
+    if ((selected_allowed || quad_selection) && selected_pipeline) {
+        const bool tess = quad_selection && params.tessellate_quads;
+        const auto* pipeline =
+            tess ? selected_pipeline->quad_tess_pipeline : selected_pipeline->pipeline;
         if (!pipeline) {
             ++stats.ahead;
             return nullptr;
         }
-        if (InstallDrawStages(pipeline, selected_pipeline->stages, true)) {
+        if (InstallDrawStages(pipeline,
+                              tess ? selected_pipeline->quad_tess_stages : selected_pipeline->stages,
+                              true)) {
             ++stats.ahead;
             // Every 64th selection is checked against one made here, from the recorder's
             // registers and memory; a difference is reported and this one used.

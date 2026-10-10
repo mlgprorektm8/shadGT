@@ -472,9 +472,10 @@ private:
     void VerifyRecorderRegs(const Regs& expected);
     /// Runs work on the recorder thread behind everything queued before it (inline without one).
     void Record(Common::UniqueFunction<void>&& work, const char* reason = "command");
-    void RecordDma(Common::UniqueFunction<void>&& work) {
-        Record(std::move(work), "dma");
-    }
+    /// PERF-063: a CP DMA; `src`/`src_bytes` the guest memory it reads (0: none),
+    /// `writes_memory` whether it writes guest memory (GPU data the CPU may read).
+    void RecordDma(Common::UniqueFunction<void>&& work, VAddr src = 0, u64 src_bytes = 0,
+                   bool writes_memory = false);
     /// PERF-063: queues work that reads no guest memory and writes none the CPU reads
     /// (submission bookkeeping, markers, fence-ordered waits); it keeps the window safe.
     void RecordSafe(Common::UniqueFunction<void>&& work);

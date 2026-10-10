@@ -374,6 +374,33 @@ void Liverpool::Record(Common::UniqueFunction<void>&& work, const char* reason) 
     }
 }
 
+void Liverpool::RecordDma(Common::UniqueFunction<void>&& work, VAddr src, u64 src_bytes,
+                          bool writes_memory) {
+    if (!early_fences_mode || !draw_pipe || !rasterizer) {
+        Record(std::move(work), "dma");
+        return;
+    }
+    // PERF-063: the bytes it reads are captured now like a draw's; a write to guest memory
+    // the CPU may read before it is recorded keeps the window uncovered in mode 1.
+    if (writes_memory && early_fences_mode == 1) {
+        Record(std::move(work), "dma writing memory");
+        return;
+    }
+    if (!window_capture) {
+        window_capture = TakeCapture();
+    }
+    if (src_bytes != 0 && !rasterizer->CaptureGuestRange(*window_capture, src, src_bytes)) {
+        Record(std::move(work), "dma not captured");
+        return;
+    }
+    // Covered by the window's capture, but a barrier for the buffer stage (it changes buffers).
+    draw_pipe->Push([this, work = std::move(work), capture = window_capture]() mutable {
+        rasterizer->SetReadCapture(capture.get());
+        work();
+        rasterizer->SetReadCapture(nullptr);
+    });
+}
+
 void Liverpool::RecordSafe(Common::UniqueFunction<void>&& work) {
     if (draw_pipe) {
         draw_pipe->Push(std::move(work), DrawPipe::JobKind::Neutral);
@@ -1955,6 +1982,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto dma = *dma_packet;
                 const bool to_memory =
                     dma.dst_sel == DmaDataDst::Memory || dma.dst_sel == DmaDataDst::MemoryUsingL2;
+                const bool src_memory = dma.src_sel == DmaDataSrc::Memory ||
+                                        dma.src_sel == DmaDataSrc::MemoryUsingL2;
                 RecordDma([this, dma] {
                     const auto* dma_data = &dma;
                     if (dma_data->src_sel == DmaDataSrc::Data &&
@@ -1987,7 +2016,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}",
                                         u32(dma_data->src_sel), u32(dma_data->dst_sel));
                     }
-                });
+                }, src_memory ? dma.SrcAddress<VAddr>() : 0, src_memory ? dma.NumBytes() : 0,
+                          to_memory);
                 if (to_memory && WritesLiveCommands(dma.DstAddress<VAddr>(), dma.NumBytes())) {
                     SyncRecorder("dma into commands");
                 }
@@ -2567,20 +2597,21 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 RecordDma([this, dst = dma_data->dst_addr_lo, src = dma_data->SrcAddress<VAddr>(),
                         bytes = dma_data->NumBytes()] {
                     rasterizer->CopyBuffer(dst, src, bytes, true, false);
-                });
+                }, dma_data->SrcAddress<VAddr>(), dma_data->NumBytes());
             } else if (dma_data->src_sel == DmaDataSrc::Data &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
                 RecordDma(
                     [this, dst = dma_data->DstAddress<VAddr>(), bytes = dma_data->NumBytes(),
-                     value = dma_data->data] { rasterizer->FillBuffer(dst, bytes, value, false); });
+                     value = dma_data->data] { rasterizer->FillBuffer(dst, bytes, value, false); },
+                    0, 0, true);
             } else if (dma_data->src_sel == DmaDataSrc::Gds &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
                 RecordDma([this, dst = dma_data->DstAddress<VAddr>(), src = dma_data->src_addr_lo,
                         bytes = dma_data->NumBytes()] {
                     rasterizer->CopyBuffer(dst, src, bytes, false, true);
-                });
+                }, 0, 0, true);
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
@@ -2597,7 +2628,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 } else {
                     RecordDma([this, dst_addr, src_addr, num_bytes] {
                         rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
-                    });
+                    }, src_addr, num_bytes, true);
                 }
             } else {
                 UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
