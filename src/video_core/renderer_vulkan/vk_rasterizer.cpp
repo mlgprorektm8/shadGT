@@ -487,7 +487,13 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
 }
 
 Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical) {
-    auto& shadow = shadow_infos[canonical];
+    // PERF-065: most draws use the infos of the draws before them; the map is looked up once.
+    auto& cached = shadow_lookup[(reinterpret_cast<uintptr_t>(canonical) >> 6) %
+                                 shadow_lookup.size()];
+    if (cached.first != canonical) {
+        cached = {canonical, &shadow_infos[canonical]};
+    }
+    auto& shadow = *cached.second;
     // A cached info's identity never changes; a different one means the address was reused.
     if (!shadow.info || shadow.identity != canonical->identity) {
         // The command thread rewrites the cached info's per-draw fields under the lock.
@@ -499,12 +505,12 @@ Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical) {
 }
 
 bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
-                                   const std::array<SelectedStage, Shader::MaxStageTypes>& stages,
+                                   std::array<SelectedStage, Shader::MaxStageTypes>& stages,
                                    bool validate) {
     const auto& canonical = pipeline->CanonicalStages();
     std::array<const Shader::Info*, Shader::MaxStageTypes> draw_stages{};
     for (u32 stage = 0; stage < Shader::MaxStageTypes; ++stage) {
-        const auto& selected = stages[stage];
+        auto& selected = stages[stage];
         if (!canonical[stage] || !selected.present) {
             if (canonical[stage] || selected.present) {
                 return false;
@@ -521,7 +527,9 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
         // checks it never differed). -DisablePerf 69 reads them again and compares.
         static const bool trust_selection = Common::PerfFeatureEnabled(69);
         if (validate && trust_selection) {
-            info.flattened_ud_buf = selected.flattened;
+            // PERF-065: moved, not copied; the selection is recycled after the draw and keeps
+            // the shadow's old buffer (its capacity).
+            std::swap(info.flattened_ud_buf, selected.flattened);
             info.flattened_ud_src.assign(info.flattened_ud_buf.size(), 0);
         } else {
             // The sharps are read again from the memory as the recorder sees it now.

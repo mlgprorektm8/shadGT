@@ -113,7 +113,7 @@ public:
         buffer_cache.SetDrawEpoch(epoch);
     }
     /// PERF-047: on the recorder thread, around the draw it selected the pipeline for.
-    void SetSelectedPipeline(const SelectedPipeline* selected) {
+    void SetSelectedPipeline(SelectedPipeline* selected) {
         selected_pipeline = selected;
     }
     /// PERF-056: a used selection goes back for reuse with its vectors' capacity.
@@ -301,7 +301,9 @@ private:
         std::array<u32, Shader::NUM_USER_DATA_REGS> user_data{};
     };
     std::unordered_map<const Shader::Info*, ShadowInfo> shadow_infos;
-    const SelectedPipeline* selected_pipeline{};
+    // PERF-065: the last shadow found for a canonical info, direct-mapped by its address.
+    std::array<std::pair<const Shader::Info*, ShadowInfo*>, 512> shadow_lookup{};
+    SelectedPipeline* selected_pipeline{};
     struct {
         u64 ahead;
         u64 compute_ahead; // PERF-055
@@ -326,8 +328,9 @@ private:
                                                     bool selected_allowed);
     /// Points the pipeline's stages at copies holding the given user data; with `validate`,
     /// false if a stage's flattened user data now differs from what selection used.
+    /// PERF-065: the selection's flattened user data is moved into the stage (swapped).
     bool InstallDrawStages(const Pipeline* pipeline,
-                           const std::array<SelectedStage, Shader::MaxStageTypes>& stages,
+                           std::array<SelectedStage, Shader::MaxStageTypes>& stages,
                            bool validate);
     ShadowInfo& ShadowOf(const Shader::Info* canonical);
     /// The user data of the infos the pipeline cache just selected (under its lock).
