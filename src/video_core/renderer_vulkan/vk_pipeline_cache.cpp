@@ -1587,17 +1587,28 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
     Common::SetCurrentThreadName("shadGT:PrewarmRead");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
     auto& store = Storage::DataBase::Instance();
-    // Stored translations made for another device or driver profile are not built.
+    // The profile file is written only when missing (by the removed precompile), so it can be
+    // older than most entries: GT Sport's is from October 6, the store's entries from October 6
+    // to 9. A draw's first use loads the same stored SPIR-V without checking it (PERF-032), so
+    // a background build makes the pipeline that draw would make; differences are only logged.
     std::vector<u8> stored_profile;
     if (store.Exists(Storage::BlobType::ShaderProfile, "profile")) {
         store.Load(Storage::BlobType::ShaderProfile, "profile", stored_profile);
     }
-    if (!stored_profile.empty() && (stored_profile.size() != sizeof(profile) ||
-                                    std::memcmp(stored_profile.data(), &profile, sizeof(profile)))) {
-        LOG_WARNING(Render_Vulkan, "PERF-038: the stored pipelines were made for another shader "
-                                   "profile; none are built in the background");
-        prewarm_reader_done = true;
-        return;
+    if (!stored_profile.empty()) {
+        std::string differences;
+        const auto* current = reinterpret_cast<const u8*>(&profile);
+        for (size_t i = 0; i < std::min(stored_profile.size(), sizeof(profile)); ++i) {
+            if (stored_profile[i] != current[i]) {
+                differences += fmt::format(" [{}] {:#x}->{:#x}", i, stored_profile[i], current[i]);
+            }
+        }
+        if (!differences.empty() || stored_profile.size() != sizeof(profile)) {
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-038: the store's profile file ({} bytes) differs from this "
+                        "profile ({} bytes):{}",
+                        stored_profile.size(), sizeof(profile), differences);
+        }
     }
     auto keys = store.ListBlobs(Storage::BlobType::PipelineKey);
     std::erase_if(keys, [](const auto& key) { return !key.first.starts_with("g_"); });
