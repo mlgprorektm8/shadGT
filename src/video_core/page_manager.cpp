@@ -11,6 +11,7 @@
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
 #include "common/perf_monitor.h"
+#include "common/sampling_profiler.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
@@ -507,6 +508,16 @@ struct SignalImpl : public PageManager::Impl {
         // thread lets the recorder finish first, since the handling uses the caches.
         const auto is_gpu_thread = rasterizer->IsGpuThread();
         if (is_gpu_thread) {
+            // DIAG-049: which GPU-thread code touched protected guest memory. A fault on the
+            // command thread drains the recorder and may wait for the GPU.
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+                LOG_WARNING(Render, "DIAG-049 GPU-thread {} fault at {:#x} from {}; stack:{}",
+                            Common::IsWriteError(context) ? "write" : "read", addr,
+                            Common::SamplingProfiler::DescribeCode(
+                                reinterpret_cast<u64>(Common::GetRip(context))),
+                            Common::SamplingProfiler::DescribeStack());
+            }
             rasterizer->OnGpuThreadFault();
         }
         if (Common::IsWriteError(context)) {

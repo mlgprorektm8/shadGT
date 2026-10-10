@@ -41,6 +41,7 @@ struct SampledThread {
     ULONG_PTR stack_low{};
     ULONG_PTR stack_high{};
     u64 samples{};
+    u32 period{1}; // sampled every this many ticks (1 ms)
     std::unordered_map<u64, u64> self;      // address -> samples it was the current address
     std::unordered_map<u64, u64> inclusive; // function start -> samples it was on the stack
 };
@@ -52,7 +53,7 @@ public:
         return sampler;
     }
 
-    void Register(const char* name) {
+    void Register(const char* name, ULONG_PTR low, ULONG_PTR high, u32 period) {
         HANDLE handle{};
         if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
                              &handle,
@@ -60,15 +61,13 @@ public:
                              FALSE, 0)) {
             return;
         }
-        ULONG_PTR low{};
-        ULONG_PTR high{};
-        GetCurrentThreadStackLimits(&low, &high);
         std::scoped_lock lk{mutex};
         auto& thread = threads.emplace_back(std::make_unique<SampledThread>());
         thread->name = name;
         thread->handle = handle;
         thread->stack_low = low;
         thread->stack_high = high;
+        thread->period = period;
         if (!worker.joinable()) {
             worker = std::jthread{[this](std::stop_token stop) { Run(stop); }};
         }
@@ -80,12 +79,16 @@ private:
         SetCurrentThreadPriority(ThreadPriority::High);
         timeBeginPeriod(1);
         auto report_at = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        u64 tick = 0;
         while (!stop.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            ++tick;
             {
                 std::scoped_lock lk{mutex};
                 for (auto& thread : threads) {
-                    Sample(*thread);
+                    if (tick % thread->period == 0) {
+                        Sample(*thread);
+                    }
                 }
             }
             if (std::chrono::steady_clock::now() >= report_at) {
@@ -102,7 +105,7 @@ private:
         u64 frames[16];
         u32 depth = 0;
         if (SuspendThread(thread.handle) == static_cast<DWORD>(-1)) {
-            return;
+            return; // exited
         }
         CONTEXT context{};
         context.ContextFlags = CONTEXT_FULL;
@@ -153,6 +156,7 @@ private:
         }
     }
 
+public:
     static std::string Describe(u64 address) {
         HMODULE module{};
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -169,6 +173,7 @@ private:
         return fmt::format("{}+{:#x}", name, address - reinterpret_cast<u64>(module));
     }
 
+private:
     static std::string Top(const std::unordered_map<u64, u64>& counts, u64 total, size_t count) {
         std::vector<std::pair<u64, u64>> sorted(counts.begin(), counts.end());
         std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second > b.second; });
@@ -186,10 +191,11 @@ private:
             if (thread->samples == 0) {
                 continue;
             }
+            const bool guest = thread->period != 1;
             LOG_WARNING(Debug, "DIAG-048 profile {} ({} samples), self:{}", thread->name,
-                        thread->samples, Top(thread->self, thread->samples, 40));
+                        thread->samples, Top(thread->self, thread->samples, guest ? 12 : 40));
             LOG_WARNING(Debug, "DIAG-048 profile {} ({} samples), inclusive:{}", thread->name,
-                        thread->samples, Top(thread->inclusive, thread->samples, 60));
+                        thread->samples, Top(thread->inclusive, thread->samples, guest ? 20 : 60));
             thread->samples = 0;
             thread->self.clear();
             thread->inclusive.clear();
@@ -205,16 +211,54 @@ private:
 
 void RegisterCurrentThread(const char* name) {
     if (Enabled()) {
-        Sampler::Instance().Register(name);
+        ULONG_PTR low{};
+        ULONG_PTR high{};
+        GetCurrentThreadStackLimits(&low, &high);
+        Sampler::Instance().Register(name, low, high, 1);
     }
+}
+
+void RegisterGuestThread(const char* name, const void* stack_low, const void* stack_high) {
+    if (Enabled()) {
+        // Game threads run on their own stacks, and there are many: sampled every 4 ms.
+        ULONG_PTR low = reinterpret_cast<ULONG_PTR>(stack_low);
+        ULONG_PTR high = reinterpret_cast<ULONG_PTR>(stack_high);
+        if (!stack_low) {
+            GetCurrentThreadStackLimits(&low, &high);
+        }
+        Sampler::Instance().Register(fmt::format("guest:{}", name).c_str(), low, high, 4);
+    }
+}
+
+std::string DescribeCode(u64 address) {
+    return Sampler::Describe(address);
+}
+
+std::string DescribeStack() {
+    void* frames[24];
+    const USHORT count = RtlCaptureStackBackTrace(1, 24, frames, nullptr);
+    std::string out;
+    for (USHORT i = 0; i < count; ++i) {
+        out += ' ' + Sampler::Describe(reinterpret_cast<u64>(frames[i]));
+    }
+    return out;
 }
 
 } // namespace Common::SamplingProfiler
 
 #else
 
+#include <fmt/format.h>
+
 namespace Common::SamplingProfiler {
 void RegisterCurrentThread(const char*) {}
+void RegisterGuestThread(const char*, const void*, const void*) {}
+std::string DescribeCode(u64 address) {
+    return fmt::format("{:#x}", address);
+}
+std::string DescribeStack() {
+    return {};
+}
 } // namespace Common::SamplingProfiler
 
 #endif

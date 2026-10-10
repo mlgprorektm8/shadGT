@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/thread.h"
+#include "common/sampling_profiler.h"
 #ifdef _WIN32
 #include "common/ntapi.h"
 #else
@@ -269,6 +270,8 @@ static void* RunThread(void* arg) {
     /* Run the current thread's start routine with argument: */
     auto* const stack =
         (void*)(((size_t)curthread->attr.stackaddr_attr + curthread->attr.stacksize_attr) & (~15));
+    Common::SamplingProfiler::RegisterGuestThread(curthread->name.c_str(),
+                                                  curthread->attr.stackaddr_attr, stack);
     void* ret = _runOnAnotherStack(curthread->arg, (void*)curthread->start_routine, stack);
 
     /* Remove thread from tracking */

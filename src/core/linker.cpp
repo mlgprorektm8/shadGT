@@ -10,6 +10,7 @@
 #include "common/path_util.h"
 #include "common/singleton.h"
 #include "common/string_util.h"
+#include "common/sampling_profiler.h"
 #include "common/thread.h"
 #include "core/aerolib/aerolib.h"
 #include "core/aerolib/stubs.h"
@@ -148,6 +149,7 @@ void Linker::Execute(const std::vector<std::string>& args) {
 
     main_thread.Run([this, module, &args, has_libcinternal](std::stop_token) {
         Common::SetCurrentThreadName("Game:Main");
+        Common::SamplingProfiler::RegisterGuestThread("Main", nullptr, nullptr); // DIAG-048
 
 #ifndef _WIN32 // Clear any existing signal mask for game threads.
         sigset_t emptyset;
