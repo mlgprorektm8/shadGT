@@ -221,6 +221,13 @@ private:
         VideoCore::TextureCache::ImageDesc desc;
     };
     std::vector<DecodedTsharp> decoded_tsharps;
+    // FIX-046: bumped on every unmap (any thread); the decoded T#s are checked again after it.
+    std::atomic<u64> tsharp_epoch{};
+    u64 decoded_epoch{};
+    /// FIX-046: whether the address is in mapped guest memory (cached per unmap epoch).
+    bool IsMappedStart(VAddr address);
+    std::array<u64, 1024> mapped_pages_seen{};
+    u64 mapped_epoch{};
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
 

@@ -1745,7 +1745,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                 vsharp.GetStride(), vsharp.num_records, source);
                 }
             }
-            if (vsharp.base_address == 0 || vsharp.GetSize() == 0 || impossible) {
+            // FIX-046: a V# over unmapped guest memory would be tracked like the T# at 0xa000.
+            const bool unmapped = !impossible && vsharp.base_address != 0 &&
+                                  vsharp.GetSize() != 0 && !IsMappedStart(vsharp.base_address);
+            if (unmapped) {
+                static std::atomic<u32> rejected{};
+                if (const u32 n = ++rejected; n <= 20 || n % 1000 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-046: buffer {} of stage {:#x} bound empty: {:#x}+{:#x} is "
+                                "outside mapped memory",
+                                n, stage.pgm_hash, u64(vsharp.base_address), vsharp.GetSize());
+                }
+            }
+            if (vsharp.base_address == 0 || vsharp.GetSize() == 0 || impossible || unmapped) {
                 // DIAG-041: empty buffer bindings of the draw.
                 if (DiagHistoryEnabled()) {
                     diag_empty_bindings += fmt::format(
@@ -2033,6 +2045,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     if (decode_once && decoded_tsharps.empty()) {
         decoded_tsharps.resize(4096);
     }
+    if (const u64 epoch = tsharp_epoch.load(std::memory_order_acquire); epoch != decoded_epoch) {
+        // FIX-046: memory was unmapped; T#s are checked against the mappings again.
+        decoded_epoch = epoch;
+        for (auto& entry : decoded_tsharps) {
+            entry.valid = false;
+        }
+    }
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
         const auto data_fmt = tsharp.GetDataFmt();
@@ -2133,9 +2152,31 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const u32 num_bindings = image_desc.NumBindings(stage);
 
-        if (decoded && !decoded_hit) {
-            std::construct_at(&decoded->desc, tsharp, image_desc);
-            decoded->valid = true;
+        if (!decoded_hit) {
+            // FIX-046: the image must start in mapped guest memory. A garbage T# of GT Sport's
+            // grass compute shader 0xaa3822a3 with base 0xa000 passed the checks above (they
+            // only bound the address to 40 bits), and tracking its 4 MB stopped the emulator
+            // (Protect: "addr 0xa000 out of bounds", October 9 22:03). Like the rejections above,
+            // the binding becomes a null image. Checked when a T# is first decoded; unmapping
+            // memory forgets the decoded T#s (tsharp_epoch).
+            const VideoCore::TextureCache::ImageDesc checked{tsharp, image_desc};
+            const auto& info = checked.info;
+            if (!IsMappedStart(info.guest_address)) {
+                static std::atomic<u32> rejected{};
+                if (const u32 n = ++rejected; n <= 20 || n % 1000 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-046: rejecting T# {} at {:#x}+{:#x} outside mapped memory, "
+                                "shader={}_{:#x}, sharp_offset={}",
+                                n, info.guest_address, info.guest_size, stage.hw_stage,
+                                stage.pgm_hash, image_desc.sharp_fetch.offsets[0]);
+                }
+                bind_null_image();
+                continue;
+            }
+            if (decoded) {
+                std::construct_at(&decoded->desc, checked);
+                decoded->valid = true;
+            }
         }
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings[num_images++];
@@ -2747,7 +2788,27 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
     page_manager.OnGpuMap(addr, size);
 }
 
+bool Rasterizer::IsMappedStart(VAddr address) {
+    // FIX-046: a resource whose start is not in mapped guest memory (FIX-027's test). Pages found
+    // mapped are cached, direct-mapped; unmapping clears them.
+    if (const u64 epoch = tsharp_epoch.load(std::memory_order_acquire); epoch != mapped_epoch) {
+        mapped_epoch = epoch;
+        mapped_pages_seen.fill(0);
+    }
+    const u64 page = address >> 12;
+    auto& entry = mapped_pages_seen[(page * 0x9E3779B97F4A7C15ull) >> 54];
+    if (entry == page + 1) {
+        return true;
+    }
+    if (!memory->IsValidMapping(address, 1) || !memory->IsMappedAddress(address)) {
+        return false;
+    }
+    entry = page + 1;
+    return true;
+}
+
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    tsharp_epoch.fetch_add(1, std::memory_order_release); // FIX-046
     buffer_cache.InvalidateMemory(addr, size);
     // FIX-026: the texture cache has no cache-wide lock since upstream #5219; freeing images here
     // on a game thread raced with the GPU thread freeing the same image ("Trying to unregister an
