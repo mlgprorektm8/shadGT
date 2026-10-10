@@ -226,8 +226,10 @@ class EmulatorProcess:
             self.send(*lines)
             return self._wait_line(lambda l: l.startswith(reply_prefix), timeout)
 
-    def handshake(self, timeout: float = 30.0) -> set[str]:
-        """Reads the #IPC_ENABLED ... #IPC_END block, then sends RUN and START.
+    def handshake(self, timeout: float = 30.0,
+                  patches: list[tuple[str, str, str]] | None = None) -> set[str]:
+        """Reads the #IPC_ENABLED ... #IPC_END block, sends the patches (as the Qt launcher
+        does: with IPC the emulator does not load patch files itself), then RUN and START.
 
         The emulator exits if RUN does not arrive within 5 s of #IPC_END.
         """
@@ -239,6 +241,11 @@ class EmulatorProcess:
                 break
             caps.add(line)
         self.capabilities = caps
+        if patches and "ENABLE_MEMORY_PATCH" in caps:
+            for name, address, value in patches:
+                # modName, offset, value, target, size, isOffset, littleEndian, patchMask,
+                # maskOffset (core/ipc/ipc.cpp)
+                self.send("PATCH_MEMORY", name, address, value, "", "", "0", "0", "0", "0")
         self.send("RUN")
         self.send("START")
         self.handshake_done = True
@@ -614,6 +621,43 @@ def _is_shadgt_running() -> bool:
 # Tools: process control
 
 
+GAME_SERIAL = "CUSA03220"
+
+
+def enabled_file_patches(profile_dir: Path, serial: str) -> list[tuple[str, str, str]]:
+    """The byte patches ticked (isEnabled="true") for the game in the profile's patch
+    repositories (user/patches/<repo>/files.json and its XML files), in file order."""
+    import xml.etree.ElementTree as ET
+
+    patches: list[tuple[str, str, str]] = []
+    patch_root = Path(profile_dir) / "user" / "patches"
+    if not patch_root.is_dir():
+        return patches
+    for repo in sorted(p for p in patch_root.iterdir() if p.is_dir()):
+        index = repo / "files.json"
+        if not index.is_file():
+            continue
+        try:
+            files = json.loads(index.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        for filename, serials in files.items():
+            if serial not in serials or not (repo / filename).is_file():
+                continue
+            try:
+                root = ET.parse(repo / filename).getroot()
+            except ET.ParseError:
+                continue
+            for meta in root.iter("Metadata"):
+                if meta.get("isEnabled") != "true" or meta.get("AppElf", "eboot.bin") != "eboot.bin":
+                    continue
+                for line in meta.iter("Line"):
+                    if line.get("Type") == "bytes":
+                        patches.append((meta.get("Name", ""), line.get("Address", ""),
+                                        line.get("Value", "")))
+    return patches
+
+
 @mcp.tool()
 def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
            env: dict[str, str] | None = None, disable_perf: str = "",
@@ -669,7 +713,7 @@ def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
                 stdout_path=SESSION.profile_dir / f"stdout-mcp-{SESSION.stamp}.txt",
                 stderr_path=SESSION.profile_dir / f"stderr-mcp-{SESSION.stamp}.txt",
             )
-            caps = emu.handshake()
+            caps = emu.handshake(patches=enabled_file_patches(SESSION.profile_dir, GAME_SERIAL))
         except Exception:
             SESSION.restore_overrides()
             raise

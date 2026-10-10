@@ -190,6 +190,27 @@ class McpServerTest(unittest.TestCase):
 
 
 class UnitTest(unittest.TestCase):
+    def test_enabled_file_patches(self):
+        # Only ticked byte patches of the game's file, as the Qt launcher sends them.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "user" / "patches" / "shadPS4"
+            repo.mkdir(parents=True)
+            (repo / "files.json").write_text(
+                json.dumps({"GranTurismoSport.xml": ["CUSA02168", "CUSA03220"],
+                            "Other.xml": ["CUSA00001"]}), encoding="utf-8")
+            (repo / "GranTurismoSport.xml").write_text(
+                '<?xml version="1.0"?><Patch>'
+                '<Metadata Name="Boot fix" AppElf="eboot.bin" isEnabled="true"><PatchList>'
+                '<Line Type="bytes" Address="0x0211ab30" Value="e92ba3490090"/>'
+                '</PatchList></Metadata>'
+                '<Metadata Name="30 FPS lock (shadGT)" AppElf="eboot.bin" isEnabled="false">'
+                '<PatchList><Line Type="bytes" Address="0x020748e2" Value="e8793cb500909090"/>'
+                '</PatchList></Metadata></Patch>', encoding="utf-8")
+            self.assertEqual(shadgt_mcp.enabled_file_patches(Path(tmp), "CUSA03220"),
+                             [("Boot fix", "0x0211ab30", "e92ba3490090")])
+            self.assertEqual(shadgt_mcp.enabled_file_patches(Path(tmp), "CUSA99999"), [])
+            self.assertEqual(shadgt_mcp.enabled_file_patches(Path(tmp) / "none", "CUSA03220"), [])
+
     def test_parse_status(self):
         parsed = shadgt_mcp.parse_status(
             "STATUS frames=12 fps=59.8 paused=0 serial=CUSA03220 app_ver=01.69 "
