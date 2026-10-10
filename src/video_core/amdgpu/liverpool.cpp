@@ -891,8 +891,8 @@ void Liverpool::ReportDrawPipe() {
     if (draw_pipe->HasStage()) {
         LOG_WARNING(Render,
                     "PERF-067 buffer stage in {:.1f} s: {} draws prepared ahead, {} waits for the "
-                    "recorder to catch up",
-                    seconds, stats.stage_prepared, stats.stage_syncs);
+                    "recorder to catch up ({} at barrier jobs)",
+                    seconds, stats.stage_prepared, stats.stage_syncs, stats.stage_barriers);
     }
     waits_moved = 0;
 }

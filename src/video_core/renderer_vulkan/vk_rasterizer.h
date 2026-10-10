@@ -343,6 +343,7 @@ private:
     const Common::ReadCapture* read_capture{}; // PERF-063
     // PERF-067
     BufferPlan* buffer_plan{};
+    std::array<std::atomic<u64>, 3> plan_refusals{};
     std::optional<std::pair<const VideoCore::Buffer*, u64>> TakePlannedBuffer(VAddr address,
                                                                                u32 size,
                                                                                bool written,

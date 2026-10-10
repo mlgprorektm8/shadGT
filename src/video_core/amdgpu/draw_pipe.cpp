@@ -130,6 +130,9 @@ void DrawPipe::RunStage(std::stop_token stop) {
             WaitFinished(forwarded - MaxLead);
         }
         bool sync = job.kind == JobKind::Barrier;
+        if (sync) {
+            stage_barriers.fetch_add(1, std::memory_order_relaxed);
+        }
         if (job.prepare) {
             Common::Nvtx::Scope nvtx{"buffer stage"}; // DIAG-056
             sync |= !job.prepare();
@@ -223,6 +226,7 @@ DrawPipe::Stats DrawPipe::TakeStats() {
     Stats taken = stats;
     taken.stage_prepared = stage_prepared.exchange(0);
     taken.stage_syncs = stage_syncs.exchange(0);
+    taken.stage_barriers = stage_barriers.exchange(0);
     stats = {};
     return taken;
 }

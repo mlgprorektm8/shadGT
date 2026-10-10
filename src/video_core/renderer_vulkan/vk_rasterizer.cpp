@@ -509,6 +509,7 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
             continue;
         }
         if (IsWatchedShader(info->pgm_hash)) {
+            ++plan_refusals[0];
             return false; // Its read pages are checked again before each use (FIX-017).
         }
         const FlatView view{sel.flattened, sel.pgm_base};
@@ -517,6 +518,7 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
                 continue;
             }
             if (!desc.sharp_fetch.FitsIn(sel.flattened.size())) {
+                ++plan_refusals[1];
                 return false;
             }
             const auto vsharp = desc.GetSharp(view);
@@ -537,6 +539,7 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
             const auto result = buffer_cache.ObtainBufferAhead(
                 vsharp.base_address, size, desc.is_written, desc.is_formatted, plan.uploads);
             if (!result) {
+                ++plan_refusals[2];
                 return false;
             }
             plan.entries.push_back({vsharp.base_address, size, desc.is_written, desc.is_formatted,
@@ -652,8 +655,17 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
             LOG_WARNING(Render_Vulkan,
                         "PERF-067 buffer stage in 2.0 s: {} shader buffers obtained ahead and "
                         "used, {} obtained again here (an image appeared over them), {} plans "
-                        "left for a different binding",
-                        plan_stats.used, plan_stats.redone, plan_stats.mismatched);
+                        "left for a different binding; plans stopped: watched shader {}, sharp "
+                        "{}, buffer {} (texel read {}, image {}, stream ring {}, arena {}, "
+                        "residency {}, staging {})",
+                        plan_stats.used, plan_stats.redone, plan_stats.mismatched,
+                        plan_refusals[0].exchange(0), plan_refusals[1].exchange(0),
+                        plan_refusals[2].exchange(0), buffer_cache.ahead_refusals[0].exchange(0),
+                        buffer_cache.ahead_refusals[1].exchange(0),
+                        buffer_cache.ahead_refusals[2].exchange(0),
+                        buffer_cache.ahead_refusals[3].exchange(0),
+                        buffer_cache.ahead_refusals[4].exchange(0),
+                        buffer_cache.ahead_refusals[5].exchange(0));
             plan_stats = {};
         }
         stats = {};

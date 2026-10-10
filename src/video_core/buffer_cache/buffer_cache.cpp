@@ -1313,10 +1313,8 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
     AheadUploads& uploads) {
     std::scoped_lock lk{mutex};
-    if (is_texel_buffer && !is_written) {
-        return std::nullopt; // Metadata (HTILE) is the texture cache's.
-    }
     if (size == 0 || texture_cache.AnyImageInRegion(device_addr, size)) {
+        ++ahead_refusals[1];
         return std::nullopt; // Image exports and aliases are the recorder's.
     }
     if (is_written) {
@@ -1327,6 +1325,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
         const auto [data, offset] = ahead_stream.Map(size, instance.UniformMinAlignment(), false);
         if (!data) {
+            ++ahead_refusals[2];
             return std::nullopt; // The ring would have to wait for the GPU.
         }
         memory->CopySparseMemory(device_addr, data, size);
@@ -1338,12 +1337,18 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
+    if (is_texel_buffer && !is_written) {
+        ++ahead_refusals[0];
+        return std::nullopt; // Metadata (HTILE) is the texture cache's (arena path only).
+    }
     if (!address_space[first_page] || address_space[first_page] != address_space[last_page]) {
+        ++ahead_refusals[3];
         return std::nullopt; // A new or migrating arena records binds.
     }
     bool resident = true;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64, u64) { resident = false; });
     if (!resident) {
+        ++ahead_refusals[4];
         return std::nullopt;
     }
     // The uploads' staging must not wait for the GPU either: size of everything this range
@@ -1351,6 +1356,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     {
         const auto [probe, probe_offset] = ahead_staging.Map(size, 16, false);
         if (!probe) {
+            ++ahead_refusals[5];
             return std::nullopt;
         }
     }

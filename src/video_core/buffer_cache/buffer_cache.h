@@ -403,6 +403,11 @@ private:
     StreamBuffer ahead_stream;
     StreamBuffer ahead_staging;
     AheadUploads* ahead_uploads{}; // set while ObtainBufferAhead runs
+public:
+    /// PERF-067: why the stage left buffers to the recorder (texel read, image, stream ring,
+    /// arena, residency, staging ring).
+    std::array<std::atomic<u64>, 6> ahead_refusals{};
+private:
     // Prepared uploads not recorded yet, oldest first. The stage has already marked their
     // bytes uploaded; anything the recorder obtains over them records them first.
     std::deque<std::shared_ptr<AheadUpload>> pending_ahead_uploads;

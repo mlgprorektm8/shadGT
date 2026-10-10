@@ -105,6 +105,7 @@ public:
         size_t max_queued;
         u64 stage_prepared; // PERF-067
         u64 stage_syncs;
+        u64 stage_barriers;
     };
     /// The counters since the previous call (resets them).
     Stats TakeStats();
@@ -127,6 +128,7 @@ private:
     u64 forwarded{}; // stage thread only
     std::atomic<u64> stage_syncs{};
     std::atomic<u64> stage_prepared{};
+    std::atomic<u64> stage_barriers{};
     std::jthread stage;
 
     std::mutex mutex;
