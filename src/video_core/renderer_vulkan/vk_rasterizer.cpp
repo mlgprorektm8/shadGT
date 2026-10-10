@@ -486,6 +486,91 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
     return complete;
 }
 
+bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan) {
+    const Pipeline* pipeline = selected.is_compute
+                                   ? static_cast<const Pipeline*>(selected.compute)
+                                   : static_cast<const Pipeline*>(selected.pipeline);
+    if (!pipeline || IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
+        IsComputeImageClear(pipeline)) {
+        return true; // Nothing to obtain, or BindResources is not reached.
+    }
+    plan.generation = texture_cache.RegistryGeneration();
+    struct FlatView {
+        const std::vector<u32>& flattened_ud_buf;
+        VAddr pgm_base;
+    };
+    static const bool null_impossible = Common::PerfFeatureEnabled(39);
+    constexpr u64 GpuAddressLimit = 1ULL << 40;
+    const auto& canonical = pipeline->CanonicalStages();
+    for (u32 stage = 0; stage < Shader::MaxStageTypes; ++stage) {
+        const auto& sel = selected.stages[stage];
+        const Shader::Info* info = canonical[stage];
+        if (!info || !sel.present) {
+            continue;
+        }
+        if (IsWatchedShader(info->pgm_hash)) {
+            return false; // Its read pages are checked again before each use (FIX-017).
+        }
+        const FlatView view{sel.flattened, sel.pgm_base};
+        for (const auto& desc : info->buffers) {
+            if (desc.IsSpecial()) {
+                continue;
+            }
+            if (!desc.sharp_fetch.FitsIn(sel.flattened.size())) {
+                return false;
+            }
+            const auto vsharp = desc.GetSharp(view);
+            // The same rejections as BindBuffers, which then obtains nothing.
+            const bool impossible =
+                null_impossible && vsharp.num_records != UINT32_MAX &&
+                (vsharp.GetSize() >= GpuAddressLimit ||
+                 u64(vsharp.base_address) + vsharp.GetSize() > GpuAddressLimit ||
+                 (vsharp.GetSize() >= 1_GB && vsharp.base_address != 0 &&
+                  !memory->IsValidMapping(vsharp.base_address)));
+            const bool unmapped = !impossible && vsharp.base_address != 0 &&
+                                  vsharp.GetSize() != 0 && !IsMappedStart(vsharp.base_address);
+            if (vsharp.base_address == 0 || vsharp.GetSize() == 0 || impossible || unmapped) {
+                continue;
+            }
+            const u32 size =
+                static_cast<u32>(memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize()));
+            const auto result = buffer_cache.ObtainBufferAhead(
+                vsharp.base_address, size, desc.is_written, desc.is_formatted, plan.uploads);
+            if (!result) {
+                return false;
+            }
+            plan.entries.push_back({vsharp.base_address, size, desc.is_written, desc.is_formatted,
+                                    result->first, result->second});
+        }
+    }
+    return true;
+}
+
+std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedBuffer(
+    VAddr address, u32 size, bool written, bool texel) {
+    auto* plan = buffer_plan;
+    if (!plan || plan->next >= plan->entries.size()) {
+        return std::nullopt;
+    }
+    const auto& entry = plan->entries[plan->next];
+    if (entry.address != address || entry.size != size || entry.written != written ||
+        entry.texel != texel) {
+        // The recorder binds something else than planned: it obtains the rest itself.
+        ++plan_stats.mismatched;
+        plan->next = plan->entries.size();
+        return std::nullopt;
+    }
+    ++plan->next;
+    if (texture_cache.RegistryGeneration() != plan->generation &&
+        texture_cache.AnyImageInRegion(address, size)) {
+        // An image over the range appeared since: obtained again, with its export.
+        ++plan_stats.redone;
+        return std::nullopt;
+    }
+    ++plan_stats.used;
+    return std::pair<const VideoCore::Buffer*, u64>{entry.buffer, entry.offset};
+}
+
 Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical) {
     // PERF-065: most draws use the infos of the draws before them; the map is looked up once.
     auto& cached = shadow_lookup[(reinterpret_cast<uintptr_t>(canonical) >> 6) %
@@ -562,6 +647,14 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
                         std::chrono::duration<double>(now - stats.since).count(),
                         stats.ahead + stats.compute_ahead, stats.compute_ahead, stats.mismatched,
                         stats.recorder, stats.verified, stats.verify_failed);
+        }
+        if (plan_stats.used + plan_stats.redone + plan_stats.mismatched != 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-067 buffer stage in 2.0 s: {} shader buffers obtained ahead and "
+                        "used, {} obtained again here (an image appeared over them), {} plans "
+                        "left for a different binding",
+                        plan_stats.used, plan_stats.redone, plan_stats.mismatched);
+            plan_stats = {};
         }
         stats = {};
         stats.since = now;
@@ -1709,6 +1802,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     image_infos.clear();
     bound_textures.clear();
 
+    if (buffer_plan && !buffer_plan->uploads.empty()) {
+        // PERF-067: the uploads the buffer stage prepared for this draw's buffers.
+        buffer_cache.RecordAheadUploads(buffer_plan->uploads);
+    }
+
     bool uses_dma = false;
 
     // Preserve the compiled stage binding numbers while resolving every buffer alias before
@@ -2450,6 +2548,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 VideoCore::g_gpu_write_tag = stage.pgm_hash;
                 const auto [buffer, offset] = [&] {
                     Common::PhaseTimer obtain_timer{Common::Phase::BufObtain};
+                    if (const auto planned = TakePlannedBuffer(
+                            vsharp.base_address, u32(size), desc.is_written, desc.is_formatted)) {
+                        return *planned; // PERF-067
+                    }
                     return buffer_cache.ObtainBuffer(vsharp.base_address, size, desc.is_written,
                                                      desc.is_formatted);
                 }();

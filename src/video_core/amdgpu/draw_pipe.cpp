@@ -3,7 +3,10 @@
 
 #include <chrono>
 
+#include <immintrin.h>
 #include "common/nvtx.h"
+#include "common/perf_monitor.h"
+#include "common/thread.h"
 #include "video_core/amdgpu/draw_pipe.h"
 
 namespace AmdGpu {
@@ -23,10 +26,25 @@ DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_)
     while (recorder_id.load(std::memory_order_acquire) == std::thread::id{}) {
         std::this_thread::yield();
     }
+    // PERF-067: the buffer stage thread does each draw's buffer work ahead of the recorder.
+    // -DisablePerf 74 keeps it off.
+    if (const char* env = std::getenv("SHADGT_BUFFER_STAGE");
+        env && env[0] == '1' && Common::PerfFeatureEnabled(74)) {
+        stage_enabled = true;
+        stage = std::jthread{[this](std::stop_token stop) { RunStage(stop); }};
+    }
 }
 
 DrawPipe::~DrawPipe() {
     Drain();
+    if (stage_enabled) {
+        stage.request_stop();
+        {
+            std::scoped_lock lk{stage_mutex};
+            stage_cv.notify_all();
+        }
+        stage.join();
+    }
     recorder.request_stop();
     {
         std::scoped_lock lk{mutex};
@@ -36,19 +54,94 @@ DrawPipe::~DrawPipe() {
 }
 
 void DrawPipe::Push(Work&& work) {
+    Push(std::move(work), JobKind::Barrier);
+}
+
+void DrawPipe::Push(Work&& work, JobKind kind, Prepare&& prepare) {
+    if (stage_enabled) {
+        {
+            std::scoped_lock lk{mutex};
+            exclusive = false;
+            ++pushed;
+            pushed_jobs.store(pushed, std::memory_order_release);
+            ++stats.pushed;
+        }
+        std::scoped_lock lk{stage_mutex};
+        stage_queue.push_back(StageJob{std::move(work), std::move(prepare), kind});
+        stage_cv.notify_one();
+        return;
+    }
     std::unique_lock lk{mutex};
     exclusive = false;
+    ++pushed;
+    pushed_jobs.store(pushed, std::memory_order_release);
+    ++stats.pushed;
     if (queue.size() >= max_pending) {
         ++stats.push_waits;
         done_cv.wait(lk, [this] { return queue.size() < max_pending; });
     }
     queue.push_back(std::move(work));
-    ++pushed;
-    pushed_jobs.store(pushed, std::memory_order_release);
-    ++stats.pushed;
     stats.max_queued = std::max(stats.max_queued, queue.size());
     if (recorder_waiting) {
         work_cv.notify_one();
+    }
+}
+
+void DrawPipe::Forward(Work&& work) {
+    std::unique_lock lk{mutex};
+    if (queue.size() >= max_pending) {
+        ++stats.push_waits;
+        done_cv.wait(lk, [this] { return queue.size() < max_pending; });
+    }
+    queue.push_back(std::move(work));
+    stats.max_queued = std::max(stats.max_queued, queue.size());
+    if (recorder_waiting) {
+        work_cv.notify_one();
+    }
+}
+
+void DrawPipe::WaitFinished(u64 jobs) {
+    for (u32 spins = 0; finished_jobs.load(std::memory_order_acquire) < jobs; ++spins) {
+        if (spins < 64) {
+            _mm_pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
+void DrawPipe::RunStage(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:GpuBufferStage");
+    // The stage keeps at most this many jobs ahead of the recorder: what it prepares is
+    // committed to rings that are reused once the GPU passes the tick they were taken in.
+    constexpr u64 MaxLead = 256;
+    while (true) {
+        StageJob job;
+        {
+            std::unique_lock lk{stage_mutex};
+            stage_cv.wait(lk, stop, [this] { return !stage_queue.empty(); });
+            if (stage_queue.empty()) {
+                return; // stopped
+            }
+            job = std::move(stage_queue.front());
+            stage_queue.pop_front();
+        }
+        if (forwarded > MaxLead) {
+            WaitFinished(forwarded - MaxLead);
+        }
+        bool sync = job.kind == JobKind::Barrier;
+        if (job.prepare) {
+            Common::Nvtx::Scope nvtx{"buffer stage"}; // DIAG-056
+            sync |= !job.prepare();
+            stage_prepared.fetch_add(1, std::memory_order_relaxed);
+        }
+        Forward(std::move(job.run));
+        ++forwarded;
+        if (sync) {
+            // The jobs after this one see what it changes only once the recorder ran it.
+            stage_syncs.fetch_add(1, std::memory_order_relaxed);
+            WaitFinished(forwarded);
+        }
     }
 }
 
@@ -127,7 +220,9 @@ void DrawPipe::ReleaseExclusive() {
 
 DrawPipe::Stats DrawPipe::TakeStats() {
     std::scoped_lock lk{mutex};
-    const Stats taken = stats;
+    Stats taken = stats;
+    taken.stage_prepared = stage_prepared.exchange(0);
+    taken.stage_syncs = stage_syncs.exchange(0);
     stats = {};
     return taken;
 }

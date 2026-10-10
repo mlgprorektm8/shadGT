@@ -1255,6 +1255,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image_lru_cache.Insert(image, gc_tick);
     const auto& info = image.info;
     ASSERT_MSG((info.guest_address & 0xff) == 0, "Trying to register an unaligned image");
+    std::unique_lock lk{registry_mutex}; // PERF-067
     ForEachPage(info.guest_address, info.guest_size, [this, image_id, info](u64 page) {
         page_table[page].entries.emplace_back(BucketEntry{
             .key = u32(info.guest_address >> 8),
@@ -1272,6 +1273,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ++registry_generation; // PERF-057
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    std::unique_lock lk{registry_mutex}; // PERF-067
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
         ASSERT_MSG(page_it, "Unregistering unregistered page={:#x}", page << Traits::PAGE_BITS);

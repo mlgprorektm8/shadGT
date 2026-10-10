@@ -26,6 +26,15 @@ namespace AmdGpu {
 class DrawPipe {
 public:
     using Work = Common::UniqueFunction<void>;
+    /// PERF-067: work done for a job on the buffer stage thread before the recorder runs it;
+    /// false when the recorder must have run the job before the stage goes on.
+    using Prepare = Common::UniqueFunction<bool>;
+
+    /// PERF-067: how a job orders against the buffer stage running ahead of the recorder.
+    enum class JobKind : u8 {
+        Barrier, ///< Changes what later jobs read (memory, caches): the stage waits for it.
+        Neutral, ///< Reads and writes nothing later jobs' buffer work depends on.
+    };
 
     /// `thread_init` runs first on the recorder thread (thread name, thread-local state).
     explicit DrawPipe(std::function<void()> thread_init, size_t max_pending = 4096);
@@ -36,6 +45,14 @@ public:
 
     /// Queues work behind everything pushed before it. Waits while `max_pending` jobs are queued.
     void Push(Work&& work);
+    /// PERF-067: the same, with the job's kind and the work the buffer stage does for it first
+    /// (only with the stage on; otherwise `prepare` is dropped and the recorder does it all).
+    void Push(Work&& work, JobKind kind, Prepare&& prepare = {});
+
+    /// PERF-067: whether the buffer stage thread runs (SHADGT_BUFFER_STAGE=1).
+    bool HasStage() const noexcept {
+        return stage_enabled;
+    }
 
     /// Returns once every job pushed so far has finished. A no-op on the recorder thread.
     /// PERF-050: the caller (the command thread) then owns the caches until its next Push or
@@ -86,12 +103,31 @@ public:
         u64 push_waits;
         u64 recorder_busy_us;
         size_t max_queued;
+        u64 stage_prepared; // PERF-067
+        u64 stage_syncs;
     };
     /// The counters since the previous call (resets them).
     Stats TakeStats();
 
 private:
     void Run(std::stop_token stop);
+    // PERF-067
+    void Forward(Work&& work);
+    void RunStage(std::stop_token stop);
+    void WaitFinished(u64 jobs);
+    struct StageJob {
+        Work run;
+        Prepare prepare;
+        JobKind kind;
+    };
+    bool stage_enabled{};
+    std::mutex stage_mutex;
+    std::condition_variable_any stage_cv;
+    std::deque<StageJob> stage_queue;
+    u64 forwarded{}; // stage thread only
+    std::atomic<u64> stage_syncs{};
+    std::atomic<u64> stage_prepared{};
+    std::jthread stage;
 
     std::mutex mutex;
     std::condition_variable_any work_cv;

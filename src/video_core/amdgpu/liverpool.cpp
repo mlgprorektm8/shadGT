@@ -376,7 +376,7 @@ void Liverpool::Record(Common::UniqueFunction<void>&& work) {
 
 void Liverpool::RecordSafe(Common::UniqueFunction<void>&& work) {
     if (draw_pipe) {
-        draw_pipe->Push(std::move(work));
+        draw_pipe->Push(std::move(work), DrawPipe::JobKind::Neutral);
     } else {
         work();
     }
@@ -599,10 +599,30 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
             UnsafeWindow(compute ? "dispatch not selected ahead" : "draw not selected ahead");
         }
     }
+    // PERF-067: with the buffer stage, the selection and the buffers obtained for it are shared
+    // by the stage's work and the recorder's.
+    struct StagedDraw {
+        std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
+        Vulkan::Rasterizer::BufferPlan plan;
+    };
+    std::shared_ptr<StagedDraw> staged;
+    DrawPipe::Prepare prepare;
+    if (draw_pipe->HasStage() && selected) {
+        staged = std::make_shared<StagedDraw>();
+        staged->selected = std::move(selected);
+        selected.reset();
+        prepare = [this, staged] {
+            return rasterizer->PrepareBuffersAhead(*staged->selected, staged->plan);
+        };
+    }
+    // A draw whose buffers the stage does not obtain is obtained by the recorder: the stage
+    // must not run past it.
+    const auto kind = staged ? DrawPipe::JobKind::Neutral : DrawPipe::JobKind::Barrier;
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
-                     decode_epoch, capture = std::move(capture)]() mutable {
+                     decode_epoch, capture = std::move(capture), staged]() mutable {
+        auto& sel = staged ? staged->selected : selected;
         auto& state = *recorder;
         RegsDelta<Regs::NumRegs>::Apply(delta, std::span<u32, Regs::NumRegs>{state.regs.reg_array});
         if (cs) {
@@ -613,18 +633,20 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         if (expected) {
             VerifyRecorderRegs(*expected);
         }
-        rasterizer->SetSelectedPipeline(selected ? &*selected : nullptr);
-        rasterizer->SetDrawEpoch(selected ? decode_epoch : 0);
+        rasterizer->SetSelectedPipeline(sel ? &*sel : nullptr);
+        rasterizer->SetDrawEpoch(sel ? decode_epoch : 0);
         rasterizer->SetReadCapture(capture.get());
+        rasterizer->SetBufferPlan(staged ? &staged->plan : nullptr);
         draw();
+        rasterizer->SetBufferPlan(nullptr);
         rasterizer->SetReadCapture(nullptr);
         rasterizer->SetDrawEpoch(0);
         rasterizer->SetSelectedPipeline(nullptr);
         delta_recycler.Give(std::move(delta));
-        if (selected) {
-            rasterizer->RecycleSelectedPipeline(std::move(*selected));
+        if (sel) {
+            rasterizer->RecycleSelectedPipeline(std::move(*sel));
         }
-    });
+    }, kind, std::move(prepare));
     if (read_ahead_states && !compute) {
         OfferDrawState();
     }
@@ -866,6 +888,12 @@ void Liverpool::ReportDrawPipe() {
                 seconds, stats.pushed, stats.recorder_busy_us / (seconds * 1e4), stats.max_queued,
                 stats.push_waits, waits_moved, stats.drains, stats.drains_that_waited,
                 stats.drain_wait_us / 1000.0, reasons, read_ahead);
+    if (draw_pipe->HasStage()) {
+        LOG_WARNING(Render,
+                    "PERF-067 buffer stage in {:.1f} s: {} draws prepared ahead, {} waits for the "
+                    "recorder to catch up",
+                    seconds, stats.stage_prepared, stats.stage_syncs);
+    }
     waits_moved = 0;
 }
 

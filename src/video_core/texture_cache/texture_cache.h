@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <mutex>
+#include <shared_mutex>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 
@@ -245,7 +246,28 @@ public:
     /// PERF-057: changes whenever an image is registered or unregistered, i.e. whenever
     /// ForEachImageInRegion could find a different set of images.
     u64 RegistryGeneration() const {
-        return registry_generation;
+        return registry_generation.load(std::memory_order_acquire);
+    }
+
+    /// PERF-067 (any thread): whether a registered image overlaps the range. Images are
+    /// registered and unregistered under the registry lock this takes shared.
+    bool AnyImageInRegion(VAddr cpu_addr, size_t size) const {
+        std::shared_lock lk{registry_mutex};
+        bool found = false;
+        ForEachPage(cpu_addr, size, [&](u64 page) {
+            const auto* bucket = page_table.find(page);
+            if (!bucket) {
+                return false;
+            }
+            for (const auto& entry : bucket->entries) {
+                if (entry.Overlaps(cpu_addr, size)) {
+                    found = true;
+                    return true;
+                }
+            }
+            return false;
+        });
+        return found;
     }
 
     template <typename Func>
@@ -350,7 +372,8 @@ private:
     BufferCache& buffer_cache;
     PageManager& tracker;
     PageTable page_table;
-    u64 registry_generation{1}; // PERF-057
+    std::atomic<u64> registry_generation{1}; // PERF-057
+    mutable std::shared_mutex registry_mutex;  // PERF-067: page_table structure
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     Common::SlotVector<Sampler> slot_samplers;

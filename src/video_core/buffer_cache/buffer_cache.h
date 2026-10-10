@@ -132,6 +132,31 @@ public:
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
 
+    /// PERF-067: an upload the buffer stage prepared; the recorder records its copy.
+    struct AheadUpload {
+        const Buffer* staging;
+        const Buffer* arena;
+        boost::container::small_vector<vk::BufferCopy, 4> copies;
+        VAddr begin; // guest range the copies write
+        VAddr end;
+        bool recorded{};
+    };
+    using AheadUploads = std::vector<std::shared_ptr<AheadUpload>>;
+    /// PERF-067 (buffer stage thread): ObtainBuffer for the simple, common case, ahead of the
+    /// recorder: no image over the range, no metadata, the arena resident. Uploads it needs go
+    /// to `uploads` for the recorder to record. Nothing (and nothing changed) otherwise; the
+    /// recorder then obtains the buffer itself.
+    [[nodiscard]] std::optional<std::pair<const Buffer*, u64>> ObtainBufferAhead(
+        VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer, AheadUploads& uploads);
+    /// PERF-067 (recorder): records the copies of a draw's prepared uploads not recorded yet
+    /// (ahead of the session's draws when PERF-066 is on).
+    void RecordAheadUploads(const AheadUploads& uploads);
+    /// PERF-067: the cache is used by the buffer stage thread and the recorder; every entry
+    /// point takes this.
+    std::recursive_mutex& Mutex() noexcept {
+        return mutex;
+    }
+
     /// Return true when a region is modified from the CPU
     [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
 
@@ -374,6 +399,16 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
 
     StreamBuffer stream_buffer;
+    // PERF-067: rings the buffer stage fills ahead of the recorder.
+    StreamBuffer ahead_stream;
+    StreamBuffer ahead_staging;
+    AheadUploads* ahead_uploads{}; // set while ObtainBufferAhead runs
+    // Prepared uploads not recorded yet, oldest first. The stage has already marked their
+    // bytes uploaded; anything the recorder obtains over them records them first.
+    std::deque<std::shared_ptr<AheadUpload>> pending_ahead_uploads;
+    void RecordPendingAheadUploads(VAddr device_addr, u64 size);
+    void RecordAheadUpload(AheadUpload& upload);
+    mutable std::recursive_mutex mutex;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
     u32 image_alias_exports_logged{};

@@ -180,6 +180,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
+      ahead_stream{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
+      ahead_staging{instance, scheduler, MemoryType::HostUncached, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance},
       // PERF-011 is disabled: skipping GPU-written bytes in uploads loses CPU stores to those
@@ -258,12 +260,14 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::TickFrame() {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
 }
 
 void BufferCache::RecordGdsReadback(VAddr address, u32 gds_offset, u32 size) {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
     auto readback = std::make_shared<AsyncReadback>();
     readback->address = address;
     readback->size = size;
@@ -284,6 +288,7 @@ void BufferCache::RecordGdsReadback(VAddr address, u32 gds_offset, u32 size) {
 }
 
 std::vector<std::shared_ptr<BufferCache::AsyncReadback>> BufferCache::TakePendingAsyncReadbacks() {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
     std::scoped_lock lk{async_readbacks_mutex};
     auto readbacks = std::move(pending_async_readbacks);
     pending_async_readbacks.clear();
@@ -336,6 +341,7 @@ void BufferCache::NoteCpuReadFault(VAddr address, u64 size, u64 exact_write_size
 }
 
 bool BufferCache::RecordHotPageReadbacks() {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
     LogHotPageStats();
     if (hot_page_order.empty()) {
         return false;
@@ -490,6 +496,7 @@ static void NoteWritebackOverCommands(AmdGpu::Liverpool* liverpool, const char* 
 
 void BufferCache::CompleteAsyncReadbacks(
     std::span<const std::shared_ptr<AsyncReadback>> readbacks) {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
     std::scoped_lock lk{async_readbacks_mutex};
     for (const auto& readback : readbacks) {
         if (readback->valid && memory->IsValidMapping(readback->address, readback->size) &&
@@ -528,6 +535,7 @@ void BufferCache::CompleteAsyncReadbacks(
 }
 
 void BufferCache::ReleaseFinishedAsyncReadbacks() {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
     std::vector<Vulkan::StagingBufferRef> finished;
     {
         std::scoped_lock lk{async_readbacks_mutex};
@@ -726,6 +734,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks,
                              u64 exact_write_size) {
     const auto flush_request = [this, device_addr, size, is_write, exact_write_size] {
+        std::scoped_lock buffer_lock{mutex}; // PERF-067
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
@@ -831,6 +840,7 @@ void BufferCache::WaitForFaultWritebacks(u64 tick) {
 std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr device_addr,
                                                                          u64 size, bool is_write,
                                                                          u64 exact_write_size) {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
     // As ReadMemory's flush_request up to DownloadMemory's GPU wait.
     const u32 first_block = device_addr >> block_shift;
     const u32 last_block = (device_addr + size - 1) >> block_shift;
@@ -936,6 +946,7 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
 }
 
 void BufferCache::FinishFaultFlush(FaultDownload& fault) {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
     // The rest of DownloadMemory and of the flush, for the bytes no GPU write has changed since
     // the download: those stay GPU-written and their guest copy is stale, as for any GPU write.
     boost::container::small_vector<std::pair<VAddr, VAddr>, 8> newer;
@@ -1039,6 +1050,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
+    RecordPendingAheadUploads(device_addr, size);
     if (is_written) {
         InvalidateAsyncReadbacks(device_addr, size);
     }
@@ -1085,6 +1098,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
+    RecordPendingAheadUploads(device_addr, size);
     if (IsRegionGpuModified(device_addr, size)) {
         return ObtainBuffer(device_addr, size, false);
     }
@@ -1104,6 +1119,7 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 bool BufferCache::HasGpuImageAlias(VAddr addr, size_t size) {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
     if (size == 0) {
         return false;
     }
@@ -1116,6 +1132,8 @@ bool BufferCache::HasGpuImageAlias(VAddr addr, size_t size) {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
+    RecordPendingAheadUploads(0, ~u64{0} >> 1);
     fault_process_pending = true;
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
@@ -1289,6 +1307,122 @@ void BufferCache::HashPagesAhead(std::span<const std::pair<VAddr, u64>> ranges, 
         }
     });
     ahead_hashed.fetch_add(pages.size(), std::memory_order_relaxed);
+}
+
+std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
+    VAddr device_addr, u32 size, bool is_written, bool is_texel_buffer,
+    AheadUploads& uploads) {
+    std::scoped_lock lk{mutex};
+    if (is_texel_buffer && !is_written) {
+        return std::nullopt; // Metadata (HTILE) is the texture cache's.
+    }
+    if (size == 0 || texture_cache.AnyImageInRegion(device_addr, size)) {
+        return std::nullopt; // Image exports and aliases are the recorder's.
+    }
+    if (is_written) {
+        InvalidateAsyncReadbacks(device_addr, size);
+    }
+    ApplyCompletedReadbacks();
+    ++Common::GetWorkCounters().obtain_buffer;
+    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+        const auto [data, offset] = ahead_stream.Map(size, instance.UniformMinAlignment(), false);
+        if (!data) {
+            return std::nullopt; // The ring would have to wait for the GPU.
+        }
+        memory->CopySparseMemory(device_addr, data, size);
+        ahead_stream.Commit();
+        ++Common::GetWorkCounters().obtain_stream;
+        return std::pair<const Buffer*, u64>{&ahead_stream, offset};
+    }
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block = (device_addr + size - 1) >> block_shift;
+    const u64 first_page = first_block >> blocks_per_arena_page_shift;
+    const u64 last_page = last_block >> blocks_per_arena_page_shift;
+    if (!address_space[first_page] || address_space[first_page] != address_space[last_page]) {
+        return std::nullopt; // A new or migrating arena records binds.
+    }
+    bool resident = true;
+    resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64, u64) { resident = false; });
+    if (!resident) {
+        return std::nullopt;
+    }
+    // The uploads' staging must not wait for the GPU either: size of everything this range
+    // could upload.
+    {
+        const auto [probe, probe_offset] = ahead_staging.Map(size, 16, false);
+        if (!probe) {
+            return std::nullopt;
+        }
+    }
+    const Buffer* arena = address_space[first_page];
+    ahead_uploads = &uploads;
+    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    ahead_uploads = nullptr;
+    if (is_written) {
+        gpu_modified_ranges.Add(device_addr, size);
+        NoteGpuWrite(device_addr, size);
+        if (size <= 4_KB) {
+            if (small_gpu_writers.size() > 65536) {
+                small_gpu_writers.clear();
+            }
+            small_gpu_writers[Common::AlignDown(device_addr, 4_KB)] =
+                GpuWriter{g_gpu_write_kind, g_gpu_write_tag, device_addr, size};
+        } else {
+            if (large_gpu_writers.size() > 16384) {
+                large_gpu_writers.clear();
+            }
+            large_gpu_writers[device_addr] =
+                GpuWriter{g_gpu_write_kind, g_gpu_write_tag, device_addr, size};
+        }
+    }
+    return std::pair<const Buffer*, u64>{arena, arena->Offset(device_addr)};
+}
+
+void BufferCache::RecordAheadUpload(AheadUpload& upload) {
+    if (upload.recorded) {
+        return;
+    }
+    upload.recorded = true;
+    if (runtime.HoistsUploads()) {
+        runtime.CopyBufferHoisted(upload.staging, upload.arena, upload.copies);
+    } else {
+        runtime.CopyBuffer(upload.staging, upload.arena, upload.copies);
+    }
+}
+
+void BufferCache::RecordAheadUploads(const AheadUploads& uploads) {
+    std::scoped_lock buffer_lock{mutex};
+    for (const auto& upload : uploads) {
+        RecordAheadUpload(*upload);
+    }
+    while (!pending_ahead_uploads.empty() && pending_ahead_uploads.front()->recorded) {
+        pending_ahead_uploads.pop_front();
+    }
+}
+
+void BufferCache::RecordPendingAheadUploads(VAddr device_addr, u64 size) {
+    // Lock held. An upload prepared for a later draw over these bytes is recorded now, with
+    // the ones prepared before it, so this use sees them.
+    if (pending_ahead_uploads.empty()) {
+        return;
+    }
+    size_t last = pending_ahead_uploads.size();
+    for (size_t i = pending_ahead_uploads.size(); i-- > 0;) {
+        const auto& upload = *pending_ahead_uploads[i];
+        if (!upload.recorded && upload.begin < device_addr + size && device_addr < upload.end) {
+            last = i;
+            break;
+        }
+    }
+    if (last == pending_ahead_uploads.size()) {
+        return;
+    }
+    for (size_t i = 0; i <= last; ++i) {
+        RecordAheadUpload(*pending_ahead_uploads[i]);
+    }
+    while (!pending_ahead_uploads.empty() && pending_ahead_uploads.front()->recorded) {
+        pending_ahead_uploads.pop_front();
+    }
 }
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
@@ -1536,6 +1670,32 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         Common::GetWorkCounters().uploads += copies.size();
         Common::GetWorkCounters().upload_bytes += total_size_bytes;
+        if (ahead_uploads) {
+            // PERF-067: on the buffer stage; the ring and the free check were done before.
+            const auto [mapped, staging_offset] = ahead_staging.Map(total_size_bytes, 16, false);
+            ASSERT(mapped);
+            for (auto& copy : copies) {
+                memory->CopySparseMemory(copy.dstOffset, mapped + copy.srcOffset, copy.size);
+                copy.srcOffset += staging_offset;
+                copy.dstOffset -= arena->cpu_addr;
+            }
+            ahead_staging.Commit();
+            auto upload = std::make_shared<AheadUpload>();
+            upload->staging = &ahead_staging;
+            upload->arena = arena;
+            upload->copies.assign(copies.begin(), copies.end());
+            upload->begin = ~VAddr{0};
+            upload->end = 0;
+            for (const auto& copy : copies) {
+                upload->begin = std::min(upload->begin, arena->cpu_addr + copy.dstOffset);
+                upload->end = std::max(upload->end, arena->cpu_addr + copy.dstOffset + copy.size);
+            }
+            ahead_uploads->push_back(upload);
+            pending_ahead_uploads.push_back(std::move(upload));
+            copies.clear();
+        }
+    }
+    if (!copies.empty()) {
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         // PERF-027: large uploads are copied on several cores; -DisablePerf 27 copies them on
         // this thread only.
@@ -1652,6 +1812,8 @@ void BufferCache::DumpRange(VAddr address, u64 size, const std::filesystem::path
 }
 
 void BufferCache::InlineGuestWrite(VAddr address, std::span<const u8> data) {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
+    RecordPendingAheadUploads(0, ~u64{0} >> 1);
     const u64 size = data.size();
     const u64 first_block = address >> block_shift;
     const u64 last_block = (address + size - 1) >> block_shift;
@@ -1714,6 +1876,7 @@ std::string BufferCache::DescribeRange(VAddr address, u64 size) {
 }
 
 void BufferCache::RefreshReadPages(VAddr address, u64 size, u64 shader_hash, bool quad_vertices) {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
     // FIX-017: the Nurburgring grass is drawn as quad lists and stretched across the screen.
     // In a capture its vertex pages were never uploaded during the frame, so the GPU drew an
     // older copy. Before the draw's uploads, each vertex page is compared with the guest bytes
@@ -1935,6 +2098,7 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+    std::scoped_lock buffer_lock{mutex}; // PERF-067
     if (pending_binds.empty()) {
         return;
     }

@@ -101,6 +101,31 @@ public:
     /// (an early fence) and that reads the page is not recorded yet.
     void WaitForEarlyFences(VAddr page);
 
+    /// PERF-067: the shader buffers of a draw or dispatch, obtained on the buffer stage
+    /// thread ahead of the recorder, in the order BindBuffers obtains them.
+    struct BufferPlan {
+        struct Entry {
+            VAddr address;
+            u32 size;
+            bool written;
+            bool texel;
+            const VideoCore::Buffer* buffer;
+            u64 offset;
+        };
+        std::vector<Entry> entries;
+        VideoCore::BufferCache::AheadUploads uploads;
+        u64 generation{};
+        size_t next{};
+    };
+    /// PERF-067 (buffer stage thread): obtains what it can of the selected draw's shader
+    /// buffers. False when it stopped early (the recorder obtains the rest, and must have
+    /// recorded this draw before the stage goes on).
+    bool PrepareBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan);
+    /// PERF-067 (recorder): around the draw the plan was made for.
+    void SetBufferPlan(BufferPlan* plan) {
+        buffer_plan = plan;
+    }
+
     /// PERF-063 (recorder): the capture of the job being recorded, or null.
     void SetReadCapture(const Common::ReadCapture* capture) {
         read_capture = capture;
@@ -316,6 +341,18 @@ private:
     u64 select_verify_count{};
     Common::Recycler<SelectedPipeline, 4096> selected_recycler;
     const Common::ReadCapture* read_capture{}; // PERF-063
+    // PERF-067
+    BufferPlan* buffer_plan{};
+    std::optional<std::pair<const VideoCore::Buffer*, u64>> TakePlannedBuffer(VAddr address,
+                                                                               u32 size,
+                                                                               bool written,
+                                                                               bool texel);
+    struct {
+        u64 used;
+        u64 redone;
+        u64 mismatched;
+        std::chrono::steady_clock::time_point since;
+    } plan_stats{};
     struct CaptureScan {
         // Ranges already scanned for the current capture (they repeat across draws).
         u64 capture_id{};

@@ -142,6 +142,12 @@ struct StreamBuffer : public Buffer {
     /// Reserves and commits a region in one step.
     std::optional<u64> Reserve(u64 size, u64 alignment = 0, bool allow_wait = true);
 
+    /// PERF-067: commits count as made this many ticks later (for a ring filled ahead of
+    /// the recorder, whose commands using it may come after later submissions).
+    void SetTickBias(u64 bias) noexcept {
+        tick_bias = bias;
+    }
+
     /// Tick of the most recent commit into this buffer, 0 if never used.
     [[nodiscard]] u64 LastTick() const noexcept {
         return last_tick;
@@ -181,6 +187,7 @@ private:
     u64 offset{};
     u64 mapped_size{};
     u64 last_tick{};
+    u64 tick_bias{};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;
