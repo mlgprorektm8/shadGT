@@ -152,7 +152,9 @@ static std::string TakePhaseTimes() {
     static constexpr std::array<const char*, size_t(Phase::Count)> Names = {
         "setup",    "pipeline",   "targets",         "vtx/idx",     "buffers",
         "textures", "rebind",     "begin-rendering", "descriptors", "dynamic",
-        "record",   "draw-total", "dispatch-total",  "submit"};
+        "record",   "draw-total", "dispatch-total",  "submit",      "[tex-find]",
+        "[tex-view]", "[tex-transit]", "[buf-obtain]", "[read-ahead-eval]",
+        "[program-match]"};
     static u64 last_tsc = PhaseTimer::ReadTsc();
     static auto last_time = std::chrono::steady_clock::now();
     const u64 tsc = PhaseTimer::ReadTsc();

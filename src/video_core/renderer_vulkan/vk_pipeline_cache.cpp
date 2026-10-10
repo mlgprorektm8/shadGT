@@ -810,6 +810,7 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         // A queued state holds every register a key is built from; the others keep these values.
         queued_state_regs = std::make_unique<AmdGpu::Regs>(liverpool->DrawRegs());
     }
+    Common::PhaseTimer eval_timer{Common::Phase::ReadAheadEval};
     const auto key = graphics_key;
     u32 evaluated = 0;
     u32 started = 0;
@@ -1957,6 +1958,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     }
 
     auto& program = it_pgm.value();
+    std::optional<Common::PhaseTimer> match_timer{std::in_place, Common::Phase::ProgramMatch};
     // Diagnostic for runaway permutations: why each existing permutation was rejected.
     std::string mismatch_reasons;
     for (size_t perm_idx = 0; perm_idx < program->modules.size(); ++perm_idx) {
@@ -1998,6 +2000,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         }
         return std::make_tuple(&info, permutation.module, HashCombine(params.hash, perm_idx));
     }
+    match_timer.reset();
 
     // PERF-013: runtime permutations used to take the next free slot of this session, which
     // depends on which stored permutations were preloaded. A slot already used in the stored

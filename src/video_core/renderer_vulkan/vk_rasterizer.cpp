@@ -1867,8 +1867,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 VideoCore::g_gpu_write_kind = "shader";
                 VideoCore::g_gpu_write_tag = stage.pgm_hash;
-                const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                const auto [buffer, offset] = [&] {
+                    Common::PhaseTimer obtain_timer{Common::Phase::BufObtain};
+                    return buffer_cache.ObtainBuffer(vsharp.base_address, size, desc.is_written,
+                                                     desc.is_formatted);
+                }();
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -2117,7 +2120,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 desc.view_info.range.extent.levels = 1;
             }
 
-            image_id = texture_cache.FindImage(desc);
+            {
+                Common::PhaseTimer find_timer{Common::Phase::TexFindImage};
+                image_id = texture_cache.FindImage(desc);
+            }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -2157,7 +2163,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             auto& image = texture_cache.GetImage(image_id);
+            std::optional<Common::PhaseTimer> part_timer{std::in_place, Common::Phase::TexView};
             auto& image_view = texture_cache.FindTexture(image_id, desc);
+            part_timer.emplace(Common::Phase::TexTransit);
             const auto binding = image.binding;
 
             if (binding.is_target && image.info.props.is_depth) {

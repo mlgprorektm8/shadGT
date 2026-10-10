@@ -67,6 +67,13 @@ enum class Phase : u32 {
     DrawTotal,
     DispatchTotal,
     Submit,
+    // PERF-040: parts of the steps above (counted in them as well).
+    TexFindImage,
+    TexView,
+    TexTransit,
+    BufObtain,
+    ReadAheadEval,
+    ProgramMatch,
     Count,
 };
 std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();
