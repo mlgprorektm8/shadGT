@@ -363,9 +363,9 @@ bool Liverpool::WaitTurnsEnabled() {
     return enabled;
 }
 
-void Liverpool::Record(Common::UniqueFunction<void>&& work) {
+void Liverpool::Record(Common::UniqueFunction<void>&& work, const char* reason) {
     if (early_fences_mode) {
-        UnsafeWindow("command");
+        UnsafeWindow(reason);
     }
     if (draw_pipe) {
         draw_pipe->Push(std::move(work));
@@ -596,7 +596,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                 UnsafeWindow("draw not captured");
             }
         } else {
-            UnsafeWindow(compute ? "dispatch not selected ahead" : "draw not selected ahead");
+            UnsafeWindow(!direct_draw ? (compute ? "indirect dispatch" : "indirect draw")
+                         : compute ? "dispatch not selected ahead"
+                                   : "draw not selected ahead (quad list)");
         }
     }
     // PERF-067: with the buffer stage, the selection and the buffers obtained for it are shared
@@ -981,7 +983,7 @@ void Liverpool::ProcessCommands() {
         }
         if (record) {
             ++commands_recorded;
-            Record(std::move(callback));
+            Record(std::move(callback), "queued command (flip, fault)");
         } else {
             callback();
         }
@@ -1103,7 +1105,8 @@ void Liverpool::Process(std::stop_token stoken) {
         // PERF-031: the GPU is idle once everything decoded so far is recorded.
         if (submit_done) {
             submit_done = false;
-            Record([this] {
+            // PERF-063: submits the recorded work; reads and writes no guest memory.
+            RecordSafe([this] {
                 VideoCore::EndCapture();
                 if (rasterizer) {
                     rasterizer->OnSubmit();
@@ -1332,7 +1335,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
-                    Record(
+                    RecordSafe(
                         [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); });
                     break;
                 }
@@ -1952,7 +1955,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto dma = *dma_packet;
                 const bool to_memory =
                     dma.dst_sel == DmaDataDst::Memory || dma.dst_sel == DmaDataDst::MemoryUsingL2;
-                Record([this, dma] {
+                RecordDma([this, dma] {
                     const auto* dma_data = &dma;
                     if (dma_data->src_sel == DmaDataSrc::Data &&
                         dma_data->dst_sel == DmaDataDst::Gds) {
@@ -2052,7 +2055,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::MemSemaphore: {
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
                 if (mem_semaphore->IsSignaling()) {
-                    Record([semaphore = *mem_semaphore] { semaphore.Signal(); });
+                    Record([semaphore = *mem_semaphore] { semaphore.Signal(); }, "memory semaphore");
                 } else {
                     GpuWaitDiagnostics diagnostics;
                     const auto wait_start = std::chrono::steady_clock::now();
@@ -2555,26 +2558,26 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             // PERF-031: copies run on the recorder thread in order with the dispatches around them.
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
-                Record(
+                RecordDma(
                     [this, dst = dma_data->dst_addr_lo, bytes = dma_data->NumBytes(),
                      value = dma_data->data] { rasterizer->FillBuffer(dst, bytes, value, true); });
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        dma_data->dst_sel == DmaDataDst::Gds) {
-                Record([this, dst = dma_data->dst_addr_lo, src = dma_data->SrcAddress<VAddr>(),
+                RecordDma([this, dst = dma_data->dst_addr_lo, src = dma_data->SrcAddress<VAddr>(),
                         bytes = dma_data->NumBytes()] {
                     rasterizer->CopyBuffer(dst, src, bytes, true, false);
                 });
             } else if (dma_data->src_sel == DmaDataSrc::Data &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                Record(
+                RecordDma(
                     [this, dst = dma_data->DstAddress<VAddr>(), bytes = dma_data->NumBytes(),
                      value = dma_data->data] { rasterizer->FillBuffer(dst, bytes, value, false); });
             } else if (dma_data->src_sel == DmaDataSrc::Gds &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                Record([this, dst = dma_data->DstAddress<VAddr>(), src = dma_data->src_addr_lo,
+                RecordDma([this, dst = dma_data->DstAddress<VAddr>(), src = dma_data->src_addr_lo,
                         bytes = dma_data->NumBytes()] {
                     rasterizer->CopyBuffer(dst, src, bytes, false, true);
                 });
@@ -2592,7 +2595,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     header->type == 3 && header->type3.opcode == PM4ItOpcode::DispatchDirect) {
                     indirect_patches.emplace_back(header, src_addr);
                 } else {
-                    Record([this, dst_addr, src_addr, num_bytes] {
+                    RecordDma([this, dst_addr, src_addr, num_bytes] {
                         rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
                     });
                 }
@@ -2726,7 +2729,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
             if (mem_semaphore->IsSignaling()) {
-                Record([semaphore = *mem_semaphore] { semaphore.Signal(); });
+                Record([semaphore = *mem_semaphore] { semaphore.Signal(); }, "memory semaphore");
             } else {
                 const auto wait_start = std::chrono::steady_clock::now();
                 if (!mem_semaphore->Signaled()) {

@@ -471,7 +471,10 @@ private:
     void ReportDrawPipe();
     void VerifyRecorderRegs(const Regs& expected);
     /// Runs work on the recorder thread behind everything queued before it (inline without one).
-    void Record(Common::UniqueFunction<void>&& work);
+    void Record(Common::UniqueFunction<void>&& work, const char* reason = "command");
+    void RecordDma(Common::UniqueFunction<void>&& work) {
+        Record(std::move(work), "dma");
+    }
     /// PERF-063: queues work that reads no guest memory and writes none the CPU reads
     /// (submission bookkeeping, markers, fence-ordered waits); it keeps the window safe.
     void RecordSafe(Common::UniqueFunction<void>&& work);
