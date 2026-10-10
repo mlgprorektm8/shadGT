@@ -110,6 +110,8 @@ private:
     /// PERF-034: with the draw pipe, starts builds for the upcoming draw states the command
     /// thread queued. During a draw (`restore`), its key is computed again afterwards.
     void BuildQueuedStates(const DrawIndirectParams params, bool restore);
+    /// PERF-038: claims a build nobody started, so it is never built; false if one started.
+    static bool CancelBuild(PipelineBuild& build);
     /// PERF-038: queues a stored pipeline's build behind all other builds.
     void QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build);
     /// PERF-038: on this thread, between draws: takes stored pipelines the reader thread

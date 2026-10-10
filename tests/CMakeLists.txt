@@ -332,6 +332,7 @@ set(GCN_TEST_SOURCES
     test_dynamic_readconst.cpp
     test_resource_patching.cpp
     test_color_export.cpp
+    test_srt_walker_registry.cpp
 )
 
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})

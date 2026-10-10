@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
@@ -69,6 +70,10 @@ PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size, u64 key) {
     // instead of appending another copy to the fixed-size code buffer. Only that first copy is
     // ever executed; later duplicates are discarded by the pipeline cache.
     static std::unordered_map<u64, std::vector<std::pair<const u8*, size_t>>> registered;
+    // The code buffer and this map are shared; PERF-038's background reader once decoded shader
+    // metadata on its own thread, corrupting both (a spinning reader, then a crash on a draw).
+    static std::mutex mutex;
+    std::scoped_lock lk{mutex};
     if (key != 0) {
         for (const auto& [code, code_size] : registered[key]) {
             if (code_size == size && std::memcmp(code, ptr, size) == 0) {

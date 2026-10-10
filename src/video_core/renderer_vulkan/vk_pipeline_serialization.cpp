@@ -76,6 +76,34 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
                                        fmt::format("g_{:#018x}", hash), ar.TakeOff());
 }
 
+bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx) {
+    // The layout LoadShaderMeta reads: versions, permutation hash and index, the
+    // specialization, then the shader info, which starts with InfoPersistent.
+    Serialization::Archive ar{std::move(blob)};
+    Serialization::Reader meta{ar};
+    u32 meta_version{};
+    meta.Read(meta_version);
+    if (meta_version != Serialization::ShaderMetaVersion &&
+        meta_version != Serialization::ShaderMetaVersionWithoutResourceUsage &&
+        meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags) {
+        return false;
+    }
+    u32 binary_version{};
+    meta.Read(binary_version);
+    if (binary_version != Serialization::ShaderBinaryVersion) {
+        return false;
+    }
+    u64 perm_hash{};
+    meta.Read(perm_hash);
+    meta.Read(perm_idx);
+    Shader::StageSpecialization spec{};
+    spec.Deserialize(ar);
+    alignas(Shader::InfoPersistent) std::array<u8, sizeof(Shader::InfoPersistent)> persistent;
+    meta.Read(persistent.data(), persistent.size());
+    pgm_hash = reinterpret_cast<const Shader::InfoPersistent*>(persistent.data())->pgm_hash;
+    return true;
+}
+
 bool LoadStoredGraphicsPipeline(std::vector<u8>&& blob, GraphicsPipelineKey& key,
                                 GraphicsPipeline::SerializationSupport& sdata) {
     if (blob.size() < 2 * sizeof(u32) + sizeof(GraphicsPipelineKey)) {

@@ -20,6 +20,9 @@ void RegisterShaderMeta(const Shader::Info& info,
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
                     Shader::StageSpecialization& spec, size_t& perm_idx);
+/// PERF-038: the program hash and permutation index of stored shader metadata, without decoding
+/// the rest (decoding registers SRT walker code, which only the GPU thread may do).
+bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx);
 /// PERF-038: a stored graphics pipeline of the current key version (others are skipped).
 bool LoadStoredGraphicsPipeline(std::vector<u8>&& blob, GraphicsPipelineKey& key,
                                 GraphicsPipeline::SerializationSupport& sdata);

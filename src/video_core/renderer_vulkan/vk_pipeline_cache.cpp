@@ -684,6 +684,16 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(
     return build;
 }
 
+bool PipelineCache::CancelBuild(PipelineBuild& build) {
+    // A worker may already have taken the job and wait in FinishBuild for whoever claimed the
+    // build; release it, the build stays empty.
+    if (build.started.exchange(true)) {
+        return false;
+    }
+    build.promise.set_value();
+    return true;
+}
+
 void PipelineCache::QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build) {
     if (!build_workers) {
         build_workers = std::make_unique<PipelineBuildWorkers>();
@@ -831,7 +841,7 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
             pending != pending_builds.end()) {
             // PERF-038: a stored pipeline still waiting in the background queue is needed soon;
             // build it now from this draw's state instead.
-            if (pending->second->preloading && !pending->second->started.exchange(true)) {
+            if (pending->second->preloading && CancelBuild(*pending->second)) {
                 pending.value() = StartPipelineBuild(false);
                 ++prewarm_stats.promoted;
                 ++started;
@@ -937,7 +947,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 RegisterPipelineData(graphics_key, pipeline_hash, sdata);
                 return it->second.get();
             }
-            if (!stored->started.exchange(true)) {
+            if (CancelBuild(*stored)) {
                 // Not started in the background yet: built now the usual way.
                 pending_builds.erase(pending);
                 pending = pending_builds.end();
@@ -1645,25 +1655,26 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
                 std::vector<u8> meta_blob;
                 store.Load(Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", perm_hash),
                            meta_blob);
-                Shader::Info info{};
-                Shader::StageSpecialization spec{};
-                spec.info = &info;
+                // Only the program hash and index: the full decode is the GPU thread's
+                // (ApplyStoredListing), as it registers SRT walker code.
+                u64 pgm_hash{};
                 size_t perm_idx{};
-                Serialization::Archive meta{std::move(meta_blob)};
-                if (meta.SizeBytes() < 24 || !LoadShaderMeta(meta, info, spec, perm_idx) ||
-                    HashCombine(info.pgm_hash, perm_idx) != perm_hash) {
+                if (meta_blob.size() < 24 ||
+                    !PeekShaderMeta(std::move(meta_blob), pgm_hash, perm_idx) ||
+                    HashCombine(pgm_hash, perm_idx) != perm_hash) {
                     valid = false;
                     break;
                 }
-                record->pgm[stage] = info.pgm_hash;
+                record->pgm[stage] = pgm_hash;
                 record->perm[stage] = perm_idx;
-                if (listed.insert(info.pgm_hash).second) {
-                    record->listings.push_back(ReadStoredListing(info.pgm_hash));
+                if (listed.insert(pgm_hash).second) {
+                    record->listings.push_back(ReadStoredListing(pgm_hash));
                 }
                 store.Load(Storage::BlobType::ShaderBinary,
-                           fmt::format("{:#018x}_{}", info.pgm_hash, perm_idx), record->spv[stage]);
+                           fmt::format("{:#018x}_{}", pgm_hash, perm_idx), record->spv[stage]);
             }
-        } catch (const Common::RecoverableFailure&) {
+        } catch (const std::exception&) {
+            // RecoverableFailure, or a corrupt entry (std::bitset rejects bad text).
             valid = false;
         }
         if (!valid) {
