@@ -272,7 +272,8 @@ private:
 
     bool SynchronizeMetadata(const Buffer* arena, VAddr device_addr, u32 size);
 
-    void SynchronizeMemoryFromImage(VAddr device_addr, u32 size);
+    /// Returns whether any image overlaps [device_addr, device_addr + size).
+    bool SynchronizeMemoryFromImage(VAddr device_addr, u32 size);
     /// DIAG-028: records the guest bytes of watched pages as they are uploaded.
     void RecordWatchedUploads(VAddr start, VAddr end);
     /// DIAG-029: the recorded GPU writes overlapping a range.

@@ -731,10 +731,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     // ranges this write adds.
     ApplyCompletedReadbacks();
     ++Common::GetWorkCounters().obtain_buffer;
-    SynchronizeMemoryFromImage(device_addr, size);
+    const bool images_overlap = SynchronizeMemoryFromImage(device_addr, size);
+    // PERF-043: with no image over the range, it has no GPU image alias either; the texture
+    // cache is not walked again. -DisablePerf 55 walks it again.
+    static const bool skip_alias_walk = Common::PerfFeatureEnabled(55);
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
-        !HasGpuImageAlias(device_addr, size)) {
+        ((skip_alias_walk && !images_overlap) || !HasGpuImageAlias(device_addr, size))) {
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
@@ -1294,9 +1297,9 @@ bool BufferCache::SynchronizeMetadata(const Buffer* arena, VAddr device_addr, u3
     return false;
 }
 
-void BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
+bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     if (size == 0) {
-        return;
+        return false;
     }
     std::vector<ImageId> image_ids;
     const auto collect = [&](ImageId id, Image&) {
@@ -1306,6 +1309,9 @@ void BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     };
     texture_cache.ForEachImageInRegion(device_addr, size, collect);
     const size_t requested_images = image_ids.size();
+    if (requested_images == 0) {
+        return false;
+    }
     // Full exports must also consider aliases outside the requested buffer slice.
     for (size_t i = 0; i < requested_images; ++i) {
         const auto& image = texture_cache.GetImage(image_ids[i]);
@@ -1376,6 +1382,7 @@ void BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
                 image.info.size.height, device_addr, size);
         }
     }
+    return true;
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
