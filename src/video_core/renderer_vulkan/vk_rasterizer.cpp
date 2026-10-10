@@ -1997,16 +1997,8 @@ void Rasterizer::ResetBindings(bool is_compute) {
         for (const auto id : bound_images) {
             images.push_back(texture_cache.GetImage(id).GetImage());
         }
-        if (!is_compute) {
-            for (const auto& [id, desc] : cb_descs) {
-                if (id) {
-                    images.push_back(texture_cache.GetImage(id).GetImage());
-                }
-            }
-            if (db_desc.first) {
-                images.push_back(texture_cache.GetImage(db_desc.first).GetImage());
-            }
-        }
+        // Render targets are left out: the color slots past the draw's targets keep ids of
+        // images that may be gone.
         runtime.DiagBatchDraw(buffers, images);
     }
     bound_images.clear();
