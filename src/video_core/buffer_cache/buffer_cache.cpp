@@ -846,11 +846,14 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
     }
     scheduler.DeferPriorityOperation([this, fault, arena_base] {
         fault->download.buffer->Invalidate(fault->download.offset, fault->download.size);
+        std::scoped_lock lk{fault_downloads_mutex};
         for (const auto& copy : fault->copies) {
-            auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-            memory->TryWriteBacking(
-                dst_addr, fault->download.mapped + (copy.dstOffset - fault->download.offset),
-                copy.size);
+            const VAddr start = arena_base + copy.srcOffset;
+            const u8* src = fault->download.mapped + (copy.dstOffset - fault->download.offset);
+            for (const auto& [s, e] : PartsWithoutNewerWrites(start, start + copy.size,
+                                                              fault->released)) {
+                memory->TryWriteBacking(std::bit_cast<u8*>(s), src + (s - start), e - s);
+            }
         }
         fault->applied.store(true, std::memory_order_release);
         fault->done.release();
@@ -870,9 +873,22 @@ void BufferCache::FinishFaultFlush(FaultDownload& fault) {
         }
     }
     const std::span<const std::pair<VAddr, VAddr>> newer_writes{newer.data(), newer.size()};
+    std::vector<std::pair<VAddr, VAddr>> released;
     for (const auto& [start, end] : fault.ranges) {
         for (const auto& [s, e] : PartsWithoutNewerWrites(start, end, newer_writes)) {
             gpu_modified_ranges.Subtract(s, e - s);
+            released.emplace_back(s, e);
+        }
+    }
+    {
+        // Later fault downloads of these bytes that have not reached guest memory yet hold the
+        // same GPU bytes; once this flush returns the CPU may write them, so they skip them.
+        std::scoped_lock lk{fault_downloads_mutex};
+        for (const auto& other : fault_downloads) {
+            if (other.get() != &fault && other->tick >= fault.tick &&
+                !other->applied.load(std::memory_order_acquire)) {
+                other->released.insert(other->released.end(), released.begin(), released.end());
+            }
         }
     }
     if (newer.empty()) {
@@ -1249,8 +1265,32 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         });
     };
     // PERF-046: the hot pages of all ranges are hashed first, on several threads when many.
-    boost::container::small_vector<std::pair<VAddr, u16>, 64> hot;
-    boost::container::small_vector<size_t, 8> range_end; // one past each range's hot pages
+    // PERF-053: into scratch vectors kept by the thread (thousands of hot pages per call), and
+    // looked up under one hold of the record lock.
+    struct HotScratch {
+        std::vector<std::pair<VAddr, u16>> hot;
+        std::vector<size_t> range_end; // one past each range's hot pages
+        std::vector<u64> hashes;
+        std::vector<size_t> misses;
+        std::vector<u64> miss_hashes;
+        std::vector<u8> unchanged;
+        bool in_use = false;
+    };
+    static thread_local HotScratch thread_scratch;
+    HotScratch local_scratch;
+    HotScratch& scratch = thread_scratch.in_use ? local_scratch : thread_scratch;
+    scratch.in_use = true;
+    struct Release {
+        HotScratch& scratch;
+        ~Release() {
+            scratch.in_use = false;
+        }
+    } release{scratch};
+    auto& hot = scratch.hot;
+    auto& range_end = scratch.range_end;
+    auto& hot_hashes = scratch.hashes;
+    hot.clear();
+    range_end.clear();
     for (const auto& [addr, range_size] : ranges) {
         memory_tracker->ForEachHotPage(addr, range_size, [&](VAddr page, u16 generation) {
             if (page >= addr && page + BYTES_PER_PAGE <= addr + range_size) {
@@ -1259,12 +1299,13 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         });
         range_end.push_back(hot.size());
     }
-    boost::container::small_vector<u64, 64> hot_hashes(hot.size());
+    hot_hashes.resize(hot.size());
     if (prehasher && !hot.empty()) {
         // PERF-049: hashes taken ahead in the current epoch; the rest are hashed here.
         const u32 epoch = g_upload_epoch.load(std::memory_order_acquire);
         const auto batch = prehasher->Current();
-        boost::container::small_vector<size_t, 64> misses;
+        auto& misses = scratch.misses;
+        misses.clear();
         for (size_t i = 0; i < hot.size(); ++i) {
             if (!batch || !batch->Lookup(hot[i].first, epoch, hot_hashes[i])) {
                 misses.push_back(i);
@@ -1272,7 +1313,8 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
         prehashed_hits += hot.size() - misses.size();
         prehashed_misses += misses.size();
-        boost::container::small_vector<u64, 64> miss_hashes(misses.size());
+        auto& miss_hashes = scratch.miss_hashes;
+        miss_hashes.resize(misses.size());
         HashPages(misses.size(), [&](size_t j) { return hot[misses[j]].first; },
                   std::span<u64>{miss_hashes.data(), miss_hashes.size()});
         for (size_t j = 0; j < misses.size(); ++j) {
@@ -1282,6 +1324,16 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         HashPages(hot.size(), [&](size_t i) { return hot[i].first; },
                   std::span<u64>{hot_hashes.data(), hot_hashes.size()});
     }
+    auto& unchanged_pages = scratch.unchanged;
+    unchanged_pages.resize(hot.size());
+    if (!hot.empty()) {
+        std::scoped_lock lk{uploaded_pages_mutex};
+        for (size_t i = 0; i < hot.size(); ++i) {
+            unchanged_pages[i] =
+                uploaded_page_contents.Unchanged(hot[i].first, hot[i].second, hot_hashes[i]);
+        }
+    }
+    u64 unchanged_count = 0;
     size_t hot_index = 0;
     for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
         const auto [addr, range_size] = ranges[range_index];
@@ -1289,17 +1341,12 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         for (; hot_index < range_end[range_index]; ++hot_index) {
             const auto [page, generation] = hot[hot_index];
             const u64 hash = hot_hashes[hot_index];
-            bool unchanged;
-            {
-                std::scoped_lock lk{uploaded_pages_mutex};
-                unchanged = uploaded_page_contents.Unchanged(page, generation, hash);
-            }
-            if (unchanged) {
+            if (unchanged_pages[hot_index]) {
                 if (page > cursor) {
                     upload_range(cursor, page - cursor);
                 }
                 cursor = page + BYTES_PER_PAGE;
-                ++hot_pages_unchanged;
+                ++unchanged_count;
             } else if (whole_page_from_guest(page)) {
                 hot_uploads.push_back({page, generation, hash});
             } else {
@@ -1311,6 +1358,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             upload_range(cursor, addr + range_size - cursor);
         }
     }
+    hot_pages_unchanged += unchanged_count;
     if (!copies.empty()) {
         for (const auto& copy : copies) {
             RecordWatchedUploads(copy.dstOffset, copy.dstOffset + copy.size);
@@ -1512,6 +1560,9 @@ void BufferCache::RefreshReadPages(VAddr address, u64 size, u64 shader_hash, boo
                         DescribeGpuWriters(address, size));
         }
     }
+    // PERF-049: hashes taken ahead in the current epoch are used here too.
+    const u32 epoch = g_upload_epoch.load(std::memory_order_acquire);
+    const auto prehashed = prehasher ? prehasher->Current() : nullptr;
     for (VAddr page = Common::AlignDown(address, WatchedPageSize); page < address + size;
          page += WatchedPageSize) {
         // FIX-038: ClampRangeSize does not look up mappings below 1 GB, and IsValidMapping
@@ -1522,7 +1573,11 @@ void BufferCache::RefreshReadPages(VAddr address, u64 size, u64 shader_hash, boo
             continue;
         }
         ++stats.checked;
-        const u64 hash = XXH3_64bits(std::bit_cast<const void*>(page), WatchedPageSize);
+        static_assert(WatchedPageSize == BYTES_PER_PAGE);
+        u64 hash;
+        if (!prehashed || !prehashed->Lookup(page, epoch, hash)) {
+            hash = XXH3_64bits(std::bit_cast<const void*>(page), WatchedPageSize);
+        }
         const auto [it, inserted] = vertex_page_hashes.try_emplace(page >> WatchedPageBits, hash);
         if (inserted) {
             // What the GPU copy holds is unknown; upload it so the next check has a reference.

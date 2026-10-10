@@ -142,6 +142,11 @@ public:
     /// (-DisablePerf 62 queues it like any command). DIAG-050 times the wait.
     void SendFaultCommand(Common::UniqueFunction<void>&& func);
 
+    /// PERF-054: a fault on the command thread is flushed like a game thread's (urgent work on
+    /// the recorder) instead of draining every decoded job first, unless the command thread owns
+    /// the caches already. -DisablePerf 65 drains.
+    bool CommandThreadFaultIsUrgent();
+
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
         if constexpr (wait_done) {

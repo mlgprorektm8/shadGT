@@ -199,6 +199,9 @@ private:
         Vulkan::StagingBufferRef download{};
         boost::container::small_vector<vk::BufferCopy, 4> copies;
         boost::container::small_vector<std::pair<VAddr, VAddr>, 4> ranges;
+        /// Bytes an earlier fault released before this one reached guest memory: the CPU may
+        /// have written them since, so they are not written again (fault_downloads_mutex).
+        std::vector<std::pair<VAddr, VAddr>> released;
         std::atomic<bool> applied{};
         std::binary_semaphore done{0};
     };

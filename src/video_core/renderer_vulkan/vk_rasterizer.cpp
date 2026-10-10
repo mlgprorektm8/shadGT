@@ -3367,6 +3367,10 @@ bool Rasterizer::IsGpuThread() const {
     return liverpool->IsGpuThread(std::this_thread::get_id());
 }
 
+bool Rasterizer::CommandThreadFaultIsUrgent() {
+    return liverpool->CommandThreadFaultIsUrgent();
+}
+
 void Rasterizer::OnGpuThreadFault() {
     liverpool->OnGpuThreadFault();
 }

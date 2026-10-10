@@ -56,6 +56,12 @@ public:
     /// Command thread: gives up ownership of the caches taken by Drain (before it goes idle).
     void ReleaseExclusive();
 
+    /// Command thread: whether it owns the caches after a drain.
+    bool IsExclusive() {
+        std::scoped_lock lk{mutex};
+        return exclusive;
+    }
+
     bool OnRecorderThread() const {
         return std::this_thread::get_id() == recorder_id.load(std::memory_order_acquire);
     }

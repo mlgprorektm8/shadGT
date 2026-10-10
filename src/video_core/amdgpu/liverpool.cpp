@@ -608,6 +608,12 @@ void Liverpool::SendFaultCommand(Common::UniqueFunction<void>&& func) {
     }
 }
 
+bool Liverpool::CommandThreadFaultIsUrgent() {
+    static const bool urgent = Common::PerfFeatureEnabled(62) && Common::PerfFeatureEnabled(65);
+    return urgent && Pipelined() && std::this_thread::get_id() == gpu_id &&
+           !draw_pipe->IsExclusive();
+}
+
 void Liverpool::ProcessCommands() {
     if (draw_pipe) {
         draw_pipe->RunUrgentIfExclusive(); // PERF-050

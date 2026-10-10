@@ -166,6 +166,7 @@ public:
     /// The command processor thread or the draw pipe's recorder thread (PERF-031).
     bool IsGpuThread() const;
     void OnGpuThreadFault();
+    bool CommandThreadFaultIsUrgent();
 #ifdef __linux__
     bool IsGpuThreadTid(u32 tid) const;
 #endif

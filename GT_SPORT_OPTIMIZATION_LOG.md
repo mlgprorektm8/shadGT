@@ -1487,3 +1487,42 @@ The command thread was 9-14% busy.
 - **Shared filter.** FilterDraw's decision is shared through ClassifyDraw.
 - **Self-check.** Every 64th selection is compared with one made on the recorder; a difference is logged and the recorder's result used.
 - **Logging.** The 2 s `PERF-047 pipelines` line counts the cases, and `[select-ahead]` times the command thread's share.
+
+## Game-thread profile, and PERF-049 to PERF-054 (October 10, branch `perf-parallel-gpu`)
+
+Lance's run with DIAG-048 game-thread sampling and DIAG-049 GPU-thread fault sites was a race at about 25 FPS.
+
+- **The game's threads were about 1% busy each.** The GPU was 31-47% busy.
+- **The recorder was the critical path, about 31 ms per frame.**
+  - Draws took about 17 ms, about 11 ms of it in the buffer cache.
+  - Dispatches took about 4 ms.
+  - About 6 ms went to `Scheduler::Finish` inside fault downloads.
+  - It was idle about 22% of the time.
+- **Game-thread faults.** Four pages fault about once per frame each. In each case the CPU writes bytes next to GPU-written bytes (GDS copies, shader 0x36e98369 results).
+  - Each flush waited behind every decoded job (often more than 1,000), then for the GPU.
+  - The game's job threads spent about 0.67 of a thread blocked in host condvar waits.
+- **Recorder faults.** All of them were compute RELEASE_MEM fence stores into tracked pages.
+- **Command thread.** About 8% of its time went to fault drains; the site is not known yet.
+
+### What changed
+
+All of these are on `perf-parallel-gpu`; the number in brackets is the `-DisablePerf` id.
+
+- **PERF-049 [61]: hot pages hashed ahead.** At each new upload epoch, a background thread hashes the PERF-033 recorded pages.
+  - A hash is used only in the epoch it was taken in, the same guarantee as hashing on the recorder. RefreshReadPages uses the hashes too.
+  - Hashing happens under a shared hold of the memory map lock, only for mapped pages, and not in precise readback mode.
+- **PERF-050 [62]: urgent fault flushes.** A game thread's fault flush runs on the recorder between two jobs, instead of behind the decoded backlog.
+  - After a drain, the command thread owns the caches until its next push or until it goes idle. It runs urgent work itself in ProcessCommands.
+  - Unit tests check that urgent work runs ahead of the backlog and never overlaps the drained caller.
+  - **Semantic change.** The download holds the GPU writes recorded so far, not all decoded ones.
+  - DIAG-050 reports the wait.
+- **PERF-051 [63]: compute fence values through the backing.** Compute fence values are written through the backing, as graphics EOP/EOS fences already were.
+- **PERF-052 [64]: GPU waits off the recorder.** For a game-thread fault, the recorder records the download and submits; the faulting thread waits for the GPU.
+  - The bytes reach guest memory on the scheduler's completion thread, in GPU order with async readbacks.
+  - A second short job then releases the ranges that no newer GPU write touched. The newer-write cut-out is unit-tested against a byte map.
+  - Bytes released by an earlier fault are skipped by later pending downloads, which keeps a CPU store made in between.
+  - A synchronous download waits for older fault downloads first.
+- **PERF-053: less churn in SynchronizeMemory.** Scratch vectors are kept per thread, and the record lock is taken once per call instead of per page.
+- **PERF-054 [65]: command-thread faults as urgent work.** A command-thread fault is flushed as urgent work instead of draining the recorder, unless the command thread already owns the caches.
+
+Literal multi-threaded recording is not part of this. Each draw's cache work changes the state the next draw depends on, so recording draws on several threads would need concurrent buffer and texture caches.

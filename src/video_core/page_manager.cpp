@@ -519,13 +519,18 @@ struct SignalImpl : public PageManager::Impl {
                                 reinterpret_cast<u64>(Common::GetRip(context))),
                             Common::SamplingProfiler::DescribeStack());
             }
+        }
+        // PERF-054: the command thread's fault is flushed as urgent work on the recorder,
+        // which then holds the caches; otherwise this thread drains the recorder and uses them.
+        const bool assume_locks = is_gpu_thread && !rasterizer->CommandThreadFaultIsUrgent();
+        if (assume_locks) {
             rasterizer->OnGpuThreadFault();
         }
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread,
+            return rasterizer->InvalidateMemory(addr, size, assume_locks,
                                                 ExactWriteSize(context, addr));
         } else {
-            return rasterizer->ReadMemory(addr, size, is_gpu_thread);
+            return rasterizer->ReadMemory(addr, size, assume_locks);
         }
         return false;
     }
