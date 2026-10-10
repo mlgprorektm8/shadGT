@@ -479,6 +479,21 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
                 // An open-ended V# is bound up to the end of its mapping: copying that for
                 // every window cost more than the early fence saved (October 10 benchmark).
                 capture_failure = "open-ended buffer";
+                static std::atomic<u32> logged{};
+                if (vsharp.base_address != 0 && IsMappedStart(vsharp.base_address) &&
+                    logged.fetch_add(1) < 40) {
+                    const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                    u64 unwatched = 0;
+                    for (VAddr page = Common::AlignDown(vsharp.base_address, 4096);
+                         page < vsharp.base_address + std::min<u64>(size, 256_MB); page += 4096) {
+                        unwatched += page_manager.IsUnwatched(page);
+                    }
+                    LOG_WARNING(Render_Vulkan,
+                                "PERF-063: open-ended V# shader {}_{:#x} binding {} base {:#x} "
+                                "stride {} bound {:#x} bytes, {} of its pages unprotected",
+                                info->hw_stage, info->pgm_hash, &desc - info->buffers.data(),
+                                u64(vsharp.base_address), vsharp.GetStride(), size, unwatched);
+                }
                 return false;
             }
             capture_range(vsharp.base_address, vsharp.GetSize());
