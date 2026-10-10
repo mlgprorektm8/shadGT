@@ -36,6 +36,7 @@ DrawPipe::~DrawPipe() {
 
 void DrawPipe::Push(Work&& work) {
     std::unique_lock lk{mutex};
+    exclusive = false;
     if (queue.size() >= max_pending) {
         ++stats.push_waits;
         done_cv.wait(lk, [this] { return queue.size() < max_pending; });
@@ -55,14 +56,71 @@ void DrawPipe::Drain() {
     }
     std::unique_lock lk{mutex};
     ++stats.drains;
-    if (finished == pushed) {
+    if (finished == pushed && !urgent_running) {
+        exclusive = true;
         return;
     }
     ++stats.drains_that_waited;
     const auto start = std::chrono::steady_clock::now();
     const u64 target = pushed;
-    done_cv.wait(lk, [this, target] { return finished >= target; });
+    done_cv.wait(lk, [this, target] { return finished >= target && !urgent_running; });
+    exclusive = true;
     stats.drain_wait_us += MicrosecondsSince(start);
+}
+
+void DrawPipe::PushUrgent(Work&& work) {
+    std::scoped_lock lk{mutex};
+    urgent.push_back(std::move(work));
+    has_urgent.store(true, std::memory_order_release);
+    work_cv.notify_all();
+}
+
+void DrawPipe::RunUrgent() {
+    if (!has_urgent.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::deque<Work> jobs;
+    {
+        std::scoped_lock lk{mutex};
+        if (exclusive || urgent.empty()) {
+            return;
+        }
+        jobs.swap(urgent);
+        has_urgent.store(false, std::memory_order_relaxed);
+        urgent_running = true;
+    }
+    for (auto& job : jobs) {
+        job();
+    }
+    std::scoped_lock lk{mutex};
+    urgent_running = false;
+    done_cv.notify_all();
+}
+
+void DrawPipe::RunUrgentIfExclusive() {
+    if (!has_urgent.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::deque<Work> jobs;
+    {
+        std::scoped_lock lk{mutex};
+        if (!exclusive || urgent.empty()) {
+            return;
+        }
+        jobs.swap(urgent);
+        has_urgent.store(false, std::memory_order_relaxed);
+    }
+    for (auto& job : jobs) {
+        job();
+    }
+}
+
+void DrawPipe::ReleaseExclusive() {
+    std::scoped_lock lk{mutex};
+    exclusive = false;
+    if (!urgent.empty()) {
+        work_cv.notify_all();
+    }
 }
 
 DrawPipe::Stats DrawPipe::TakeStats() {
@@ -80,14 +138,21 @@ void DrawPipe::Run(std::stop_token stop) {
 
     std::deque<Work> batch;
     while (true) {
+        RunUrgent();
         {
             std::unique_lock lk{mutex};
             if (queue.empty()) {
                 recorder_waiting = true;
-                work_cv.wait(lk, [&] { return !queue.empty() || stop.stop_requested(); });
+                work_cv.wait(lk, [&] {
+                    return !queue.empty() || (!urgent.empty() && !exclusive) ||
+                           stop.stop_requested();
+                });
                 recorder_waiting = false;
             }
             if (queue.empty()) {
+                if (!urgent.empty() && !stop.stop_requested()) {
+                    continue; // urgent work only
+                }
                 return; // Stopped with nothing left to do.
             }
             // Take what is queued now; new work keeps queueing behind it meanwhile.
@@ -103,6 +168,7 @@ void DrawPipe::Run(std::stop_token stop) {
             batch.pop_front();
             work();
             ++ran;
+            RunUrgent();
         }
         std::scoped_lock lk{mutex};
         finished += ran;

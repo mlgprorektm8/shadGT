@@ -137,6 +137,11 @@ public:
         rasterizer = rasterizer_;
     }
 
+    /// PERF-050: a CPU fault's flush from a game thread; returns once it ran. With the draw pipe
+    /// it runs as soon as the caches are free instead of behind all decoded work
+    /// (-DisablePerf 62 queues it like any command). DIAG-050 times the wait.
+    void SendFaultCommand(Common::UniqueFunction<void>&& func);
+
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
         if constexpr (wait_done) {
@@ -348,6 +353,10 @@ private:
     u64 commands_recorded{};
     // PERF-048: waits on labels another queue writes, found after letting it decode first.
     u64 waits_moved_after_turns{};
+    // DIAG-050: CPU fault flushes and how long the faulting threads waited for them.
+    std::atomic<u64> fault_flushes{};
+    std::atomic<u64> fault_flush_wait_us{};
+    std::atomic<u64> fault_flush_max_us{};
     // DIAG-047: the label a graphics wait drains for, and how often a queue's job writes it then.
     VAddr waited_label{};
     u64 labels_written_while_waiting{};

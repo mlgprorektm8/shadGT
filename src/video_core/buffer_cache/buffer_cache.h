@@ -21,7 +21,6 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
-#include "video_core/buffer_cache/hot_page_prehasher.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/uploaded_pages.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -43,6 +42,8 @@ class StagingBufferPool;
 } // namespace Vulkan
 
 namespace VideoCore {
+
+class HotPagePrehasher; // PERF-049
 
 /// PERF-DIAG-012: what the command thread is doing when it writes GPU memory, for reports.
 inline thread_local const char* g_gpu_write_kind = "unknown";

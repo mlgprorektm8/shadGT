@@ -476,6 +476,7 @@ void Liverpool::RecorderWaitRegMem(const PM4CmdWaitRegMem& wait) {
     const auto start = std::chrono::steady_clock::now();
     rasterizer->FlushForDeferredFences();
     while (!wait.Test(state_regs) && !SatisfiedByPendingFence(rasterizer, &wait)) {
+        draw_pipe->RunUrgent(); // PERF-050: no job is half done here
         std::this_thread::yield();
     }
     VideoCore::BumpUploadEpoch();
@@ -539,6 +540,14 @@ void Liverpool::ReportDrawPipe() {
                                   waits_moved_after_turns);
         waits_moved_after_turns = 0;
     }
+    if (const u64 flushes = fault_flushes.exchange(0); flushes != 0) {
+        const u64 wait_us = fault_flush_wait_us.exchange(0);
+        read_ahead += fmt::format(
+            "; DIAG-050: {} CPU fault flushes, game threads waited {:.1f} ms (avg {:.2f}, max "
+            "{:.1f})",
+            flushes, wait_us / 1000.0, wait_us / 1000.0 / flushes,
+            fault_flush_max_us.exchange(0) / 1000.0);
+    }
     LOG_WARNING(Render,
                 "PERF-031 draw pipe in {:.1f} s: {} jobs, recorder busy {:.0f}%, max queued {}, "
                 "{} full-queue waits; {} waits moved to the recorder; drains {} ({} waited, "
@@ -576,7 +585,33 @@ void Liverpool::OnGpuThreadFault() {
     }
 }
 
+void Liverpool::SendFaultCommand(Common::UniqueFunction<void>&& func) {
+    static const bool urgent = Common::PerfFeatureEnabled(62);
+    const auto start = std::chrono::steady_clock::now();
+    if (draw_pipe && urgent) {
+        std::binary_semaphore sem{0};
+        draw_pipe->PushUrgent([&sem, &func] {
+            func();
+            sem.release();
+        });
+        sem.acquire();
+    } else {
+        SendCommand<true>([&func] { func(); });
+    }
+    const u64 us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - start)
+                                        .count());
+    fault_flushes.fetch_add(1, std::memory_order_relaxed);
+    fault_flush_wait_us.fetch_add(us, std::memory_order_relaxed);
+    u64 max = fault_flush_max_us.load(std::memory_order_relaxed);
+    while (us > max && !fault_flush_max_us.compare_exchange_weak(max, us)) {
+    }
+}
+
 void Liverpool::ProcessCommands() {
+    if (draw_pipe) {
+        draw_pipe->RunUrgentIfExclusive(); // PERF-050
+    }
     if (!num_commands) {
         return;
     }
@@ -617,6 +652,9 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
 
     while (!stoken.stop_requested()) {
+        if (draw_pipe) {
+            draw_pipe->ReleaseExclusive(); // PERF-050: idle; urgent work may run on the recorder
+        }
         {
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,

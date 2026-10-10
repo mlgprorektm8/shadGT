@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <chrono>
+#include <semaphore>
+#include <thread>
 #include <random>
 #include <vector>
 #include <gtest/gtest.h>
@@ -151,4 +154,84 @@ TEST(DrawPipe, StateWrittenBeforeADrainIsVisibleAfterIt) {
         pipe.Drain();
         ASSERT_EQ(value, expected);
     }
+}
+
+// PERF-050: urgent work runs between two queued jobs, not behind all of them.
+TEST(DrawPipe, UrgentWorkRunsBeforeTheQueuedBacklog) {
+    AmdGpu::DrawPipe pipe{nullptr};
+    std::atomic<int> ran{0};
+    std::atomic<bool> release{false};
+    pipe.Push([&] {
+        while (!release.load()) {
+            std::this_thread::yield();
+        }
+        ++ran;
+    });
+    for (int i = 0; i < 200; ++i) {
+        pipe.Push([&] {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds{200};
+            while (std::chrono::steady_clock::now() < until) {
+            }
+            ++ran;
+        });
+    }
+    std::atomic<int> ran_before_urgent{-1};
+    std::binary_semaphore done{0};
+    pipe.PushUrgent([&] {
+        ran_before_urgent = ran.load();
+        done.release();
+    });
+    release = true;
+    done.acquire();
+    EXPECT_LE(ran_before_urgent.load(), 2) << "urgent work waited for the backlog";
+    pipe.Drain();
+    pipe.ReleaseExclusive();
+    EXPECT_EQ(ran.load(), 201);
+}
+
+// PERF-050: after a drain the caller owns the caches: urgent work waits for it (or the caller
+// runs it), and never runs on the recorder at the same time as the caller's own cache use.
+TEST(DrawPipe, UrgentWorkNeverOverlapsTheDrainedCaller) {
+    AmdGpu::DrawPipe pipe{nullptr};
+    std::atomic<int> users{0};
+    std::atomic<bool> overlap{false};
+    const auto use_caches = [&] {
+        if (users.fetch_add(1) != 0) {
+            overlap = true;
+        }
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds{20};
+        while (std::chrono::steady_clock::now() < until) {
+        }
+        users.fetch_sub(1);
+    };
+    std::atomic<bool> stop{false};
+    std::atomic<int> urgent_done{0};
+    std::thread sender{[&] {
+        while (!stop.load()) {
+            std::binary_semaphore sem{0};
+            pipe.PushUrgent([&] {
+                use_caches();
+                sem.release();
+            });
+            sem.acquire();
+            ++urgent_done;
+        }
+    }};
+    for (int round = 0; round < 400; ++round) {
+        for (int i = 0; i < 5; ++i) {
+            pipe.Push(use_caches);
+        }
+        pipe.Drain();
+        use_caches(); // the command thread's own cache use after a drain
+        pipe.RunUrgentIfExclusive();
+        use_caches();
+        if (round % 3 == 0) {
+            pipe.ReleaseExclusive();
+        }
+    }
+    pipe.ReleaseExclusive();
+    stop = true;
+    sender.join();
+    EXPECT_FALSE(overlap.load());
+    EXPECT_GT(urgent_done.load(), 0);
 }

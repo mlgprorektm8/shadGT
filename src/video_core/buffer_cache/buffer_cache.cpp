@@ -19,6 +19,7 @@
 #include "common/io_file.h"
 #include "common/perf_monitor.h"
 #include "core/emulator_settings.h"
+#include "video_core/buffer_cache/hot_page_prehasher.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
@@ -717,7 +718,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (assume_locks) {
         flush_request();
     } else {
-        liverpool->SendCommand<true>(std::move(flush_request));
+        liverpool->SendFaultCommand(std::move(flush_request));
     }
 }
 

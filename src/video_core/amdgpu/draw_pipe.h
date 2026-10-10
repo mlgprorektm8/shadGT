@@ -38,7 +38,23 @@ public:
     void Push(Work&& work);
 
     /// Returns once every job pushed so far has finished. A no-op on the recorder thread.
+    /// PERF-050: the caller (the command thread) then owns the caches until its next Push or
+    /// ReleaseExclusive; urgent work waits for it or is run by it (RunUrgentIfExclusive).
     void Drain();
+
+    /// PERF-050: runs `work` as soon as the caches are free: on the recorder between two jobs
+    /// (not behind the queued ones), or on the command thread while it owns them after a drain.
+    /// Any thread; does not wait.
+    void PushUrgent(Work&& work);
+
+    /// Recorder thread, at a point where no job is half done: runs the queued urgent work.
+    void RunUrgent();
+
+    /// Command thread: runs the queued urgent work if it owns the caches after a drain.
+    void RunUrgentIfExclusive();
+
+    /// Command thread: gives up ownership of the caches taken by Drain (before it goes idle).
+    void ReleaseExclusive();
 
     bool OnRecorderThread() const {
         return std::this_thread::get_id() == recorder_id.load(std::memory_order_acquire);
@@ -67,6 +83,11 @@ private:
     std::condition_variable_any work_cv;
     std::condition_variable_any done_cv;
     std::deque<Work> queue;
+    // PERF-050
+    std::deque<Work> urgent;
+    std::atomic<bool> has_urgent{};
+    bool exclusive{};
+    bool urgent_running{};
     u64 pushed{};
     u64 finished{};
     bool recorder_waiting{};
