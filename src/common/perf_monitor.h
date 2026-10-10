@@ -87,11 +87,21 @@ void NoteGameFrame();
 // tick array are inline instead of function calls.
 inline std::array<std::atomic<u64>, size_t(Phase::Count)> g_phase_ticks{};
 
+/// SHADGT_LEAN=1: no per-draw timing (PhaseTimer) or sampled selection checks (PERF-047),
+/// for the best frame rate a build gives; the 2 s lines then show zero step times.
+bool LeanRun();
+
 class PhaseTimer {
 public:
-    explicit PhaseTimer(Phase phase_) : phase{phase_}, start{ReadTsc()} {}
+    explicit PhaseTimer(Phase phase_) : phase{phase_}, start{Enabled() ? ReadTsc() : 0} {}
     ~PhaseTimer() {
-        g_phase_ticks[size_t(phase)].fetch_add(ReadTsc() - start, std::memory_order_relaxed);
+        if (start != 0) {
+            g_phase_ticks[size_t(phase)].fetch_add(ReadTsc() - start, std::memory_order_relaxed);
+        }
+    }
+    static bool Enabled() {
+        static const bool enabled = !LeanRun();
+        return enabled;
     }
     static u64 ReadTsc() {
 #if defined(_WIN32) || defined(__x86_64__)

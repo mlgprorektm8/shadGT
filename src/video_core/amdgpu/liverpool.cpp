@@ -299,6 +299,12 @@ void Liverpool::StartDrawPipe() {
         verify_interval ? fmt::format(", registers verified every {} draws", verify_interval) : "");
 }
 
+bool Liverpool::WaitTurnsEnabled() {
+    // PERF-048: -DisablePerf 60 drains at once as before.
+    static const bool enabled = Common::PerfFeatureEnabled(60);
+    return enabled;
+}
+
 void Liverpool::Record(Common::UniqueFunction<void>&& work) {
     if (draw_pipe) {
         draw_pipe->Push(std::move(work));
@@ -423,6 +429,9 @@ void Liverpool::RecordLabelWrite(VAddr address, std::vector<u8> value,
         return;
     }
     const u64 job = ++label_jobs;
+    if (waited_label != 0 && address <= waited_label && waited_label < address + value.size()) {
+        ++labels_written_while_waiting; // DIAG-047
+    }
     {
         std::scoped_lock lk{pending_labels_mutex};
         pending_labels[address] = PendingLabel{std::move(value), job};
@@ -517,6 +526,16 @@ void Liverpool::ReportDrawPipe() {
     if (commands_recorded != 0) {
         read_ahead += fmt::format("; {} commands run on the recorder", commands_recorded);
         commands_recorded = 0;
+    }
+    if (labels_written_while_waiting != 0) {
+        read_ahead += fmt::format("; {} waited-on labels written by queued jobs during the wait",
+                                  labels_written_while_waiting);
+        labels_written_while_waiting = 0;
+    }
+    if (waits_moved_after_turns != 0) {
+        read_ahead += fmt::format("; {} waits moved after the other queues decoded",
+                                  waits_moved_after_turns);
+        waits_moved_after_turns = 0;
     }
     LOG_WARNING(Render,
                 "PERF-031 draw pipe in {:.1f} s: {} jobs, recorder busy {:.0f}%, max queued {}, "
@@ -1607,14 +1626,29 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // PERF-031: what is waited on may be written by recorded work (a fence, a copy, a
                 // flip); let the recorder finish before waiting.
                 if (!wait_reg_mem->Test(regs.reg_array)) {
-                    if (PendingLabelSatisfies(*wait_reg_mem)) {
+                    // PERF-048: the label may come from another queue's packets not decoded
+                    // yet. This queue stays at its wait while the others take a few turns;
+                    // a write they queue moves the wait to the recorder.
+                    bool yielded = false;
+                    for (u32 turn = 0; draw_pipe && WaitTurnsEnabled() && turn < 4 &&
+                                       !wait_reg_mem->Test(regs.reg_array) &&
+                                       !PendingLabelSatisfies(*wait_reg_mem);
+                         ++turn) {
+                        yielded = true;
+                        YIELD_GFX();
+                    }
+                    if (!wait_reg_mem->Test(regs.reg_array) &&
+                        PendingLabelSatisfies(*wait_reg_mem)) {
                         // A queued fence writes the label: the recorder waits for it in order
                         // and decoding goes on.
                         ++waits_moved;
+                        waits_moved_after_turns += yielded;
                         Record([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
                         break;
                     }
-                    SyncRecorder("wait reg mem");
+                    if (!wait_reg_mem->Test(regs.reg_array)) {
+                        SyncRecorder("wait reg mem");
+                    }
                 }
                 const bool waited = !wait_reg_mem->Test(regs.reg_array);
                 if (vo_port->IsVoLabel(wait_addr) &&
@@ -1635,6 +1669,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     rasterizer->FlushForDeferredFences();
                 }
                 // Other queues run while this one yields and may record more work.
+                // DIAG-047: a queue's job writing this label meanwhile is counted.
+                waited_label = reinterpret_cast<VAddr>(wait_reg_mem->Address<u32*>());
                 while (!wait_reg_mem->Test(regs.reg_array) &&
                        (SyncRecorder("wait reg mem"),
                         !SatisfiedByPendingFence(rasterizer, wait_reg_mem))) {
@@ -1646,6 +1682,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                     YIELD_GFX();
                 }
+                waited_label = 0;
                 if (waited) {
                     RecordFrontendWait(vo_port->IsVoLabel(wait_addr) ? FrontendWait::GfxVoLabel
                                                                      : FrontendWait::GfxWaitRegMem,
@@ -2180,9 +2217,19 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             const auto wait_start = std::chrono::steady_clock::now();
+            // PERF-048: as for graphics waits, the other queues decode first.
+            bool yielded = false;
+            for (u32 turn = 0; draw_pipe && WaitTurnsEnabled() && turn < 4 &&
+                               !wait_reg_mem->Test(regs.reg_array) &&
+                               !PendingLabelSatisfies(*wait_reg_mem);
+                 ++turn) {
+                yielded = true;
+                YIELD_ASC(vqid);
+            }
             if (!wait_reg_mem->Test(regs.reg_array) && PendingLabelSatisfies(*wait_reg_mem)) {
                 // PERF-031: a queued fence writes the label; the recorder waits for it in order.
                 ++waits_moved;
+                waits_moved_after_turns += yielded;
                 Record([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
                 break;
             }

@@ -262,7 +262,8 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
             ++stats.ahead;
             // Every 64th selection is checked against one made here, from the recorder's
             // registers and memory; a difference is reported and this one used.
-            if (++select_verify_count % 64 != 0) {
+            static const bool verify = !Common::LeanRun();
+            if (!verify || ++select_verify_count % 64 != 0) {
                 return pipeline;
             }
             ++stats.verified;

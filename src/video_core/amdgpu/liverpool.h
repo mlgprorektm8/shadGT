@@ -346,6 +346,12 @@ private:
     u64 waits_moved{};
     // PERF-035: commands from other threads run on the recorder instead of after a drain.
     u64 commands_recorded{};
+    // PERF-048: waits on labels another queue writes, found after letting it decode first.
+    u64 waits_moved_after_turns{};
+    // DIAG-047: the label a graphics wait drains for, and how often a queue's job writes it then.
+    VAddr waited_label{};
+    u64 labels_written_while_waiting{};
+    static bool WaitTurnsEnabled();
     /// Records a job that writes `value` at `address` (a fence or WRITE_DATA).
     void RecordLabelWrite(VAddr address, std::vector<u8> value,
                           Common::UniqueFunction<void>&& work);

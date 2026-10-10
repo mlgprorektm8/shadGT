@@ -174,6 +174,14 @@ static std::string TakePhaseTimes() {
     return out;
 }
 
+bool LeanRun() {
+    static const bool lean = [] {
+        const char* env = std::getenv("SHADGT_LEAN");
+        return env && env[0] == '1';
+    }();
+    return lean;
+}
+
 bool PerfFeatureEnabled(u32 id) {
     static const std::vector<u32> disabled = [] {
         std::vector<u32> ids;
