@@ -1745,7 +1745,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                 vsharp.GetStride(), vsharp.num_records, source);
                 }
             }
-            // FIX-046: a V# over unmapped guest memory would be tracked like the T# at 0xa000.
+            // FIX-046: a V# outside the guest address space would be tracked like the T# at
+            // 0xa000.
             const bool unmapped = !impossible && vsharp.base_address != 0 &&
                                   vsharp.GetSize() != 0 && !IsMappedStart(vsharp.base_address);
             if (unmapped) {
@@ -1753,7 +1754,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (const u32 n = ++rejected; n <= 20 || n % 1000 == 0) {
                     LOG_WARNING(Render_Vulkan,
                                 "FIX-046: buffer {} of stage {:#x} bound empty: {:#x}+{:#x} is "
-                                "outside mapped memory",
+                                "outside the guest address space",
                                 n, stage.pgm_hash, u64(vsharp.base_address), vsharp.GetSize());
                 }
             }
@@ -2153,20 +2154,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const u32 num_bindings = image_desc.NumBindings(stage);
 
         if (!decoded_hit) {
-            // FIX-046: the image must start in mapped guest memory. A garbage T# of GT Sport's
-            // grass compute shader 0xaa3822a3 with base 0xa000 passed the checks above (they
-            // only bound the address to 40 bits), and tracking its 4 MB stopped the emulator
-            // (Protect: "addr 0xa000 out of bounds", October 9 22:03). Like the rejections above,
-            // the binding becomes a null image. Checked when a T# is first decoded; unmapping
-            // memory forgets the decoded T#s (tsharp_epoch).
+            // FIX-046: the image must start inside the guest address space. A garbage T# of
+            // GT Sport's grass compute shader 0xaa3822a3 with base 0xa000 passed the checks
+            // above (they only bound the address to 40 bits), and tracking its 4 MB stopped the
+            // emulator (Protect: "addr 0xa000 out of bounds", October 9 22:03). Like the
+            // rejections above, the binding becomes a null image. Checked when a T# is first
+            // decoded.
             const VideoCore::TextureCache::ImageDesc checked{tsharp, image_desc};
             const auto& info = checked.info;
             if (!IsMappedStart(info.guest_address)) {
                 static std::atomic<u32> rejected{};
                 if (const u32 n = ++rejected; n <= 20 || n % 1000 == 0) {
                     LOG_WARNING(Render_Vulkan,
-                                "FIX-046: rejecting T# {} at {:#x}+{:#x} outside mapped memory, "
-                                "shader={}_{:#x}, sharp_offset={}",
+                                "FIX-046: rejecting T# {} at {:#x}+{:#x} outside the guest address "
+                                "space, shader={}_{:#x}, sharp_offset={}",
                                 n, info.guest_address, info.guest_size, stage.hw_stage,
                                 stage.pgm_hash, image_desc.sharp_fetch.offsets[0]);
                 }
@@ -2789,22 +2790,11 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 }
 
 bool Rasterizer::IsMappedStart(VAddr address) {
-    // FIX-046: a resource whose start is not in mapped guest memory (FIX-027's test). Pages found
-    // mapped are cached, direct-mapped; unmapping clears them.
-    if (const u64 epoch = tsharp_epoch.load(std::memory_order_acquire); epoch != mapped_epoch) {
-        mapped_epoch = epoch;
-        mapped_pages_seen.fill(0);
-    }
-    const u64 page = address >> 12;
-    auto& entry = mapped_pages_seen[(page * 0x9E3779B97F4A7C15ull) >> 54];
-    if (entry == page + 1) {
-        return true;
-    }
-    if (!memory->IsValidMapping(address, 1) || !memory->IsMappedAddress(address)) {
-        return false;
-    }
-    entry = page + 1;
-    return true;
+    // FIX-046: only an address outside the guest address space is refused; that is what stops
+    // page tracking (Protect: "out of bounds"). A first version also required the start to be in
+    // a mapped area (FIX-027's test) and refused GT Sport's 105 MB GPU resource at 0x2900000000
+    // (likely its shadow map; shadows broke in Lance's 22:18 run).
+    return memory->IsValidMapping(address);
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
