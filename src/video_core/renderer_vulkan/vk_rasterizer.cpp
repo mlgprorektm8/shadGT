@@ -475,7 +475,12 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
                 return false;
             }
             const auto vsharp = desc.GetSharp(view);
-            // An open-ended V# (max records) is bound clamped to the mapped memory.
+            if (vsharp.num_records == UINT32_MAX) {
+                // An open-ended V# is bound up to the end of its mapping: copying that for
+                // every window cost more than the early fence saved (October 10 benchmark).
+                capture_failure = "open-ended buffer";
+                return false;
+            }
             capture_range(vsharp.base_address, vsharp.GetSize());
         }
         for (const auto& desc : info->images) {
