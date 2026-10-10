@@ -400,7 +400,7 @@ std::shared_ptr<Common::ReadCapture> Liverpool::TakeCapture() {
     if (capture) {
         capture->Reset();
     } else {
-        capture = new Common::ReadCapture(16384);
+        capture = new Common::ReadCapture(8192);
     }
     return std::shared_ptr<Common::ReadCapture>(capture, [](Common::ReadCapture* c) {
         std::scoped_lock lk{*g_capture_pool_mutex};
@@ -464,6 +464,12 @@ void Liverpool::NoteEarlyFence() {
     fences_delivered.fetch_add(1, std::memory_order_release);
     if (window_capture) {
         std::scoped_lock lk{early_windows_mutex};
+        // Windows the recorder has finished are not guarded any more (their captures go back
+        // to the pool).
+        const u64 done = draw_pipe->FinishedJobs();
+        while (!early_windows.empty() && early_windows.front().end_job <= done) {
+            early_windows.pop_front();
+        }
         early_windows.push_back({window_capture, draw_pipe->PushedJobs()});
     }
     NewWindow();
