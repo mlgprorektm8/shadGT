@@ -245,9 +245,9 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
             LOG_WARNING(Render_Vulkan,
                         "PERF-047 pipelines in {:.1f} s: {} selected on the command thread, {} "
                         "selected again here (memory changed), {} selected here (quad lists, "
-                        "indirect draws)",
+                        "indirect draws); {} checked against a selection here, {} differed",
                         std::chrono::duration<double>(now - stats.since).count(), stats.ahead,
-                        stats.mismatched, stats.recorder);
+                        stats.mismatched, stats.recorder, stats.verified, stats.verify_failed);
         }
         stats = {};
         stats.since = now;
@@ -260,7 +260,39 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
         }
         if (InstallDrawStages(pipeline, selected_pipeline->stages, true)) {
             ++stats.ahead;
-            return pipeline;
+            // Every 64th selection is checked against one made here, from the recorder's
+            // registers and memory; a difference is reported and this one used.
+            if (++select_verify_count % 64 != 0) {
+                return pipeline;
+            }
+            ++stats.verified;
+            std::array<SelectedStage, Shader::MaxStageTypes> own{};
+            const GraphicsPipeline* own_pipeline;
+            {
+                std::scoped_lock lk{pipeline_cache.LookupMutex()};
+                own_pipeline = pipeline_cache.GetGraphicsPipeline(params);
+                if (own_pipeline) {
+                    CopySelectedStages(own);
+                }
+            }
+            if (own_pipeline == pipeline) {
+                return pipeline;
+            }
+            ++stats.verify_failed;
+            static u32 reports = 0;
+            if (reports++ < 20) {
+                LOG_ERROR(Render_Vulkan,
+                          "PERF-047: pipeline selected on the command thread ({:#x}) differs from "
+                          "the one selected here ({:#x})",
+                          std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey()),
+                          own_pipeline ? std::hash<GraphicsPipelineKey>{}(
+                                             own_pipeline->GetGraphicsKey())
+                                       : 0);
+            }
+            if (own_pipeline) {
+                InstallDrawStages(own_pipeline, own, false);
+            }
+            return own_pipeline;
         }
         // The user data now leads to other sharps than the selection read (memory written in
         // between): select here, from what the recorder sees.

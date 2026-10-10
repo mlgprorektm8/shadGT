@@ -1446,3 +1446,44 @@ demand.
 - Unit tests: 530 non-GCN tests pass, including `shadps4_build_queue_test` (4) and the
   read-ahead test for the per-draw registers.
 - The 45 GCN instruction tests fail as before.
+
+## The big step: pipeline selection on the command thread, and hashing on several cores (October 10)
+
+Lance's request after the merge to main (b25c3c06): a big, accurate FPS improvement.
+
+In his 22:18 race, the recorder spent this much of every 2 s in heavy windows (about 185,000 draws):
+
+| Step | Time per 2 s | Parts |
+|---|---|---|
+| Buffers | 437-462 ms | 355-377 ms in lookups |
+| Textures | 328-339 ms | |
+| Pipeline | 270-280 ms | 213-220 ms in permutation matching |
+| Vertex/index | 200-216 ms | |
+
+The command thread was 9-14% busy.
+
+- **PERF-044 had no effect in these windows.** Its exact-input memo sees new user data on almost every draw, because per-draw pointers change.
+- **PERF-033 hashed about 7 GB per 2 s.** Those are the unchanged hot pages, checked once per upload epoch.
+
+### PERF-046 (perf id 58): hot pages hashed on several cores
+
+- SynchronizeMemory collects the hot pages first. From 128 pages on, the caller and up to three helpers hash them; the after-copy check does the same.
+- The hashes are the same as on one thread. A unit test runs 300 batches back to back.
+- Helpers join a batch only under the hasher's lock.
+
+### FIX-047: upload copier hand-over race
+
+- ParallelUploadCopier (PERF-027) checked for busy helpers outside its lock. A helper that slept through a batch could therefore read the pieces while they were being refilled.
+- The batch state now changes under the lock, and helpers join only between Run and BeginBatch.
+
+### PERF-047 (perf id 59): pipelines selected on the command thread
+
+- **Selection.** For direct draws, the command thread selects the pipeline from its registers (the same ones the recorder applies), under the cache's new lookup lock. It passes each stage's user data, program base and flattened user data to the recorder.
+- **Recorder's copies of the infos.** The cache's infos are rewritten by every lookup, so the recorder binds through its own copy of each.
+  - The copies are made under the lock, found by address, and renewed when the info's new identity differs.
+  - The recorder writes the draw's user data into the copy, flattens again from the memory it sees, and points the pipeline's draw-time stages at the copies. The canonical stages stay in a separate array.
+- **Fallback.** Flattened user data that differs from the selection means memory changed in between, so the recorder selects again itself.
+- **Not moved.** Quad lists (their pipeline depends on the recorder's buffer cache), indirect draws and dispatches are looked up on the recorder.
+- **Shared filter.** FilterDraw's decision is shared through ClassifyDraw.
+- **Self-check.** Every 64th selection is compared with one made on the recorder; a difference is logged and the recorder's result used.
+- **Logging.** The 2 s `PERF-047 pipelines` line counts the cases, and `[select-ahead]` times the command thread's share.
