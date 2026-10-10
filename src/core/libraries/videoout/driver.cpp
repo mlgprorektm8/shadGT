@@ -8,6 +8,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
+#include "common/nvtx.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
@@ -273,7 +274,11 @@ void VideoOutDriver::Flip(const Request& req) {
 
     // Present the frame.
     const auto present_start = std::chrono::steady_clock::now();
-    presenter->Present(req.frame);
+    Common::Nvtx::Mark("flip"); // DIAG-056
+    {
+        Common::Nvtx::Scope nvtx{"present"};
+        presenter->Present(req.frame);
+    }
     {
         const auto now = std::chrono::steady_clock::now();
         std::scoped_lock lk{g_flip_stats.mutex};

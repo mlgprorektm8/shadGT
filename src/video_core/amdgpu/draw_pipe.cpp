@@ -3,6 +3,7 @@
 
 #include <chrono>
 
+#include "common/nvtx.h"
 #include "video_core/amdgpu/draw_pipe.h"
 
 namespace AmdGpu {
@@ -163,6 +164,7 @@ void DrawPipe::Run(std::stop_token stop) {
         }
         const auto start = std::chrono::steady_clock::now();
         u64 ran = 0;
+        Common::Nvtx::Scope nvtx{"recording"}; // DIAG-056
         while (!batch.empty()) {
             Work work = std::move(batch.front());
             batch.pop_front();

@@ -22,6 +22,8 @@ include(FetchContent)
 option(ENABLE_DISCORD_RPC "Enable the Discord RPC integration" ON)
 option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
+# DIAG-056: path to the nvtx3 headers of an NVIDIA Nsight Systems install, for timeline ranges.
+set(SHADGT_NVTX_INCLUDE "" CACHE PATH "nvtx3 include directory (Nsight Systems timeline ranges)")
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
 
 # Determine the target architecture.
@@ -802,6 +804,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/string_util.cpp
            src/common/string_util.h
            src/common/sampling_profiler.cpp
+           src/common/nvtx.h
            src/common/sampling_profiler.h
            src/common/perf_monitor.cpp
            src/common/perf_monitor.h
@@ -1286,6 +1289,11 @@ target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURC
 
 if (ENABLE_DISCORD_RPC)
     target_compile_definitions(shadps4 PRIVATE ENABLE_DISCORD_RPC)
+endif()
+
+if (SHADGT_NVTX_INCLUDE)
+    target_include_directories(shadps4 PRIVATE "${SHADGT_NVTX_INCLUDE}")
+    target_compile_definitions(shadps4 PRIVATE SHADGT_NVTX)
 endif()
 
 if (WIN32)

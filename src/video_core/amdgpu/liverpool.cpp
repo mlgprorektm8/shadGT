@@ -16,6 +16,7 @@
 #include "common/sampling_profiler.h"
 #include "common/debug.h"
 #include "common/guest_clock.h"
+#include "common/nvtx.h"
 #include "common/perf_monitor.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -80,6 +81,10 @@ static s64 NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+static void NoteEop() {
+    g_last_eop_ns.store(NowNs());
+    Common::Nvtx::Mark("EOP interrupt"); // DIAG-056
 }
 
 static void WriteDeferredFence(void* address, const void* data, u32 num_bytes) {
@@ -473,6 +478,7 @@ void Liverpool::SyncRecorder(std::string_view reason) {
     if (!draw_pipe) {
         return;
     }
+    Common::Nvtx::Scope nvtx{"drain recorder"}; // DIAG-056
     const auto start = std::chrono::steady_clock::now();
     draw_pipe->Drain();
     auto& entry = sync_reasons[reason];
@@ -667,6 +673,7 @@ void Liverpool::OnGpuThreadFault() {
 
 void Liverpool::SendFaultCommand(Common::UniqueFunction<void>&& func) {
     static const bool urgent = Common::PerfFeatureEnabled(62);
+    Common::Nvtx::Scope nvtx{"CPU fault: wait for GPU data"}; // DIAG-056
     const auto start = std::chrono::steady_clock::now();
     if (draw_pipe && urgent) {
         std::binary_semaphore sem{0};
@@ -784,17 +791,35 @@ void Liverpool::Process(std::stop_token stoken) {
                 --num_tasks;
                 // DIAG-051: a graphics submission is decoded; time it through the pipeline.
                 std::optional<std::chrono::steady_clock::time_point> submitted;
+                std::optional<SubmitRanges> ranges;
                 if (curr_qid == GfxQueueId) {
                     std::scoped_lock lk{submit_timing_mutex};
                     if (!gfx_submit_times.empty()) {
                         submitted = gfx_submit_times.front();
                         gfx_submit_times.pop_front();
                     }
+                    if (!gfx_submit_ranges.empty()) {
+                        ranges = gfx_submit_ranges.front();
+                        gfx_submit_ranges.pop_front();
+                        Common::Nvtx::End(ranges->to_decoded);
+                    }
                 }
                 const auto decoded = std::chrono::steady_clock::now();
                 // PERF-031: the submission is finished once its recorded work is.
-                Record([this, submitted, decoded] {
+                Record([this, submitted, decoded, ranges] {
                     --num_submits;
+                    u64 gpu_range = 0;
+                    if (ranges) {
+                        Common::Nvtx::End(ranges->to_recorded);
+                        gpu_range = Common::Nvtx::Start(
+                            fmt::format("gfx submit {}: recorded until GPU done", ranges->number));
+                        if (!rasterizer) {
+                            Common::Nvtx::End(gpu_range);
+                        }
+                    }
+                    if (!submitted && rasterizer && gpu_range) {
+                        rasterizer->WhenGpuDone([gpu_range] { Common::Nvtx::End(gpu_range); });
+                    }
                     if (submitted && rasterizer) {
                         const auto recorded = std::chrono::steady_clock::now();
                         const auto us = [&](auto d) {
@@ -807,7 +832,8 @@ void Liverpool::Process(std::stop_token stoken) {
                             submit_stats.decode_us += us(decoded - *submitted);
                             submit_stats.record_us += us(recorded - *submitted);
                         }
-                        rasterizer->WhenGpuDone([this, start = *submitted, us] {
+                        rasterizer->WhenGpuDone([this, start = *submitted, us, gpu_range] {
+                            Common::Nvtx::End(gpu_range);
                             const u64 gpu = us(std::chrono::steady_clock::now() - start);
                             std::scoped_lock lk{submit_timing_mutex};
                             submit_stats.gpu_us += gpu;
@@ -1594,7 +1620,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
                         },
                         [] {
-                            g_last_eop_ns.store(NowNs());
+                            NoteEop();
                             Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                         });
                     ++g_fences_early;
@@ -1617,7 +1643,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                             WriteDeferredFence(address, &data, num_bytes);
                                         },
                                         [] {
-                                            g_last_eop_ns.store(NowNs());
+                                            NoteEop();
                                             ++g_eops_deferred;
                                             Platform::IrqC::Instance()->Signal(
                                                 Platform::InterruptId::GfxEop);
@@ -1636,7 +1662,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                                 },
                                 [] {
-                                    g_last_eop_ns.store(NowNs());
+                                    NoteEop();
                                     ++g_eops_immediate;
                                     Platform::IrqC::Instance()->Signal(
                                         Platform::InterruptId::GfxEop);
@@ -2638,6 +2664,12 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         const auto now = std::chrono::steady_clock::now();
         std::scoped_lock lk{submit_timing_mutex};
         gfx_submit_times.push_back(now);
+        if constexpr (Common::Nvtx::Enabled) {
+            const u64 n = ++gfx_submit_number;
+            gfx_submit_ranges.push_back(
+                {n, Common::Nvtx::Start(fmt::format("gfx submit {}: decode", n)),
+                 Common::Nvtx::Start(fmt::format("gfx submit {}: until recorded", n))});
+        }
         if (const s64 eop = g_last_eop_ns.load(); eop != 0) {
             const s64 since = NowNs() - eop;
             if (since >= 0 && since < 100'000'000) {

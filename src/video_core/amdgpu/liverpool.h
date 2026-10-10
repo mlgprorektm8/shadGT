@@ -380,6 +380,14 @@ private:
         std::chrono::steady_clock::time_point decoded;
     };
     std::deque<std::chrono::steady_clock::time_point> gfx_submit_times;
+    // DIAG-056: the Nsight ranges of each graphics submission (to decoded, to recorded).
+    struct SubmitRanges {
+        u64 number;
+        u64 to_decoded;
+        u64 to_recorded;
+    };
+    std::deque<SubmitRanges> gfx_submit_ranges;
+    u64 gfx_submit_number{};
     std::chrono::steady_clock::time_point last_gfx_submit{};
     std::mutex submit_timing_mutex;
     struct SubmitStats {

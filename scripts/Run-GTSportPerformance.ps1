@@ -13,7 +13,10 @@ param(
     [int]$ReadbackLinearImages = -1,
     [switch]$CheckOnly,
     # Experimental branch: PERF ids to switch off for an A/B run, e.g. '14,15'.
-    [string]$DisablePerf = ''
+    [string]$DisablePerf = '',
+    # DIAG-056: run under NVIDIA Nsight Systems (session 'gtsport', nothing recorded until
+    # Record-GTSportRace.ps1 starts a capture). Path to nsys.exe.
+    [string]$Nsight = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -125,7 +128,21 @@ try {
         }
     }
     $arguments = '"{0}" --show-fps' -f $GamePath
-    $process = Start-Process -FilePath $executable -ArgumentList $arguments `
+    $launcher = $executable
+    if ($Nsight) {
+        if (!(Test-Path -LiteralPath $Nsight -PathType Leaf)) {
+            throw "nsys.exe not found: $Nsight"
+        }
+        # Vulkan API calls, GPU work per submission and WDDM queue activity. The capture itself
+        # (and CPU sampling, which needs an elevated PowerShell) starts and stops with
+        # Record-GTSportRace.ps1.
+        $arguments = ('launch --session-new=gtsport --trace=vulkan,nvtx,wddm ' +
+            '--vulkan-gpu-workload=batch --wait=primary "{0}" {1}') -f `
+            (Resolve-Path -LiteralPath $executable).Path, $arguments
+        $launcher = $Nsight
+        Write-Output "Running under Nsight Systems (session gtsport)"
+    }
+    $process = Start-Process -FilePath $launcher -ArgumentList $arguments `
         -WorkingDirectory $ProfileDirectory -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $ProfileDirectory "stdout-performance-$stamp.txt") `
         -RedirectStandardError (Join-Path $ProfileDirectory "stderr-performance-$stamp.txt") -PassThru

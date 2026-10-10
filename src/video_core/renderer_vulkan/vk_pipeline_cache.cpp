@@ -13,6 +13,7 @@
 
 #include "common/elf_info.h"
 #include "common/guest_clock.h"
+#include "common/nvtx.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -990,6 +991,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         if (build) {
             const auto wait_start = std::chrono::steady_clock::now();
             if (queued_states) {
+                Common::Nvtx::Scope nvtx{"wait for pipeline build"}; // DIAG-056
                 WaitForBuild(*build, params);
             }
             FinishBuild(*build);
@@ -1012,6 +1014,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             sdata = build->sdata;
             it.value() = std::move(build->pipeline);
         } else {
+            Common::Nvtx::Scope nvtx{"build pipeline here"}; // DIAG-056
             it.value() = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
                 runtime_infos, fetch_shader, modules, sdata);

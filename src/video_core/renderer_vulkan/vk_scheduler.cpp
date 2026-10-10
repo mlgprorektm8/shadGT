@@ -12,6 +12,7 @@
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "common/nvtx.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
@@ -171,6 +172,7 @@ void Scheduler::Wait(u64 tick, std::source_location loc) {
     if (work_semaphore.IsFree(tick)) {
         return;
     }
+    Common::Nvtx::Scope nvtx{"wait for GPU"}; // DIAG-056
     const auto start = std::chrono::steady_clock::now();
     work_semaphore.Wait(tick);
     RecordGpuWait(loc, std::chrono::steady_clock::now() - start);
