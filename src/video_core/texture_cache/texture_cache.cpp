@@ -875,6 +875,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     collect_same_address(same_address);
 
     ImageId image_id{};
+    // PERF-041: whether overlap resolution or a new image may have changed the images at this
+    // address; only then are they collected again below.
+    bool registry_changed = false;
 
     // Check for a perfect match first
     for (const auto& cache_id : same_address) {
@@ -912,6 +915,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         SmallVector<ImageId, 8> image_ids;
         ForEachImageInRegion(info.guest_address, info.guest_size,
                              [&](ImageId id, Image&) { image_ids.push_back(id); });
+        registry_changed |= !image_ids.empty();
         for (const auto& cache_id : image_ids) {
             const auto& merged_info = image_id ? slot_images[image_id].info : info;
             auto [overlap_image_id, overlap_view_mip, overlap_view_slice] =
@@ -933,6 +937,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         for (const auto& cache_id : same_address) {
             if (cache_id != image_id &&
                 slot_images[image_id].info.IsSubrectOf(slot_images[cache_id].info)) {
+                registry_changed = true;
                 ResolveOverlap(slot_images[image_id].info, desc.type, cache_id, image_id);
             }
         }
@@ -945,6 +950,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             image_id = {};
         } else if (image_resolved.info.resources < info.resources) {
             // The image was clearly picked up wrong.
+            registry_changed = true;
             FreeImage(image_id);
             image_id = {};
             LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
@@ -952,6 +958,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
+        registry_changed = true;
         image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
@@ -961,7 +968,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // (oldest first) before the full image is used. GT Sport draws its car into a 1200-wide
     // crop of a 1920-wide target, then blends over it through the full-width descriptor.
     // Overlap resolution may have freed or created images, so collect them again.
-    collect_same_address(same_address);
+    static const bool reuse_collected = Common::PerfFeatureEnabled(53);
+    if (registry_changed || !reuse_collected) {
+        collect_same_address(same_address);
+    }
     SmallVector<ImageId, 4> newer_subrects;
     for (const auto& cache_id : same_address) {
         if (cache_id == image_id ||
