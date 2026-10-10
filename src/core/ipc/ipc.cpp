@@ -8,6 +8,11 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+#endif
 
 #include <fmt/format.h>
 
@@ -96,6 +101,7 @@ void IPC::Init() {
     }
 
     EmulatorState::GetInstance()->SetAutoPatchesLoadEnabled(false);
+    RedirectToPipes();
 
     input_thread = std::jthread([this] {
         Common::SetCurrentThreadName("IPC Read thread");
@@ -114,6 +120,34 @@ void IPC::Init() {
         std::cerr << "IPC: Failed to acquire run semaphore, closing process.\n";
         exit(1);
     }
+}
+
+void IPC::RedirectToPipes() {
+#ifdef _WIN32
+    // DIAG-056: under a profiler launcher (NVIDIA Nsight Systems) the emulator's stdin/stderr
+    // are not the client's, so the client names two pipes it created: commands come in on
+    // SHADPS4_IPC_PIPE_IN, replies go out on SHADPS4_IPC_PIPE_OUT (stderr is redirected there).
+    const char* in_name = std::getenv("SHADPS4_IPC_PIPE_IN");
+    const char* out_name = std::getenv("SHADPS4_IPC_PIPE_OUT");
+    if (!in_name || !out_name || !*in_name || !*out_name) {
+        return;
+    }
+    const auto open_pipe = [](const char* name, DWORD access, int flags) {
+        const HANDLE handle =
+            CreateFileA(name, access, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            std::cerr << "IPC: cannot open pipe " << name << "\n";
+            exit(1);
+        }
+        return _open_osfhandle(reinterpret_cast<intptr_t>(handle), flags);
+    };
+    const int in_fd = open_pipe(in_name, GENERIC_READ, _O_RDONLY | _O_BINARY);
+    const int out_fd = open_pipe(out_name, GENERIC_WRITE, _O_WRONLY | _O_BINARY);
+    std::cerr.flush();
+    _dup2(in_fd, 0);
+    _dup2(out_fd, 2);
+    std::cin.clear();
+#endif
 }
 
 void IPC::SendRestart(const std::vector<std::string>& args) {

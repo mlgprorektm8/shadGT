@@ -39,5 +39,6 @@ public:
     void SendRestart(const std::vector<std::string>& args);
 
 private:
+    void RedirectToPipes();
     [[noreturn]] void InputLoop();
 };

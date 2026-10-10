@@ -154,15 +154,24 @@ class EmulatorProcess:
     """
 
     def __init__(self, command: list[str], cwd: Path, env: dict[str, str],
-                 stdout_path: Path | None = None, stderr_path: Path | None = None):
+                 stdout_path: Path | None = None, stderr_path: Path | None = None,
+                 use_pipes: bool = False):
         self.command = command
         self.started_at = time.time()
+        self.stop_grace_s = 0.0
         self._stdout_file = open(stdout_path, "wb") if stdout_path else subprocess.DEVNULL
         self._stderr_log = open(stderr_path, "a", encoding="utf-8") if stderr_path else None
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        # DIAG-056: under a launcher (Nsight Systems) the emulator's stdin/stderr are not ours;
+        # IPC then goes through two named pipes the emulator opens (SHADPS4_IPC_PIPE_IN/OUT).
+        self._pipes = _IpcPipes() if use_pipes else None
+        if self._pipes:
+            env = {**env, **self._pipes.env()}
         self.proc = subprocess.Popen(
-            command, cwd=str(cwd), env=env, stdin=subprocess.PIPE,
-            stdout=self._stdout_file, stderr=subprocess.PIPE, creationflags=flags,
+            command, cwd=str(cwd), env=env,
+            stdin=subprocess.DEVNULL if self._pipes else subprocess.PIPE,
+            stdout=self._stdout_file,
+            stderr=subprocess.STDOUT if self._pipes else subprocess.PIPE, creationflags=flags,
         )
         self.capabilities: set[str] = set()
         self.handshake_done = False
@@ -182,8 +191,16 @@ class EmulatorProcess:
         return self.proc.poll() is None
 
     def _read_stderr(self) -> None:
-        assert self.proc.stderr is not None
-        for raw in iter(self.proc.stderr.readline, b""):
+        if self._pipes:
+            if not self._pipes.connect():
+                with self._cond:
+                    self._cond.notify_all()
+                return
+            stream = self._pipes.reader
+        else:
+            assert self.proc.stderr is not None
+            stream = self.proc.stderr
+        for raw in iter(stream.readline, b""):
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
             if self._stderr_log:
                 self._stderr_log.write(line + "\n")
@@ -217,9 +234,11 @@ class EmulatorProcess:
             raise IpcError(f"Emulator is not running (exit code {self.proc.returncode})")
         payload = "".join(str(line).replace("\n", "\\n") + "\n" for line in lines)
         with self._send_lock:
-            assert self.proc.stdin is not None
-            self.proc.stdin.write(payload.encode("utf-8"))
-            self.proc.stdin.flush()
+            stream = self._pipes.writer if self._pipes else self.proc.stdin
+            if stream is None:
+                raise IpcError("The IPC pipes are not connected")
+            stream.write(payload.encode("utf-8"))
+            stream.flush()
 
     def request(self, lines: list[str], reply_prefix: str, timeout: float = 10.0) -> str:
         with self._request_lock:
@@ -279,6 +298,46 @@ class EmulatorProcess:
                     f.close()
             except Exception:
                 pass
+
+
+class _IpcPipes:
+    """DIAG-056: an inbound and an outbound named pipe for IPC (Windows)."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._k32.CreateNamedPipeW.restype = wintypes.HANDLE
+        self._k32.CreateNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                              wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                                              wintypes.DWORD, ctypes.c_void_p]
+        self._k32.ConnectNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+        tag = f"shadgt-ipc-{os.getpid()}-{time.monotonic_ns()}"
+        self.in_name = "\\\\.\\pipe\\" + tag + "-in"
+        self.out_name = "\\\\.\\pipe\\" + tag + "-out"
+        # PIPE_ACCESS_OUTBOUND = 2 (we write), PIPE_ACCESS_INBOUND = 1 (we read); byte mode.
+        self._h_in = self._k32.CreateNamedPipeW(self.in_name, 2, 0, 1, 65536, 65536, 0, None)
+        self._h_out = self._k32.CreateNamedPipeW(self.out_name, 1, 0, 1, 65536, 65536, 0, None)
+        invalid = wintypes.HANDLE(-1).value
+        if self._h_in in (None, invalid) or self._h_out in (None, invalid):
+            raise OSError(f"CreateNamedPipe failed ({ctypes.get_last_error()})")
+        self.writer = None
+        self.reader = None
+
+    def env(self) -> dict[str, str]:
+        return {"SHADPS4_IPC_PIPE_IN": self.in_name, "SHADPS4_IPC_PIPE_OUT": self.out_name}
+
+    def connect(self) -> bool:
+        """Waits for the emulator to open both pipes (it opens them when IPC starts)."""
+        import ctypes
+        import msvcrt
+        for handle in (self._h_in, self._h_out):
+            if not self._k32.ConnectNamedPipe(handle, None):
+                if ctypes.get_last_error() != 535:  # ERROR_PIPE_CONNECTED
+                    return False
+        self.writer = os.fdopen(msvcrt.open_osfhandle(self._h_in, 0), "wb", buffering=0)
+        self.reader = os.fdopen(msvcrt.open_osfhandle(self._h_out, os.O_RDONLY), "rb")
+        return True
 
 
 def parse_status(reply: str) -> dict[str, Any]:
@@ -617,7 +676,8 @@ def _is_shadgt_running() -> bool:
 @mcp.tool()
 def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
            env: dict[str, str] | None = None, disable_perf: str = "",
-           perf_overrides: bool = True, game_path: str | None = None) -> dict:
+           perf_overrides: bool = True, game_path: str | None = None,
+           launcher: list[str] | None = None) -> dict:
     """Start GT Sport under shadGT with IPC control, like scripts/Run-GTSportPerformance.ps1.
 
     build_dir: folder containing shadGT.exe (default Build/x64-Clang-Release).
@@ -625,6 +685,8 @@ def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
     env: extra environment variables for the emulator.
     disable_perf: PERF ids to switch off for an A/B run (SHADGT_DISABLE_PERF), e.g. "14,15".
     perf_overrides: apply the script's diagnostics-off config overrides (restored on exit).
+    launcher: a command the emulator runs under (e.g. Nsight Systems' `nsys profile ...`);
+        IPC then uses named pipes (DIAG-056), and stop waits for the launcher to finish.
     Returns pid, IPC capabilities and paths. The built-in GT Sport 1.69 boot patch is applied
     by the emulator itself, so IPC disabling automatic patch loading does not affect it.
     """
@@ -646,6 +708,8 @@ def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
                     raise FileNotFoundError(f"Missing launch prerequisite: {file}")
             command = [str(executable), game, "--show-fps"]
         command += list(extra_args or [])
+        if launcher:
+            command = list(launcher) + command
 
         SESSION.stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         SESSION.last_exit = None
@@ -668,7 +732,9 @@ def launch(build_dir: str | None = None, extra_args: list[str] | None = None,
                 command, SESSION.profile_dir, environment,
                 stdout_path=SESSION.profile_dir / f"stdout-mcp-{SESSION.stamp}.txt",
                 stderr_path=SESSION.profile_dir / f"stderr-mcp-{SESSION.stamp}.txt",
+                use_pipes=bool(launcher),
             )
+            emu.stop_grace_s = 600.0 if launcher else 0.0
             caps = emu.handshake()
         except Exception:
             SESSION.restore_overrides()
@@ -701,7 +767,8 @@ def stop(timeout_s: float = 20.0) -> dict:
         except Exception:
             pass
         try:
-            emu.proc.wait(timeout=timeout_s)
+            # A launcher (Nsight Systems) writes its report after the emulator exits.
+            emu.proc.wait(timeout=max(timeout_s, emu.stop_grace_s))
         except subprocess.TimeoutExpired:
             emu.proc.kill()
             emu.proc.wait()
