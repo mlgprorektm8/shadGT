@@ -211,6 +211,16 @@ private:
         VideoCore::TextureCache::ImageDesc desc;
     };
     std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
+    // PERF-042: decoded texture descriptors. A T# and the resource's depth/written/array flags
+    // decide the image description completely (ImageInfo, ImageViewInfo), so a T# that passed
+    // the checks before is not checked and decoded again. Direct-mapped, by hash.
+    struct DecodedTsharp {
+        std::array<u32, 8> sharp{};
+        u8 flags{};
+        bool valid{};
+        VideoCore::TextureCache::ImageDesc desc;
+    };
+    std::vector<DecodedTsharp> decoded_tsharps;
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
 

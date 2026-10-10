@@ -4,6 +4,7 @@
 #include <deque>
 #include <fstream>
 #include <optional>
+#include <xxhash.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
@@ -2028,10 +2029,32 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
     u32 num_images{};
+    static const bool decode_once = Common::PerfFeatureEnabled(54);
+    if (decode_once && decoded_tsharps.empty()) {
+        decoded_tsharps.resize(4096);
+    }
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
+        // PERF-042: a T# decoded before skips the checks and the decode below.
+        DecodedTsharp* decoded = nullptr;
+        bool decoded_hit = false;
+        if (decode_once) {
+            std::array<u32, 8> words;
+            std::memcpy(words.data(), &tsharp, sizeof(words));
+            const u8 flags = u8(image_desc.is_depth) | u8(image_desc.is_written) << 1 |
+                             u8(image_desc.is_array) << 2;
+            u64 hash = XXH3_64bits(words.data(), sizeof(words));
+            hash ^= u64(flags) * 0x9E3779B97F4A7C15ull;
+            decoded = &decoded_tsharps[hash & (decoded_tsharps.size() - 1)];
+            decoded_hit = decoded->valid && decoded->flags == flags && decoded->sharp == words;
+            if (!decoded_hit) {
+                decoded->valid = false;
+                decoded->sharp = words;
+                decoded->flags = flags;
+            }
+        }
         const auto bind_null_image = [&] {
             const u32 array_size =
                 ForEachImageDescriptorBinding(stage, image_desc, [&](bool is_written) {
@@ -2045,12 +2068,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 });
             image_descriptor_array_sizes.push_back(array_size);
         };
-        if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+        if (!decoded_hit &&
+            (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid)) {
             bind_null_image();
             continue;
         }
 
-        if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
+        if (!decoded_hit && !memory->IsValidGpuMapping(tsharp.Address(), 0) ||
             !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
@@ -2064,7 +2088,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             continue;
         }
 
-        if (LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt) == vk::Format::eUndefined) {
+        if (!decoded_hit &&
+            LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt) == vk::Format::eUndefined) {
             LOG_WARNING(Render_Vulkan,
                         "Binding null image for unsupported T# format data={} number={} "
                         "address={:#x} shader={}_{:#x}",
@@ -2075,7 +2100,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
 
         const auto geometry_error =
-            VideoCore::CheckImageDescriptorGeometry(tsharp, instance.GetImageLimits());
+            decoded_hit ? VideoCore::ImageDescriptorGeometryError::None
+                        : VideoCore::CheckImageDescriptorGeometry(tsharp, instance.GetImageLimits());
         if (geometry_error != VideoCore::ImageDescriptorGeometryError::None) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid T# geometry={} address={:#x} type={} "
@@ -2107,9 +2133,17 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const u32 num_bindings = image_desc.NumBindings(stage);
 
+        if (decoded && !decoded_hit) {
+            std::construct_at(&decoded->desc, tsharp, image_desc);
+            decoded->valid = true;
+        }
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings[num_images++];
-            std::construct_at(&desc, tsharp, image_desc);
+            if (decoded) {
+                std::construct_at(&desc, decoded->desc);
+            } else {
+                std::construct_at(&desc, tsharp, image_desc);
+            }
 
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                 ASSERT(num_bindings == 1);
