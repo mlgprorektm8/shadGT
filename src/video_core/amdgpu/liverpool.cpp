@@ -3,6 +3,8 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
+#include <filesystem>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -47,6 +49,33 @@ static std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> g_de
 static std::atomic<s64> g_last_eop_ns{0};
 static std::atomic<u64> g_eops_deferred{0};
 static std::atomic<u64> g_eops_immediate{0};
+
+// EXP-063 (measurement only, not safe for play): graphics EOP/EOS fences are signaled when the
+// command thread decodes them instead of after the recorder has recorded the work before them.
+// It measures how fast races get when the game no longer waits for the recorder. The game may
+// then rewrite memory the recorder has not read yet, and reads GPU results before they exist,
+// so rendering can be wrong. On while the file named by SHADGT_EARLY_FENCES_FLAG exists (checked
+// every 250 ms), so a benchmark can turn it on after the menus. Command thread only.
+static std::atomic<u64> g_fences_early{0};
+static bool EarlyFencesActive() {
+    static const char* const flag = std::getenv("SHADGT_EARLY_FENCES_FLAG");
+    if (!flag || !*flag) {
+        return false;
+    }
+    static std::chrono::steady_clock::time_point next_check{};
+    static bool active = false;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_check) {
+        next_check = now + std::chrono::milliseconds(250);
+        std::error_code ec;
+        const bool on = std::filesystem::exists(flag, ec);
+        if (on != active) {
+            LOG_WARNING(Render, "EXP-063: early fences {} (measurement only)", on ? "on" : "off");
+        }
+        active = on;
+    }
+    return active;
+}
 static s64 NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -580,13 +609,14 @@ void Liverpool::ReportDrawPipe() {
                 "; DIAG-051: {} gfx submits, after the game's submit: decoded {:.2f} ms, recorded "
                 "{:.2f} ms, GPU done {:.2f} ms (max {:.1f}); game submits every {:.2f} ms; "
                 "DIAG-055: submits come {:.2f} ms after the last EOP interrupt; EOPs {} deferred, "
-                "{} at once",
+                "{} at once, {} EXP-063 early fences",
                 t.count, t.decode_us / 1000.0 / t.count, t.record_us / 1000.0 / t.count,
                 t.gpu_count ? t.gpu_us / 1000.0 / t.gpu_count : 0.0, t.max_gpu_us / 1000.0,
                 t.gaps ? t.gap_us / 1000.0 / t.gaps : 0.0,
                 t.eop_to_submit_count ? t.eop_to_submit_us / 1000.0 / t.eop_to_submit_count
                                       : 0.0,
-                g_eops_deferred.exchange(0), g_eops_immediate.exchange(0));
+                g_eops_deferred.exchange(0), g_eops_immediate.exchange(0),
+                g_fences_early.exchange(0));
         }
         submit_stats = {};
     }
@@ -1506,6 +1536,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+                if (draw_pipe && rasterizer &&
+                    event.command != PM4CmdEventWriteEos::Command::GdsStore &&
+                    EarlyFencesActive()) {
+                    // EXP-063: signaled now; the recorder only submits at this point.
+                    event.SignalFence([](void* address, u64 data, u32 num_bytes) {
+                        Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
+                    });
+                    ++g_fences_early;
+                    Record([this] { rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEos); });
+                    break;
+                }
                 // PERF-031: fences are signaled in order behind the recorded work.
                 RecordLabelWrite(
                     event.command != PM4CmdEventWriteEos::Command::GdsStore ? event.Address<VAddr>()
@@ -1546,6 +1587,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                if (draw_pipe && rasterizer && EarlyFencesActive()) {
+                    // EXP-063: signaled now; the recorder only submits at this point.
+                    event.SignalFence(
+                        [](void* address, u64 data, u32 num_bytes) {
+                            Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
+                        },
+                        [] {
+                            g_last_eop_ns.store(NowNs());
+                            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+                        });
+                    ++g_fences_early;
+                    Record([this] { rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEop); });
+                    break;
+                }
                 // PERF-031: fences are signaled in order behind the recorded work.
                 RecordLabelWrite(
                     reinterpret_cast<VAddr>(event.Address<u32>()),
