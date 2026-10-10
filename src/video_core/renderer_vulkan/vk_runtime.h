@@ -3,6 +3,12 @@
 
 #pragma once
 
+#include <array>
+#include <chrono>
+#include <span>
+#include <tuple>
+#include <vector>
+
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -82,6 +88,14 @@ public:
 
     void FlushBarriers();
 
+    /// DIAG-057 (SHADGT_DIAG_BATCH=1): how many consecutive draws could be recorded as one
+    /// batch, with every GPU copy and layout change for them hoisted before them, before one
+    /// touches a resource an earlier draw of the batch uses. Measures the parallel recorder's
+    /// batches without changing anything.
+    void DiagBatchDraw(std::span<const std::tuple<vk::Buffer, u64, u64, bool>> buffers,
+                       std::span<const vk::Image> images);
+    void DiagBatchCut(int reason);
+
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 
@@ -100,6 +114,21 @@ private:
     std::vector<BufferBarriers> resources;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
+    // DIAG-057
+    void DiagBatchBufferWrite(vk::Buffer buffer, u64 offset, u64 size, int reason);
+    void DiagBatchBufferRead(vk::Buffer buffer, u64 offset, u64 size, int reason);
+    void DiagBatchImage(vk::Image image, int reason);
+    struct DiagBatch {
+        bool enabled{};
+        std::vector<std::tuple<vk::Buffer, u64, u64, bool>> buffers; // used by the batch
+        std::vector<vk::Image> images;
+        u32 draws{};
+        std::array<u64, 6> cuts{};      // by reason
+        std::array<u64, 6> histogram{}; // batch sizes: 1, 2-4, 5-16, 17-64, 65-256, 257+
+        u64 total_draws{};
+        u64 batches{};
+        std::chrono::steady_clock::time_point since{};
+    } diag_batch;
 };
 
 } // namespace Vulkan

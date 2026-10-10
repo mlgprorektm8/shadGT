@@ -1986,6 +1986,29 @@ void Rasterizer::ResetBindings(bool is_compute) {
             texture_cache.InvalidateMemoryFromGPU(guest_address, size);
         }
     }
+    {
+        // DIAG-057: the resources this draw uses, for the batch measurement.
+        boost::container::small_vector<std::tuple<vk::Buffer, u64, u64, bool>, 32> buffers;
+        for (const auto& bound : bound_buffers) {
+            buffers.emplace_back(bound.buffer->Handle(), bound.offset, bound.size,
+                                 bound.is_written);
+        }
+        boost::container::small_vector<vk::Image, 32> images;
+        for (const auto id : bound_images) {
+            images.push_back(texture_cache.GetImage(id).GetImage());
+        }
+        if (!is_compute) {
+            for (const auto& [id, desc] : cb_descs) {
+                if (id) {
+                    images.push_back(texture_cache.GetImage(id).GetImage());
+                }
+            }
+            if (db_desc.first) {
+                images.push_back(texture_cache.GetImage(db_desc.first).GetImage());
+            }
+        }
+        runtime.DiagBatchDraw(buffers, images);
+    }
     bound_images.clear();
     bound_buffers.clear();
     diag_empty_bindings.clear();

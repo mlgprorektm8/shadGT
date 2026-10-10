@@ -116,6 +116,98 @@ void Runtime::TickFrame() {
     staging_pool.TickFrame();
 }
 
+// DIAG-057: cut reasons.
+static constexpr std::array<const char*, 6> BatchCutNames{
+    "buffer write over a batch read", "buffer copy from a batch write", "image layout change",
+    "submit", "other", "-"};
+
+void Runtime::DiagBatchBufferWrite(vk::Buffer buffer, u64 offset, u64 size, int reason) {
+    if (!diag_batch.enabled) {
+        return;
+    }
+    for (const auto& [b, o, n, written] : diag_batch.buffers) {
+        if (b == buffer && offset < o + n && o < offset + size) {
+            DiagBatchCut(reason);
+            return;
+        }
+    }
+}
+
+void Runtime::DiagBatchBufferRead(vk::Buffer buffer, u64 offset, u64 size, int reason) {
+    if (!diag_batch.enabled) {
+        return;
+    }
+    for (const auto& [b, o, n, written] : diag_batch.buffers) {
+        if (written && b == buffer && offset < o + n && o < offset + size) {
+            DiagBatchCut(reason);
+            return;
+        }
+    }
+}
+
+void Runtime::DiagBatchImage(vk::Image image, int reason) {
+    if (diag_batch.enabled && std::ranges::find(diag_batch.images, image) != diag_batch.images.end()) {
+        DiagBatchCut(reason);
+    }
+}
+
+void Runtime::DiagBatchCut(int reason) {
+    auto& d = diag_batch;
+    if (!d.enabled || d.draws == 0) {
+        d.buffers.clear();
+        d.images.clear();
+        return;
+    }
+    ++d.cuts[reason];
+    const u32 n = d.draws;
+    const size_t bucket = n == 1 ? 0 : n <= 4 ? 1 : n <= 16 ? 2 : n <= 64 ? 3 : n <= 256 ? 4 : 5;
+    ++d.histogram[bucket];
+    ++d.batches;
+    d.total_draws += n;
+    d.draws = 0;
+    d.buffers.clear();
+    d.images.clear();
+}
+
+void Runtime::DiagBatchDraw(std::span<const std::tuple<vk::Buffer, u64, u64, bool>> buffers,
+                            std::span<const vk::Image> images) {
+    auto& d = diag_batch;
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_DIAG_BATCH");
+        return env && env[0] == '1';
+    }();
+    d.enabled = enabled;
+    if (!enabled) {
+        return;
+    }
+    ++d.draws;
+    d.buffers.insert(d.buffers.end(), buffers.begin(), buffers.end());
+    for (const auto image : images) {
+        if (std::ranges::find(d.images, image) == d.images.end()) {
+            d.images.push_back(image);
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (d.since == std::chrono::steady_clock::time_point{}) {
+        d.since = now;
+    }
+    if (now - d.since >= std::chrono::seconds{2} && d.batches != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-057 batches in 2.0 s: {} draws in {} batches ({:.1f} draws each); "
+                    "sizes 1: {}, 2-4: {}, 5-16: {}, 17-64: {}, 65-256: {}, 257+: {}; cut by: {} "
+                    "{}, {} {}, {} {}, {} {}",
+                    d.total_draws, d.batches, double(d.total_draws) / d.batches, d.histogram[0],
+                    d.histogram[1], d.histogram[2], d.histogram[3], d.histogram[4],
+                    d.histogram[5], BatchCutNames[0], d.cuts[0], BatchCutNames[1], d.cuts[1],
+                    BatchCutNames[2], d.cuts[2], BatchCutNames[3], d.cuts[3]);
+        d.cuts = {};
+        d.histogram = {};
+        d.total_draws = 0;
+        d.batches = 0;
+        d.since = now;
+    }
+}
+
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
     SmallVector<vk::BufferCopy, 8> non_empty_copies;
@@ -134,6 +226,10 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
         FlushBarriers();
     }
 
+    for (const auto& copy : copies) {
+        DiagBatchBufferRead(src->Handle(), copy.srcOffset, copy.size, 1);
+        DiagBatchBufferWrite(dst->Handle(), copy.dstOffset, copy.size, 0);
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.copyBuffer(src->Handle(), dst->Handle(), copies);
 
@@ -155,6 +251,7 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
         FlushBarriers();
     }
 
+    DiagBatchBufferWrite(dst->Handle(), offset, size, 0);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.fillBuffer(dst->Handle(), offset, size, value);
 
@@ -169,6 +266,7 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
         FlushBarriers();
     }
 
+    DiagBatchBufferWrite(dst->Handle(), offset, sizeof(value), 0);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.updateBuffer(dst->Handle(), offset, sizeof(value), &value);
 
@@ -187,6 +285,7 @@ void Runtime::InlineData(const VideoCore::Buffer* dst, u64 offset, std::span<con
         FlushBarriers();
     }
 
+    DiagBatchBufferWrite(dst->Handle(), offset, data.size(), 0);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.updateBuffer(dst->Handle(), offset, data.size(), data.data());
 
@@ -202,6 +301,7 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
     if (next_barriers.empty()) {
         return false;
     }
+    DiagBatchImage(image->GetImage(), 2);
 
     // Barriers in a single dependency are concurrent, not a sequence of transitions.
     // Commit any earlier transition of this image before using its resulting state.
