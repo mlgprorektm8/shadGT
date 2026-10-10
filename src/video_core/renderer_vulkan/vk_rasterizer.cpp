@@ -2000,6 +2000,7 @@ void Rasterizer::ResetBindings(bool is_compute) {
         // Render targets are left out: the color slots past the draw's targets keep ids of
         // images that may be gone.
         runtime.DiagBatchDraw(buffers, images);
+        runtime.NoteSessionDraw(buffers); // PERF-066
     }
     bound_images.clear();
     bound_buffers.clear();

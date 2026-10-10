@@ -88,6 +88,19 @@ public:
 
     void FlushBarriers();
 
+    /// PERF-066 (SHADGT_HOIST_UPLOADS=1): whether buffer uploads go to the session's upload
+    /// command buffer.
+    bool HoistsUploads() const noexcept {
+        return hoist_uploads;
+    }
+    /// PERF-066: a guest-memory upload recorded in the session's upload command buffer, ahead
+    /// of the session's draws; a new session starts first when it would overwrite a range a
+    /// command already recorded in this session uses.
+    void CopyBufferHoisted(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
+                           std::span<const vk::BufferCopy> copies);
+    /// PERF-066: buffer ranges the draw just bound use in the session.
+    void NoteSessionDraw(std::span<const std::tuple<vk::Buffer, u64, u64, bool>> buffers);
+
     /// DIAG-057 (SHADGT_DIAG_BATCH=1): how many consecutive draws could be recorded as one
     /// batch, with every GPU copy and layout change for them hoisted before them, before one
     /// touches a resource an earlier draw of the batch uses. Measures the parallel recorder's
@@ -129,6 +142,16 @@ private:
         u64 batches{};
         std::chrono::steady_clock::time_point since{};
     } diag_batch;
+    // PERF-066
+    void NoteSessionUse(vk::Buffer buffer, u64 offset, u64 size);
+    void ReportHoisting();
+    bool hoist_uploads{};
+    u64 hoist_session{};
+    std::vector<std::tuple<vk::Buffer, u64, u64>> session_used;
+    u64 hoisted_copies{};
+    u64 hoist_cuts{};
+    u64 hoist_draws{};
+    std::chrono::steady_clock::time_point hoist_report{};
 };
 
 } // namespace Vulkan

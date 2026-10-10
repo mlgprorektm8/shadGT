@@ -382,8 +382,15 @@ public:
     /// Starts a new session.
     void BeginSession();
 
-    /// Returns the current command buffer used for uploads.
+    /// Returns the current command buffer used for uploads. PERF-066: it runs before the
+    /// session's primary command buffer, after everything submitted before it (barriers at its
+    /// start and end).
     vk::CommandBuffer UploadCommandBuffer();
+
+    /// PERF-066: changes with every new session.
+    u64 SessionId() const noexcept {
+        return session_id;
+    }
 
     /// Sets a function to be called on every session finalization.
     void SetSessionCallback(SessionFunc&& on_session) {
@@ -472,6 +479,7 @@ private:
         vk::CommandBuffer primary{};
     };
     std::vector<Session> sessions;
+    u64 session_id{};
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;

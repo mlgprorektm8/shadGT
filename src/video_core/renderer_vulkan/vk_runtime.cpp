@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/perf_monitor.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/buffer_copy.h"
 #include "video_core/renderer_vulkan/depth_attachment.h"
@@ -110,10 +111,82 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
     memory_barrier.dstAccessMask =
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+    // PERF-066: -DisablePerf 73 records uploads in place even with SHADGT_HOIST_UPLOADS=1.
+    const char* hoist = std::getenv("SHADGT_HOIST_UPLOADS");
+    hoist_uploads = hoist && hoist[0] == '1' && Common::PerfFeatureEnabled(73);
 }
 
 void Runtime::TickFrame() {
     staging_pool.TickFrame();
+}
+
+void Runtime::NoteSessionUse(vk::Buffer buffer, u64 offset, u64 size) {
+    if (hoist_session != scheduler.SessionId()) {
+        hoist_session = scheduler.SessionId();
+        session_used.clear();
+    }
+    session_used.emplace_back(buffer, offset, size);
+}
+
+void Runtime::NoteSessionDraw(std::span<const std::tuple<vk::Buffer, u64, u64, bool>> buffers) {
+    if (!hoist_uploads) {
+        return;
+    }
+    ++hoist_draws;
+    for (const auto& [buffer, offset, size, written] : buffers) {
+        NoteSessionUse(buffer, offset, size);
+    }
+    ReportHoisting();
+}
+
+void Runtime::CopyBufferHoisted(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
+                                std::span<const vk::BufferCopy> copies) {
+    SmallVector<vk::BufferCopy, 8> non_empty_copies;
+    copies = NonEmptyBufferCopies(copies, non_empty_copies);
+    if (copies.empty()) {
+        return;
+    }
+    if (hoist_session != scheduler.SessionId()) {
+        hoist_session = scheduler.SessionId();
+        session_used.clear();
+    }
+    const vk::Buffer handle = dst->Handle();
+    const bool conflict = std::ranges::any_of(copies, [&](const vk::BufferCopy& copy) {
+        return std::ranges::any_of(session_used, [&](const auto& used) {
+            const auto& [buffer, offset, size] = used;
+            return buffer == handle && copy.dstOffset < offset + size &&
+                   offset < copy.dstOffset + copy.size;
+        });
+    });
+    if (conflict) {
+        // A command of this session uses the bytes: the upload must come after it.
+        FlushBarriers();
+        scheduler.BeginSession();
+        hoist_session = scheduler.SessionId();
+        session_used.clear();
+        ++hoist_cuts;
+    }
+    scheduler.UploadCommandBuffer().copyBuffer(src->Handle(), handle, copies);
+    ++hoisted_copies;
+}
+
+void Runtime::ReportHoisting() {
+    const auto now = std::chrono::steady_clock::now();
+    if (hoist_report == std::chrono::steady_clock::time_point{}) {
+        hoist_report = now;
+    }
+    if (now - hoist_report < std::chrono::seconds{2}) {
+        return;
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PERF-066 uploads in 2.0 s: {} copies recorded ahead of their draws, {} new "
+                "sessions for them ({:.1f} draws per session)",
+                hoisted_copies, hoist_cuts,
+                double(hoist_draws) / double(std::max<u64>(hoist_cuts, 1)));
+    hoisted_copies = 0;
+    hoist_cuts = 0;
+    hoist_draws = 0;
+    hoist_report = now;
 }
 
 // DIAG-057: cut reasons.
@@ -229,6 +302,10 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
     for (const auto& copy : copies) {
         DiagBatchBufferRead(src->Handle(), copy.srcOffset, copy.size, 1);
         DiagBatchBufferWrite(dst->Handle(), copy.dstOffset, copy.size, 0);
+        if (hoist_uploads) {
+            NoteSessionUse(src->Handle(), copy.srcOffset, copy.size);
+            NoteSessionUse(dst->Handle(), copy.dstOffset, copy.size);
+        }
     }
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.copyBuffer(src->Handle(), dst->Handle(), copies);
@@ -252,6 +329,9 @@ void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32
     }
 
     DiagBatchBufferWrite(dst->Handle(), offset, size, 0);
+    if (hoist_uploads) {
+        NoteSessionUse(dst->Handle(), offset, size);
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.fillBuffer(dst->Handle(), offset, size, value);
 
@@ -267,6 +347,9 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
     }
 
     DiagBatchBufferWrite(dst->Handle(), offset, sizeof(value), 0);
+    if (hoist_uploads) {
+        NoteSessionUse(dst->Handle(), offset, sizeof(value));
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.updateBuffer(dst->Handle(), offset, sizeof(value), &value);
 
@@ -286,6 +369,9 @@ void Runtime::InlineData(const VideoCore::Buffer* dst, u64 offset, std::span<con
     }
 
     DiagBatchBufferWrite(dst->Handle(), offset, data.size(), 0);
+    if (hoist_uploads) {
+        NoteSessionUse(dst->Handle(), offset, data.size());
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.updateBuffer(dst->Handle(), offset, data.size(), data.data());
 
@@ -333,6 +419,9 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    if (hoist_uploads) {
+        NoteSessionUse(src->Handle(), 0, ~u64{0} >> 1); // PERF-066: an image copy uses it
+    }
     cmdbuf.copyBufferToImage(src->Handle(), dst->GetImage(), vk::ImageLayout::eTransferDstOptimal,
                              upload_copies);
 
@@ -362,6 +451,9 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
     }
 
     auto cmdbuf = scheduler.CommandBuffer();
+    if (hoist_uploads) {
+        NoteSessionUse(dst->Handle(), 0, ~u64{0} >> 1); // PERF-066: an image copy uses it
+    }
     cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->Handle(),
                              download_copies);
 
@@ -555,6 +647,9 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     }
 
     auto cmdbuf = scheduler.CommandBuffer();
+    if (hoist_uploads) {
+        NoteSessionUse(buffer->Handle(), 0, ~u64{0} >> 1); // PERF-066: an image copy uses it
+    }
     cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              buffer->Handle(), buffer_copy);
 
@@ -571,6 +666,9 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     });
 
     buffer_copy.imageSubresource.aspectMask = dst->aspect_mask & ~vk::ImageAspectFlagBits::eStencil;
+    if (hoist_uploads) {
+        NoteSessionUse(buffer->Handle(), 0, ~u64{0} >> 1); // PERF-066: an image copy uses it
+    }
     cmdbuf.copyBufferToImage(buffer->Handle(), dst->GetImage(),
                              vk::ImageLayout::eTransferDstOptimal, buffer_copy);
 

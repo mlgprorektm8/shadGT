@@ -1569,7 +1569,12 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             }
         }
         staging.Flush();
-        runtime.CopyBuffer(staging.buffer, arena, copies);
+        if (runtime.HoistsUploads()) {
+            // PERF-066: ahead of the session's draws, without ending the render pass.
+            runtime.CopyBufferHoisted(staging.buffer, arena, copies);
+        } else {
+            runtime.CopyBuffer(staging.buffer, arena, copies);
+        }
     }
     if (!hot_uploads.empty()) {
         // A page the CPU wrote while it was copied gets no record and is uploaded next time.
