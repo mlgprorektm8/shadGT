@@ -485,6 +485,10 @@ private:
     bool EarlyFenceAllowed();
     /// PERF-063: after a graphics fence signaled at decode.
     void NoteEarlyFence();
+    /// PERF-069: writes a label (WriteData, ReleaseMem) at decode when the fence rules allow
+    /// and its page is unprotected; then only the submit runs on the recorder.
+    bool TryEarlyLabel(VAddr address, std::span<const u8> value,
+                       u32 drain_source, int irq = -1);
     /// PERF-063: the work after a fence goes into a new window.
     void NewWindow();
     void ReportEarlyFences();

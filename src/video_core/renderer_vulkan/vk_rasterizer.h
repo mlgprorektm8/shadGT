@@ -96,6 +96,10 @@ public:
                           VAddr index_address, u64 index_size);
     /// PERF-063 (command thread): the same for one guest range (a DMA source).
     bool CaptureGuestRange(Common::ReadCapture& capture, VAddr address, u64 size);
+    /// PERF-069 (any thread): whether a CPU write to the page goes unnoticed.
+    bool IsUnwatchedPage(VAddr page) const {
+        return page_manager.IsUnwatched(page);
+    }
     /// PERF-063 (any thread): fences waiting for the GPU to finish (deferred) right now.
     bool DeferredFencesPending() const noexcept {
         return deferred_fences.load(std::memory_order_acquire) != 0;

@@ -485,6 +485,34 @@ bool Liverpool::EarlyFenceAllowed() {
     return true;
 }
 
+bool Liverpool::TryEarlyLabel(VAddr address, std::span<const u8> value, u32 drain_source,
+                              int irq) {
+    const auto source = static_cast<Vulkan::Rasterizer::DrainSource>(drain_source);
+    if (!early_fences_mode || !draw_pipe || !rasterizer || address == 0 || value.empty()) {
+        return false;
+    }
+    // A protected page (tracked, GPU-written) keeps its write on the recorder: a flush of GPU
+    // data there must come before the value.
+    for (VAddr page = Common::AlignDown(address, 4096); page < address + value.size();
+         page += 4096) {
+        if (!rasterizer->IsUnwatchedPage(page)) {
+            return false;
+        }
+    }
+    if (!EarlyFenceAllowed()) {
+        return false;
+    }
+    Core::Memory::Instance()->TryWriteBacking(reinterpret_cast<void*>(address), value.data(),
+                                              u32(value.size()));
+    VideoCore::BumpUploadEpoch();
+    if (irq >= 0) {
+        Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(irq));
+    }
+    NoteEarlyFence();
+    RecordSafe([this, source] { rasterizer->OnFence(source); });
+    return true;
+}
+
 void Liverpool::NoteEarlyFence() {
     ++early_stats.early;
     fences_decoded.fetch_add(1, std::memory_order_relaxed);
@@ -2037,6 +2065,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const bool into_commands =
                         WritesLiveCommands(reinterpret_cast<VAddr>(address), data_size);
                     std::vector<u8> label = data;
+                    if (!into_commands &&
+                        TryEarlyLabel(reinterpret_cast<VAddr>(address), data,
+                                      u32(Vulkan::Rasterizer::DrainSource::GfxWriteData))) {
+                        break; // PERF-069: written at decode
+                    }
                     RecordLabelWrite(
                         reinterpret_cast<VAddr>(address), std::move(label),
                         [this, address, data = std::move(data)]() mutable {
@@ -2742,6 +2775,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 std::vector<u8> data(data_size);
                 std::memcpy(data.data(), write_data->data, data_size);
                 std::vector<u8> label = data;
+                if (TryEarlyLabel(write_data->Address<VAddr>(), data,
+                                  u32(Vulkan::Rasterizer::DrainSource::AscWriteData))) {
+                    break; // PERF-069: written at decode
+                }
                 RecordLabelWrite(
                     write_data->Address<VAddr>(), std::move(label),
                     [this, address = write_data->Address<VAddr>(), data = std::move(data)] {
@@ -2826,6 +2863,16 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             // this fence once the GPU has executed the work and the data is in guest memory,
             // instead of letting the CPU access drain the GPU.
             const auto pipe_id = queue.pipe_id;
+            if (release.data_sel != DataSelect::GdsMemStore &&
+                release.data_sel != DataSelect::None) {
+                const auto bytes = FenceValueBytes(release.data_sel.Value(), release.DataDWord(),
+                                                   release.DataQWord());
+                if (TryEarlyLabel(release.Address<VAddr>(), bytes,
+                                  u32(Vulkan::Rasterizer::DrainSource::AscReleaseMem),
+                                  release.int_sel != InterruptSelect::None ? int(pipe_id) : -1)) {
+                    break; // PERF-069: signaled at decode
+                }
+            }
             // PERF-031: signaled in order behind the recorded work.
             RecordLabelWrite(
                 release.data_sel != DataSelect::GdsMemStore ? release.Address<VAddr>() : 0,
