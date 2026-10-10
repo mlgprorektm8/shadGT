@@ -333,6 +333,7 @@ set(GCN_TEST_SOURCES
     test_resource_patching.cpp
     test_color_export.cpp
     test_srt_walker_registry.cpp
+    test_number_conversion.cpp
 )
 
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})

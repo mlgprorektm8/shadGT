@@ -358,7 +358,12 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            // FIX-045: GT Sport's grass compute shader 0xaa3822a3 reads garbage T#s (rejected
+            // as invalid when bound); one with SNORM_NZ and BC3 (37) or format 25 stopped the
+            // emulator here while its pipeline key was computed (runs of October 9 at 16:44,
+            // 16:54 and 21:25). SNORM_NZ is only defined for 8- and 16-bit components; no
+            // conversion is applied to anything else.
+            return NumberConversion::None;
         }
     }
     default:
