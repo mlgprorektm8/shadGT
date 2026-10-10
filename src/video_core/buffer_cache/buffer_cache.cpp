@@ -1315,6 +1315,12 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
     std::scoped_lock lk{mutex};
     if (size == 0 || texture_cache.AnyImageInRegion(device_addr, size)) {
         ++ahead_refusals[1];
+        static std::atomic<u32> logged{};
+        if (size != 0 && logged.fetch_add(1) < 40) {
+            LOG_WARNING(Render_Vulkan, "PERF-067: buffer {:#x}+{:#x} ({}) left to the recorder: "
+                        "an image overlaps it",
+                        device_addr, size, is_written ? "written" : "read");
+        }
         return std::nullopt; // Image exports and aliases are the recorder's.
     }
     if (is_written) {

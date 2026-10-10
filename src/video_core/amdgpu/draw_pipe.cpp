@@ -101,13 +101,18 @@ void DrawPipe::Forward(Work&& work) {
 }
 
 void DrawPipe::WaitFinished(u64 jobs) {
-    for (u32 spins = 0; finished_jobs.load(std::memory_order_acquire) < jobs; ++spins) {
-        if (spins < 64) {
-            _mm_pause();
-        } else {
-            std::this_thread::yield();
+    // A short spin (the recorder is often about to finish), then the stage sleeps until the
+    // recorder has finished the job (it wakes the stage when one waits).
+    for (u32 spins = 0; spins < 256; ++spins) {
+        if (finished_jobs.load(std::memory_order_acquire) >= jobs) {
+            return;
         }
+        _mm_pause();
     }
+    std::unique_lock lk{stage_wait_mutex};
+    stage_wait_target.store(jobs); // seq_cst: against the recorder's count and load
+    stage_wait_cv.wait(lk, [&] { return finished_jobs.load() >= jobs; });
+    stage_wait_target.store(0, std::memory_order_release);
 }
 
 void DrawPipe::RunStage(std::stop_token stop) {
@@ -270,7 +275,12 @@ void DrawPipe::Run(std::stop_token stop) {
             batch.pop_front();
             work();
             ++ran;
-            finished_jobs.fetch_add(1, std::memory_order_release);
+            const u64 done = finished_jobs.fetch_add(1) + 1;
+            if (const u64 target = stage_wait_target.load();
+                target != 0 && done >= target) {
+                std::scoped_lock lk{stage_wait_mutex};
+                stage_wait_cv.notify_all();
+            }
             RunUrgent();
         }
         std::scoped_lock lk{mutex};

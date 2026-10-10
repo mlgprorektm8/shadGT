@@ -129,6 +129,9 @@ private:
     std::atomic<u64> stage_syncs{};
     std::atomic<u64> stage_prepared{};
     std::atomic<u64> stage_barriers{};
+    std::mutex stage_wait_mutex;
+    std::condition_variable stage_wait_cv;
+    std::atomic<u64> stage_wait_target{};
     std::jthread stage;
 
     std::mutex mutex;
