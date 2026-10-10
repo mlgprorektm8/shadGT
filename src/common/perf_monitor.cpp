@@ -252,6 +252,74 @@ void NoteGameFrame() {
     const auto ticks = Snapshot(GetPhaseTicks());
     const double ms = std::chrono::duration<double, std::milli>(now - last_time).count();
     ++frame;
+    // DIAG-046: frame-time distribution every 10 s, and frames well above the recent median
+    // (micro hitches) with where the GPU threads' time went.
+    {
+        static std::vector<double> window_ms;
+        static std::array<double, 64> recent{};
+        static u32 recent_count = 0;
+        static auto window_start = now;
+        static u32 hitch_lines = 0;
+        window_ms.push_back(ms);
+        std::array<double, 64> sorted_recent = recent;
+        const u32 n_recent = std::min<u32>(recent_count, 64);
+        std::sort(sorted_recent.begin(), sorted_recent.begin() + n_recent);
+        const double median = n_recent ? sorted_recent[n_recent / 2] : ms;
+        recent[recent_count++ % 64] = ms;
+        if (n_recent >= 16 && ms >= 25.0 && ms > 2.0 * median && ms < threshold_ms &&
+            hitch_lines < 40) {
+            ++hitch_lines;
+            const double ticks_per_ms = ms > 0 ? double(tsc - last_tsc) / ms : 1.0;
+            const auto phase_ms = [&](Phase phase) {
+                return double(ticks[size_t(phase)] - last_ticks[size_t(phase)]) / ticks_per_ms;
+            };
+            const auto d = Difference(work, last_work);
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-046 hitch: frame {} took {:.1f} ms (median {:.1f}). Draws {:.1f} ms "
+                        "(pipeline {:.1f}, buffers {:.1f}, textures {:.1f}), dispatches {:.1f}, "
+                        "submits {:.1f}; GPU waits {} {:.1f} ms, command-buffer waits {} {:.1f} "
+                        "ms, pipeline waits {} {:.1f} ms; {} draws, {} pipelines, {} shaders, "
+                        "{} uploads {} KB, {} protections, file reads {} {:.1f} ms",
+                        frame, ms, median, phase_ms(Phase::DrawTotal), phase_ms(Phase::Pipeline),
+                        phase_ms(Phase::Buffers), phase_ms(Phase::Textures),
+                        phase_ms(Phase::DispatchTotal), phase_ms(Phase::Submit), d.gpu_waits,
+                        d.gpu_wait_us / 1000.0, d.frontend_waits, d.frontend_wait_us / 1000.0,
+                        d.pipeline_waits, d.pipeline_wait_us / 1000.0, d.draws,
+                        d.pipelines_compiled, d.shaders_compiled, d.uploads,
+                        d.upload_bytes / 1024, d.protects, d.file_reads, d.file_read_us / 1000.0);
+        }
+        if (now - window_start >= std::chrono::seconds{10} && !window_ms.empty()) {
+            std::vector<double> sorted = window_ms;
+            std::sort(sorted.begin(), sorted.end());
+            double total = 0;
+            u32 over25 = 0, over33 = 0, over50 = 0, over100 = 0;
+            for (const double f : sorted) {
+                total += f;
+                over25 += f > 25.0;
+                over33 += f > 34.0;
+                over50 += f > 50.0;
+                over100 += f > 100.0;
+            }
+            const double avg = total / sorted.size();
+            // 1% low: the average frame rate of the slowest 1% of frames.
+            const size_t slow = std::max<size_t>(1, sorted.size() / 100);
+            double slow_total = 0;
+            for (size_t i = sorted.size() - slow; i < sorted.size(); ++i) {
+                slow_total += sorted[i];
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-046 frames in {:.1f} s: {} frames, avg {:.1f} ms ({:.1f} fps), "
+                        "median {:.1f} ms, 1% low {:.1f} fps, max {:.0f} ms; over 25 ms {}, over "
+                        "34 ms {}, over 50 ms {}, over 100 ms {}; {} hitch lines",
+                        std::chrono::duration<double>(now - window_start).count(), sorted.size(),
+                        avg, 1000.0 / avg, sorted[sorted.size() / 2],
+                        1000.0 / (slow_total / slow), sorted.back(), over25, over33, over50,
+                        over100, hitch_lines);
+            window_ms.clear();
+            window_start = now;
+            hitch_lines = 0;
+        }
+    }
     if (ms >= threshold_ms) {
         const double ticks_per_ms = ms > 0 ? double(tsc - last_tsc) / ms : 1.0;
         const auto phase_ms = [&](Phase phase) {
