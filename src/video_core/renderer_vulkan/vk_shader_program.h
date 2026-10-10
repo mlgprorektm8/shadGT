@@ -27,6 +27,21 @@ struct Program {
 
     ModuleList modules{};
 
+    /// PERF-044: the inputs of the last permutation search and its outcome. A specialization is
+    /// made from the permutation's info, the runtime info, the start bindings and the sharps,
+    /// which come from the user data and the flattened user data (and, for vertex and
+    /// tessellation stages, from guest memory too, so those are never memoized). With the same
+    /// inputs, permutations up to the one that matched decide the same way again.
+    struct MatchMemo {
+        bool valid{};
+        size_t perm{};
+        size_t modules_size{};
+        Shader::RuntimeInfo runtime_info{};
+        Shader::Backend::Bindings start{};
+        std::vector<u32> user_data;
+        std::vector<std::vector<u32>> flats;
+    } match_memo;
+
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
                    std::unique_ptr<Shader::Info> info) {
         spec.info = info.get();

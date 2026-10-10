@@ -1983,25 +1983,60 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     std::optional<Common::PhaseTimer> match_timer{std::in_place, Common::Phase::ProgramMatch};
     // Diagnostic for runaway permutations: why each existing permutation was rejected.
     std::string mismatch_reasons;
+    // PERF-044: replay the last search when its inputs are the same. -DisablePerf 56.
+    static const bool memo_enabled = Common::PerfFeatureEnabled(56);
+    auto& memo = program->match_memo;
+    const bool memo_stage = memo_enabled && (hw_stage == HwStage::Fragment ||
+                                             hw_stage == HwStage::Compute);
+    bool memo_usable = memo_stage && memo.valid &&
+                       memo.modules_size == program->modules.size() &&
+                       memo.runtime_info == runtime_info && memo.start == binding &&
+                       std::ranges::equal(memo.user_data, params.user_data);
+    const auto start_binding = binding;
+    boost::container::small_vector<std::vector<u32>, 4> flats;
+    // Leaves the memo's replay: the buffers of the permutations before `end` were the memo's.
+    const auto stop_replay = [&](size_t end) {
+        memo_usable = false;
+        flats.clear();
+        for (size_t i = 0; i < end; ++i) {
+            flats.push_back(i < memo.flats.size() ? memo.flats[i] : std::vector<u32>{});
+        }
+    };
     for (size_t perm_idx = 0; perm_idx < program->modules.size(); ++perm_idx) {
         auto& permutation = program->modules[perm_idx];
         if (!permutation.info) {
+            if (memo_stage && !memo_usable) {
+                flats.emplace_back();
+            }
             continue;
         }
         auto& info = *permutation.info;
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
         info.RefreshFlatBuf();
-        const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
-        // Newly active resources must match the compiled specialization; inactive ones can reuse
-        // it.
-        if (permutation.spec != spec) {
-            if (program->modules.size() >= 4 && mismatch_reasons.size() < 600) {
+        if (memo_usable && (perm_idx > memo.perm || memo.flats[perm_idx] != info.flattened_ud_buf)) {
+            // The inputs differ from here on; the search goes on the usual way.
+            stop_replay(perm_idx);
+        }
+        if (memo_stage && !memo_usable) {
+            flats.push_back(info.flattened_ud_buf);
+        }
+        bool matches;
+        if (memo_usable) {
+            matches = perm_idx == memo.perm;
+        } else {
+            const auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+            matches = permutation.spec == spec;
+            if (!matches && program->modules.size() >= 4 && mismatch_reasons.size() < 600) {
                 u32 index{};
                 const char* reason = permutation.spec.FirstDifference(spec, index);
                 mismatch_reasons +=
                     fmt::format(" {}:{}[{}]", perm_idx, reason ? reason : "none", index);
             }
+        }
+        // Newly active resources must match the compiled specialization; inactive ones can reuse
+        // it.
+        if (!matches) {
             continue;
         }
         if (permutation.stored) {
@@ -2010,8 +2045,21 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             permutation.module = LoadStoredModule(params.hash, perm_idx);
             if (!permutation.module) {
                 permutation.info.reset();
+                if (memo_usable) {
+                    stop_replay(perm_idx + 1);
+                }
+                memo.valid = false;
                 continue;
             }
+        }
+        if (memo_stage && !memo_usable) {
+            memo.valid = true;
+            memo.perm = perm_idx;
+            memo.modules_size = program->modules.size();
+            memo.runtime_info = runtime_info;
+            memo.start = start_binding;
+            memo.user_data.assign(params.user_data.begin(), params.user_data.end());
+            memo.flats.assign(flats.begin(), flats.end());
         }
         if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
             RecoverAttributeFlags(info, permutation.spec, params, runtime_info, perm_idx);
