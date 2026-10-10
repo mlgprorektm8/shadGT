@@ -805,6 +805,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/string_util.h
            src/common/sampling_profiler.cpp
            src/common/nvtx.h
+           src/common/read_capture.cpp
+           src/common/read_capture.h
            src/common/sampling_profiler.h
            src/common/perf_monitor.cpp
            src/common/perf_monitor.h

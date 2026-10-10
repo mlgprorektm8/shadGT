@@ -520,6 +520,11 @@ struct SignalImpl : public PageManager::Impl {
                             Common::SamplingProfiler::DescribeStack());
             }
         }
+        if (!is_gpu_thread) {
+            // PERF-063: the game was told work is done (an early fence) that the recorder has
+            // not recorded yet; if it reads this page, the access waits for it.
+            rasterizer->WaitForEarlyFences(PageManager::GetPageAddr(addr));
+        }
         // PERF-054: the command thread's fault is flushed as urgent work on the recorder,
         // which then holds the caches; otherwise this thread drains the recorder and uses them.
         const bool assume_locks = is_gpu_thread && !rasterizer->CommandThreadFaultIsUrgent();
@@ -553,6 +558,11 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 }
 
 PageManager::~PageManager() = default;
+
+bool PageManager::IsUnwatched(VAddr page) const {
+    const auto* state = impl->cached_pages.find(page >> PM_PAGE_BITS);
+    return !state || (state->num_write_watchers == 0 && state->num_read_watchers == 0);
+}
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);

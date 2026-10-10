@@ -44,6 +44,7 @@ void DrawPipe::Push(Work&& work) {
     }
     queue.push_back(std::move(work));
     ++pushed;
+    pushed_jobs.store(pushed, std::memory_order_release);
     ++stats.pushed;
     stats.max_queued = std::max(stats.max_queued, queue.size());
     if (recorder_waiting) {
@@ -170,6 +171,7 @@ void DrawPipe::Run(std::stop_token stop) {
             batch.pop_front();
             work();
             ++ran;
+            finished_jobs.fetch_add(1, std::memory_order_release);
             RunUrgent();
         }
         std::scoped_lock lk{mutex};

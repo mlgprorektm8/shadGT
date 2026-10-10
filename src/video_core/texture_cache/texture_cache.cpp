@@ -12,6 +12,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/read_capture.h"
 #include "common/path_util.h"
 #include "common/hash.h"
 #include "common/perf_monitor.h"
@@ -1168,7 +1169,10 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
         const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
         const u32 size = s_w * s_h * (image.info.num_bits / 8);
-        const u64 hash = XXH3_64bits(addr, size);
+        // PERF-063: through the recorder's capture, like the upload that may follow.
+        std::array<u8, 8 * 8 * 16> first_pixels;
+        Common::CopyGuest(first_pixels.data(), addr, std::min<size_t>(size, first_pixels.size()));
+        const u64 hash = XXH3_64bits(first_pixels.data(), std::min<size_t>(size, first_pixels.size()));
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;

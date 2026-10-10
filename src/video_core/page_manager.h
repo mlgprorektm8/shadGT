@@ -46,6 +46,10 @@ public:
                                      const RegionBits& write_mask, const RegionBits& read_mask,
                                      PageOp write_op, PageOp read_op) const;
 
+    /// PERF-063: whether a CPU write to the page goes unnoticed (no write or read watcher, so
+    /// the page is neither write- nor read-protected). Any thread; a racy but word-sized read.
+    bool IsUnwatched(VAddr page) const;
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);

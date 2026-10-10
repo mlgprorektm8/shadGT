@@ -11,6 +11,7 @@
 #include "core/libraries/kernel/memory.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
+#include "common/read_capture.h"
 #include "core/memory.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -143,6 +144,17 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
     // Pretend the entire PRT area is mapped to avoid GPU tracking errors.
     // The caches will use CopySparseMemory to fetch data which avoids unmapped areas.
     rasterizer->MapMemory(address, size);
+}
+
+void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size,
+                                     const Common::ReadCapture* capture) {
+    if (!capture) {
+        CopySparseMemory(virtual_addr, dest, size);
+        return;
+    }
+    capture->Copy(virtual_addr, dest, size, [this](VAddr address, u8* to, u64 n) {
+        CopySparseMemory(address, to, n);
+    });
 }
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {

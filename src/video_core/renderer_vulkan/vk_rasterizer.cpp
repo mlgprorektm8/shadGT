@@ -242,7 +242,7 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
         if (InstallDrawStages(pipeline, selected_pipeline->stages, true)) {
             ++select_stats.compute_ahead;
             static const bool verify = !Common::LeanRun();
-            if (!verify || ++select_verify_count % 64 != 0) {
+            if (!verify || read_capture || ++select_verify_count % 64 != 0) {
                 return pipeline;
             }
             ++select_stats.verified;
@@ -290,7 +290,13 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
 }
 
 void Rasterizer::HashDrawPagesAhead(const SelectedPipeline& selected, u32 epoch) {
-    static const bool enabled = Common::PerfFeatureEnabled(70) &&
+    // Opt-in (SHADGT_HASH_AHEAD=1): in the October 10 Nurburgring benchmark it hashed about
+    // 600,000 pages per 2 s ahead (a new upload epoch starts about 10 times a frame) of which a
+    // quarter were used, and decoding a submission went from 5 to 14 ms (27 FPS against 35).
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADGT_HASH_AHEAD");
+        return env && env[0] == '1';
+    }() && Common::PerfFeatureEnabled(70) &&
                                 EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Precise;
     if (!enabled) {
         return;
@@ -338,6 +344,144 @@ void Rasterizer::HashDrawPagesAhead(const SelectedPipeline& selected, u32 epoch)
     if (!ranges.empty()) {
         buffer_cache.HashPagesAhead(std::span{ranges.data(), ranges.size()}, epoch);
     }
+}
+
+bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
+                                  Common::ReadCapture& capture, VAddr index_address,
+                                  u64 index_size) {
+    const Pipeline* pipeline = selected.is_compute
+                                   ? static_cast<const Pipeline*>(selected.compute)
+                                   : static_cast<const Pipeline*>(selected.pipeline);
+    if (!pipeline) {
+        return false;
+    }
+    auto& scan = capture_scan;
+    if (scan.capture_id != capture.Id()) {
+        scan.capture_id = capture.Id();
+        scan.ranges.clear();
+    }
+    thread_local std::array<u8, Common::ReadCapture::PageSize> page_bytes;
+    bool complete = true;
+    // Copies the unprotected pages of a range (each range once per capture).
+    const auto capture_range = [&](VAddr address, u64 size) {
+        if (address == 0 || size == 0) {
+            return;
+        }
+        if (size > 64_MB || !IsMappedStart(address)) {
+            // Not read by the recorder either (bound null), or too large to cover.
+            if (size > 64_MB) {
+                complete = false;
+            }
+            return;
+        }
+        size = memory->ClampRangeSize(address, size);
+        const u64 key = (address * 0x9E3779B97F4A7C15ull) ^ size;
+        if (!scan.ranges.insert(key).second) {
+            return;
+        }
+        for (VAddr page = Common::AlignDown(address, Common::ReadCapture::PageSize);
+             page < address + size; page += Common::ReadCapture::PageSize) {
+            ++scan.pages_checked;
+            if (!page_manager.IsUnwatched(page)) {
+                // Protected: a CPU write faults; the fault waits while this work is pending.
+                // Pages of large ranges (shadow maps, big textures the game does not rewrite
+                // during play) are not listed, to keep the list small.
+                if (size <= 8_MB && !capture.AddWatched(page)) {
+                    complete = false;
+                    return;
+                }
+                continue;
+            }
+            if (capture.Has(page)) {
+                continue;
+            }
+            memory->CopySparseMemory(page, page_bytes.data(), page_bytes.size());
+            if (!capture.Add(page, page_bytes.data())) {
+                complete = false;
+                return;
+            }
+        }
+    };
+    struct FlatView {
+        const std::vector<u32>& flattened_ud_buf;
+        VAddr pgm_base;
+    };
+    const auto& canonical = pipeline->CanonicalStages();
+    for (u32 stage = 0; stage < Shader::MaxStageTypes && complete; ++stage) {
+        const auto& sel = selected.stages[stage];
+        const Shader::Info* info = canonical[stage];
+        if (!info || !sel.present) {
+            continue;
+        }
+        if (info->hw_stage == Shader::HwStage::Hull) {
+            return false; // Tessellation constants are read through a pointer; not covered.
+        }
+        const FlatView view{sel.flattened, sel.pgm_base};
+        for (const auto& desc : info->buffers) {
+            if (desc.IsSpecial()) {
+                continue;
+            }
+            if (!desc.sharp_fetch.FitsIn(sel.flattened.size())) {
+                return false;
+            }
+            const auto vsharp = desc.GetSharp(view);
+            if (vsharp.num_records == UINT32_MAX) {
+                return false;
+            }
+            capture_range(vsharp.base_address, vsharp.GetSize());
+        }
+        for (const auto& desc : info->images) {
+            if (!desc.sharp_fetch.FitsIn(sel.flattened.size())) {
+                return false;
+            }
+            const auto tsharp = desc.GetSharp(view);
+            if (tsharp.Address() == 0 ||
+                tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid ||
+                !magic_enum::enum_contains(tsharp.GetDataFmt()) ||
+                !magic_enum::enum_contains(tsharp.GetNumberFmt()) ||
+                VideoCore::CheckImageDescriptorGeometry(tsharp, instance.GetImageLimits()) !=
+                    VideoCore::ImageDescriptorGeometryError::None) {
+                continue; // Bound null by the recorder.
+            }
+            const VideoCore::TextureCache::ImageDesc image{tsharp, desc};
+            capture_range(image.info.guest_address, image.info.guest_size);
+        }
+    }
+    if (!complete) {
+        return false;
+    }
+    if (!selected.is_compute) {
+        // Vertex buffers: their V#s are read through a pointer in the vertex shader's user
+        // data; the V# table entries are captured as well as the buffers.
+        const auto& fetch = selected.pipeline->GetFetchShader();
+        const auto& vs = selected.stages[u32(Shader::SwStage::Vertex)];
+        if (!fetch.attributes.empty() && !vs.present) {
+            return false;
+        }
+        for (const auto& attrib : fetch.attributes) {
+            if (attrib.sgpr_base == Shader::IR::NumScalarRegs ||
+                attrib.sgpr_base + 1u >= vs.num_user_data) {
+                return false;
+            }
+            VAddr table;
+            std::memcpy(&table, &vs.user_data[attrib.sgpr_base], sizeof(table));
+            table &= 0xFFFFFFFFFFFFULL;
+            const VAddr entry = table + attrib.dword_offset * sizeof(u32);
+            capture_range(entry, sizeof(AmdGpu::Buffer));
+            if (!complete || !IsMappedStart(entry)) {
+                return false;
+            }
+            AmdGpu::Buffer vsharp;
+            capture.Copy(entry, reinterpret_cast<u8*>(&vsharp), sizeof(vsharp),
+                         [this](VAddr address, u8* to, u64 n) {
+                             memory->CopySparseMemory(address, to, n);
+                         });
+            vsharp.base_address += attrib.inst_offset;
+            capture_range(vsharp.base_address, vsharp.GetSize());
+        }
+        capture_range(index_address, std::min<u64>(index_size, 16_MB));
+    }
+    return complete;
 }
 
 Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical) {
@@ -423,7 +567,8 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
             // Every 64th selection is checked against one made here, from the recorder's
             // registers and memory; a difference is reported and this one used.
             static const bool verify = !Common::LeanRun();
-            if (!verify || ++select_verify_count % 64 != 0) {
+            // PERF-063: not for captured work; the game may have rewritten the memory.
+            if (!verify || read_capture || ++select_verify_count % 64 != 0) {
                 return pipeline;
             }
             ++stats.verified;
@@ -1377,6 +1522,13 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     const bool earlier_deferred = keep_order && deferred_fences.load() != 0;
     if (!readbacks_pending && !address_pending && !earlier_deferred) {
         return false;
+    }
+    if (readbacks_pending) {
+        last_readback_fence_ns.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count(),
+            std::memory_order_relaxed);
     }
     texture_cache.ReleaseFinishedReadbacks();
     buffer_cache.ReleaseFinishedAsyncReadbacks();
@@ -3141,6 +3293,10 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks, u64 e
     buffer_cache.InvalidateMemory(addr, size, assume_locks, exact_write_size);
     texture_cache.InvalidateMemory(addr, size);
     return true;
+}
+
+void Rasterizer::WaitForEarlyFences(VAddr page) {
+    liverpool->WaitForEarlyFences(page);
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {

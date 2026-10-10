@@ -9,6 +9,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <coroutine>
+#include <deque>
+#include <map>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -29,6 +31,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/read_ahead_states.h"
+#include "common/read_capture.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/amdgpu/regs_delta.h"
 
@@ -344,6 +347,36 @@ private:
     static inline thread_local RecorderState* recorder_state = nullptr;
     std::unique_ptr<RecorderState> recorder;
     std::unique_ptr<DrawPipe> draw_pipe;
+    // PERF-063: early fences. The work queued since the last fence ("window") reads guest
+    // memory through a capture taken at decode; when all of it does, the fence that ends the
+    // window is signaled at decode.
+    int early_fences_mode{};
+    std::shared_ptr<Common::ReadCapture> window_capture;
+    bool window_safe{true};
+    std::atomic<u64> fences_decoded{};
+    std::atomic<u64> fences_delivered{};
+    struct EarlyWindow {
+        std::shared_ptr<Common::ReadCapture> capture;
+        u64 end_job; // the recorder has recorded the window when it finished this many jobs
+    };
+    std::mutex early_windows_mutex;
+    std::deque<EarlyWindow> early_windows;
+    struct EarlyStats {
+        u64 early{};
+        u64 normal{};
+        std::map<std::string, u64> unsafe;
+        u64 earlier_fence_pending{};
+        u64 deferred_pending{};
+        u64 recent_readbacks{};
+        u64 windows_captured{};
+        u64 pages_captured{};
+        u64 full{};
+    } early_stats;
+    std::chrono::steady_clock::time_point early_report{};
+    std::atomic<u64> guard_waits{};
+    std::atomic<u64> guard_wait_us{};
+    std::atomic<u64> guard_skipped_in_wait{};
+    std::atomic<bool> recorder_in_wait{};
     std::atomic<bool> pipelined{};
     RegsDelta<Regs::NumRegs> regs_dirty;
     u32 verify_interval{};
@@ -437,6 +470,24 @@ private:
     void VerifyRecorderRegs(const Regs& expected);
     /// Runs work on the recorder thread behind everything queued before it (inline without one).
     void Record(Common::UniqueFunction<void>&& work);
+    /// PERF-063: queues work that reads no guest memory and writes none the CPU reads
+    /// (submission bookkeeping, markers, fence-ordered waits); it keeps the window safe.
+    void RecordSafe(Common::UniqueFunction<void>&& work);
+    /// PERF-063: the work queued since the last fence is not all covered by a capture.
+    void UnsafeWindow(const char* reason);
+    /// PERF-063: whether the graphics fence being decoded may be signaled now.
+    bool EarlyFenceAllowed();
+    /// PERF-063: after a graphics fence signaled at decode.
+    void NoteEarlyFence();
+    /// PERF-063: the work after a fence goes into a new window.
+    void NewWindow();
+    void ReportEarlyFences();
+
+public:
+    /// PERF-063: a CPU fault on a game thread (see Rasterizer::WaitForEarlyFences).
+    void WaitForEarlyFences(VAddr page);
+
+private:
     /// Records a draw or dispatch together with the registers written since the previous one.
     /// `direct_draw`: a draw packet with its counts in the packet (PERF-047 selects its pipeline
     /// here, while decoding).

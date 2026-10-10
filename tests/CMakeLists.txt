@@ -141,6 +141,13 @@ target_compile_features(shadps4_fault_download_ranges_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_fault_download_ranges_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_fault_download_ranges_test)
 
+add_executable(shadps4_read_capture_test test_read_capture.cpp
+               ${CMAKE_SOURCE_DIR}/src/common/read_capture.cpp)
+target_include_directories(shadps4_read_capture_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_read_capture_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_read_capture_test PRIVATE GTest::gtest_main xxHash::xxhash)
+gtest_discover_tests(shadps4_read_capture_test)
+
 add_executable(shadps4_recycling_pool_test test_recycling_pool.cpp)
 target_include_directories(shadps4_recycling_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_recycling_pool_test PRIVATE cxx_std_23)

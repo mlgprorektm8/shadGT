@@ -62,6 +62,14 @@ public:
         return exclusive;
     }
 
+    /// PERF-063: jobs pushed so far (command thread) and jobs finished (any thread).
+    u64 PushedJobs() const noexcept {
+        return pushed_jobs.load(std::memory_order_acquire);
+    }
+    u64 FinishedJobs() const noexcept {
+        return finished_jobs.load(std::memory_order_acquire);
+    }
+
     bool OnRecorderThread() const {
         return std::this_thread::get_id() == recorder_id.load(std::memory_order_acquire);
     }
@@ -96,6 +104,8 @@ private:
     bool urgent_running{};
     u64 pushed{};
     u64 finished{};
+    std::atomic<u64> pushed_jobs{};
+    std::atomic<u64> finished_jobs{};
     bool recorder_waiting{};
     const size_t max_pending;
     std::atomic<std::thread::id> recorder_id{};

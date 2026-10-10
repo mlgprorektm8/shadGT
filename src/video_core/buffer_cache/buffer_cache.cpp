@@ -78,10 +78,11 @@ public:
         return pieces;
     }
 
-    void Run(Core::MemoryManager* memory) {
+    void Run(Core::MemoryManager* memory, const Common::ReadCapture* capture) {
         {
             std::scoped_lock lk{mutex};
             memory_manager = memory;
+            read_capture = capture;
             next.store(0, std::memory_order_relaxed);
             done.store(0, std::memory_order_relaxed);
             batch_open = true;
@@ -126,13 +127,15 @@ private:
         for (size_t i = next.fetch_add(1, std::memory_order_relaxed); i < count;
              i = next.fetch_add(1, std::memory_order_relaxed)) {
             const auto& piece = pieces[i];
-            memory_manager->CopySparseMemory(piece.source, piece.destination, piece.size);
+            memory_manager->CopySparseMemory(piece.source, piece.destination, piece.size,
+                                             read_capture);
             done.fetch_add(1, std::memory_order_acq_rel);
         }
     }
 
     std::vector<Piece> pieces;
     Core::MemoryManager* memory_manager{};
+    const Common::ReadCapture* read_capture{};
     std::atomic<size_t> next{};
     std::atomic<size_t> done{};
     std::atomic<u32> active{};
@@ -1048,7 +1051,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
         ((skip_alias_walk && !images_overlap) || !HasGpuImageAlias(device_addr, size))) {
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
-        memory->CopySparseMemory(device_addr, data, size);
+        memory->CopySparseMemory(device_addr, data, size, read_capture);
         stream_buffer.Commit();
         ++Common::GetWorkCounters().obtain_stream;
         return {&stream_buffer, offset};
@@ -1084,7 +1087,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     }
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
-    memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
+    memory->CopySparseMemory(device_addr, staging.mapped, staging.size, read_capture);
     staging.Flush();
     return {staging.buffer, staging.offset};
 }
@@ -1400,7 +1403,25 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         range_end.push_back(hot.size());
     }
     hot_hashes.resize(hot.size());
-    if (draw_epoch != 0 && !hot.empty()) {
+    if (read_capture && !hot.empty()) {
+        // PERF-063: pages captured at decode come with their hash; the rest are hashed here.
+        auto& misses = scratch.misses;
+        misses.clear();
+        for (size_t i = 0; i < hot.size(); ++i) {
+            if (!read_capture->Find(hot[i].first, &hot_hashes[i])) {
+                misses.push_back(i);
+            }
+        }
+        capture_hash_hits += hot.size() - misses.size();
+        capture_hash_misses += misses.size();
+        auto& miss_hashes = scratch.miss_hashes;
+        miss_hashes.resize(misses.size());
+        HashPages(misses.size(), [&](size_t j) { return hot[misses[j]].first; },
+                  std::span<u64>{miss_hashes.data(), miss_hashes.size()});
+        for (size_t j = 0; j < misses.size(); ++j) {
+            hot_hashes[misses[j]] = miss_hashes[j];
+        }
+    } else if (draw_epoch != 0 && !hot.empty()) {
         // PERF-062: hashes the command thread took when it decoded this draw, in its epoch.
         auto& misses = scratch.misses;
         misses.clear();
@@ -1502,7 +1523,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                                       std::min(PieceSize, copy.size - done_bytes)});
                 }
             }
-            copier.Run(memory);
+            copier.Run(memory, read_capture);
             for (auto& copy : copies) {
                 copy.srcOffset += staging.offset;
                 copy.dstOffset -= arena->cpu_addr;
@@ -1510,7 +1531,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         } else {
             for (auto& copy : copies) {
                 memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset,
-                                         copy.size);
+                                         copy.size, read_capture);
                 copy.srcOffset += staging.offset;
                 copy.dstOffset -= arena->cpu_addr;
             }
@@ -1521,8 +1542,15 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     if (!hot_uploads.empty()) {
         // A page the CPU wrote while it was copied gets no record and is uploaded next time.
         boost::container::small_vector<u64, 16> after(hot_uploads.size());
-        HashPages(hot_uploads.size(), [&](size_t i) { return hot_uploads[i].page; },
-                  std::span<u64>{after.data(), after.size()});
+        if (read_capture) {
+            // PERF-063: the upload copied the captured bytes, which do not change.
+            for (size_t i = 0; i < hot_uploads.size(); ++i) {
+                after[i] = HashGuestPage(hot_uploads[i].page);
+            }
+        } else {
+            HashPages(hot_uploads.size(), [&](size_t i) { return hot_uploads[i].page; },
+                      std::span<u64>{after.data(), after.size()});
+        }
         std::scoped_lock lk{uploaded_pages_mutex};
         for (size_t i = 0; i < hot_uploads.size(); ++i) {
             const auto& upload = hot_uploads[i];
@@ -1539,6 +1567,14 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
 static constexpr u64 WatchedPageBits = 12;
 static constexpr u64 WatchedPageSize = u64{1} << WatchedPageBits;
 
+u64 BufferCache::HashGuestPage(VAddr page) const {
+    u64 hash;
+    if (read_capture && read_capture->Find(page, &hash)) {
+        return hash;
+    }
+    return XXH3_64bits(std::bit_cast<const void*>(page), BYTES_PER_PAGE);
+}
+
 void BufferCache::RecordWatchedUploads(VAddr start, VAddr end) {
     std::scoped_lock lk{vertex_pages_mutex};
     if (vertex_page_hashes.empty()) {
@@ -1549,7 +1585,7 @@ void BufferCache::RecordWatchedUploads(VAddr start, VAddr end) {
          page += WatchedPageSize) {
         const auto it = vertex_page_hashes.find(page >> WatchedPageBits);
         if (it != vertex_page_hashes.end()) {
-            it->second = XXH3_64bits(std::bit_cast<const void*>(page), WatchedPageSize);
+            it->second = HashGuestPage(page);
         }
     }
 }
@@ -1702,7 +1738,7 @@ void BufferCache::RefreshReadPages(VAddr address, u64 size, u64 shader_hash, boo
         static_assert(WatchedPageSize == BYTES_PER_PAGE);
         u64 hash;
         if (!prehashed || !prehashed->Lookup(page, epoch, hash)) {
-            hash = XXH3_64bits(std::bit_cast<const void*>(page), WatchedPageSize);
+            hash = HashGuestPage(page);
         }
         const auto [it, inserted] = vertex_page_hashes.try_emplace(page >> WatchedPageBits, hash);
         if (inserted) {

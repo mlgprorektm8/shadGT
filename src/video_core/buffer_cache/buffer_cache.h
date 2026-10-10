@@ -23,6 +23,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "common/read_capture.h"
 #include "video_core/buffer_cache/page_hash_table.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/buffer_cache/uploaded_pages.h"
@@ -114,6 +115,14 @@ public:
     void SetDrawEpoch(u32 epoch) {
         draw_epoch = epoch;
     }
+
+    /// PERF-063 (recorder): the capture of the job being recorded (null: guest memory as is).
+    void SetReadCapture(const Common::ReadCapture* capture) {
+        read_capture = capture;
+    }
+
+    /// PERF-063: XXH3 of a guest page, from the current capture when it holds the page.
+    u64 HashGuestPage(VAddr page) const;
 
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
@@ -308,8 +317,11 @@ private:
     // PERF-062: hot-page hashes taken by the command thread as it decodes draws.
     PageHashTable ahead_hashes;
     u32 draw_epoch{};
+    const Common::ReadCapture* read_capture{};
     std::atomic<u64> ahead_hashed{};
     u64 ahead_hits{};
+    u64 capture_hash_hits{};   // PERF-063
+    u64 capture_hash_misses{};
     u64 ahead_misses{};
     // PERF-049: hot-page hashes taken ahead on a background thread.
     std::unique_ptr<HotPagePrehasher> prehasher;

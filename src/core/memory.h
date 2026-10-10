@@ -28,6 +28,10 @@ namespace Core::Devtools::Widget {
 class MemoryMapViewer;
 }
 
+namespace Common {
+class ReadCapture;
+}
+
 namespace Core {
 
 constexpr u64 DEFAULT_MAPPING_BASE = 0x200000000;
@@ -325,6 +329,8 @@ public:
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
+    /// PERF-063: pages the capture holds are taken from it.
+    void CopySparseMemory(VAddr source, u8* dest, u64 size, const Common::ReadCapture* capture);
 
     bool TryWriteBacking(void* address, const void* data, u64 size,
                          std::source_location loc = std::source_location::current());

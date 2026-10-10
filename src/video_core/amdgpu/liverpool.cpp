@@ -14,6 +14,7 @@
 
 #include "common/assert.h"
 #include "common/sampling_profiler.h"
+#include "common/scope_exit.h"
 #include "common/debug.h"
 #include "common/guest_clock.h"
 #include "common/nvtx.h"
@@ -340,6 +341,15 @@ void Liverpool::StartDrawPipe() {
 #endif
     });
     pipe_report_start = std::chrono::steady_clock::now();
+    // PERF-063: SHADGT_EARLY_FENCES=1 signals graphics fences at decode when the work before
+    // them reads guest memory only through a capture (=2: also right after fences that waited
+    // for readbacks). Needs the command thread's selections as they are (PERF-061).
+    if (const char* env = std::getenv("SHADGT_EARLY_FENCES");
+        env && (env[0] == '1' || env[0] == '2') && Common::PerfFeatureEnabled(71) &&
+        Common::PerfFeatureEnabled(69) && rasterizer && rasterizer->SelectsPipelinesAhead()) {
+        early_fences_mode = env[0] - '0';
+        LOG_WARNING(Render, "PERF-063: early fences on (mode {})", early_fences_mode);
+    }
     pipelined.store(true, std::memory_order_release);
     LOG_WARNING(
         Render, "PERF-031: draws are recorded on a second thread (draw pipe){}{}",
@@ -354,11 +364,147 @@ bool Liverpool::WaitTurnsEnabled() {
 }
 
 void Liverpool::Record(Common::UniqueFunction<void>&& work) {
+    if (early_fences_mode) {
+        UnsafeWindow("command");
+    }
     if (draw_pipe) {
         draw_pipe->Push(std::move(work));
     } else {
         work();
     }
+}
+
+void Liverpool::RecordSafe(Common::UniqueFunction<void>&& work) {
+    if (draw_pipe) {
+        draw_pipe->Push(std::move(work));
+    } else {
+        work();
+    }
+}
+
+void Liverpool::UnsafeWindow(const char* reason) {
+    if (window_safe) {
+        window_safe = false;
+        ++early_stats.unsafe[reason];
+    }
+}
+
+void Liverpool::NewWindow() {
+    if (window_capture) {
+        ++early_stats.windows_captured;
+        early_stats.pages_captured += window_capture->NumPages();
+        early_stats.full += window_capture->Full();
+    }
+    window_capture.reset();
+    window_safe = true;
+}
+
+bool Liverpool::EarlyFenceAllowed() {
+    if (!early_fences_mode || !draw_pipe || !rasterizer) {
+        return false;
+    }
+    if (!window_safe) {
+        return false; // counted by UnsafeWindow
+    }
+    if (fences_delivered.load(std::memory_order_acquire) !=
+        fences_decoded.load(std::memory_order_relaxed)) {
+        // Fences reach memory in order (FIX-049): an earlier one is still to be recorded.
+        ++early_stats.earlier_fence_pending;
+        return false;
+    }
+    if (rasterizer->DeferredFencesPending()) {
+        ++early_stats.deferred_pending;
+        return false;
+    }
+    if (early_fences_mode == 1) {
+        // The game read GPU results with a recent fence (image readbacks): keep fences in
+        // step with the recorder for a while, so it does not read them before they exist.
+        const s64 last = rasterizer->LastReadbackFenceNs();
+        if (last != 0 && NowNs() - last < 2'000'000'000) {
+            ++early_stats.recent_readbacks;
+            return false;
+        }
+    }
+    return true;
+}
+
+void Liverpool::NoteEarlyFence() {
+    ++early_stats.early;
+    fences_decoded.fetch_add(1, std::memory_order_relaxed);
+    fences_delivered.fetch_add(1, std::memory_order_release);
+    if (window_capture) {
+        std::scoped_lock lk{early_windows_mutex};
+        early_windows.push_back({window_capture, draw_pipe->PushedJobs()});
+    }
+    NewWindow();
+}
+
+void Liverpool::WaitForEarlyFences(VAddr page) {
+    if (!early_fences_mode || !draw_pipe) {
+        return;
+    }
+    u64 wait_until = 0;
+    {
+        std::scoped_lock lk{early_windows_mutex};
+        const u64 done = draw_pipe->FinishedJobs();
+        while (!early_windows.empty() && early_windows.front().end_job <= done) {
+            early_windows.pop_front();
+        }
+        for (const auto& window : early_windows) {
+            if (window.capture->Lists(page)) {
+                wait_until = std::max(wait_until, window.end_job);
+            }
+        }
+    }
+    if (wait_until == 0 || draw_pipe->FinishedJobs() >= wait_until) {
+        return;
+    }
+    Common::Nvtx::Scope nvtx{"CPU fault: wait for early-fenced work"}; // DIAG-056
+    const auto start = std::chrono::steady_clock::now();
+    while (draw_pipe->FinishedJobs() < wait_until) {
+        if (recorder_in_wait.load(std::memory_order_acquire)) {
+            // The recorder waits for memory a CPU thread writes; it may be this one.
+            ++guard_skipped_in_wait;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    ++guard_waits;
+    guard_wait_us += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count());
+}
+
+void Liverpool::ReportEarlyFences() {
+    if (!early_fences_mode) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (early_report == std::chrono::steady_clock::time_point{}) {
+        early_report = now;
+        return;
+    }
+    if (now - early_report < std::chrono::seconds{2}) {
+        return;
+    }
+    auto& st = early_stats;
+    std::string unsafe;
+    for (const auto& [reason, n] : st.unsafe) {
+        unsafe += fmt::format(" {}={}", reason, n);
+    }
+    LOG_WARNING(Render,
+                "PERF-063 early fences in {:.1f} s: {} signaled at decode, {} in step with the "
+                "recorder (windows not covered:{}; earlier fence pending {}, deferred fences {}, "
+                "recent readbacks {}); {} windows captured, {:.1f} pages each, {} full; CPU "
+                "faults waited {} times, {:.1f} ms ({} not waited: recorder in a wait)",
+                std::chrono::duration<double>(now - early_report).count(), st.early, st.normal,
+                unsafe.empty() ? " none" : unsafe, st.earlier_fence_pending, st.deferred_pending,
+                st.recent_readbacks, st.windows_captured,
+                st.windows_captured ? double(st.pages_captured) / st.windows_captured : 0.0,
+                st.full, guard_waits.exchange(0), guard_wait_us.exchange(0) / 1000.0,
+                guard_skipped_in_wait.exchange(0));
+    st = {};
+    early_report = now;
 }
 
 void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw) {
@@ -391,10 +537,36 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     if (selected) {
         rasterizer->HashDrawPagesAhead(*selected, decode_epoch);
     }
+    // PERF-063: the pages the draw reads that the CPU can rewrite without a fault are copied
+    // now; the recorder reads the copies.
+    std::shared_ptr<Common::ReadCapture> capture;
+    if (early_fences_mode) {
+        if (selected) {
+            if (!window_capture) {
+                window_capture = std::make_shared<Common::ReadCapture>(16384);
+            }
+            VAddr index_address = 0;
+            u64 index_size = 0;
+            if (!compute && regs.index_base_address.Address<VAddr>() != 0) {
+                const u32 index_bytes =
+                    regs.index_buffer_type.index_type == IndexType::Index16 ? 2 : 4;
+                index_address = regs.index_base_address.Address<VAddr>();
+                index_size = u64(regs.max_index_size) * index_bytes;
+            }
+            if (rasterizer->CaptureDrawReads(*selected, *window_capture, index_address,
+                                             index_size)) {
+                capture = window_capture;
+            } else {
+                UnsafeWindow("draw not captured");
+            }
+        } else {
+            UnsafeWindow(compute ? "dispatch not selected ahead" : "draw not selected ahead");
+        }
+    }
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
-                     decode_epoch]() mutable {
+                     decode_epoch, capture = std::move(capture)]() mutable {
         auto& state = *recorder;
         RegsDelta<Regs::NumRegs>::Apply(delta, std::span<u32, Regs::NumRegs>{state.regs.reg_array});
         if (cs) {
@@ -407,7 +579,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         }
         rasterizer->SetSelectedPipeline(selected ? &*selected : nullptr);
         rasterizer->SetDrawEpoch(selected ? decode_epoch : 0);
+        rasterizer->SetReadCapture(capture.get());
         draw();
+        rasterizer->SetReadCapture(nullptr);
         rasterizer->SetDrawEpoch(0);
         rasterizer->SetSelectedPipeline(nullptr);
         delta_recycler.Give(std::move(delta));
@@ -419,6 +593,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         OfferDrawState();
     }
     ReportDrawPipe();
+    ReportEarlyFences();
 }
 
 // PERF-037: the registers the draw packets write, left out of the read-ahead state hash.
@@ -494,6 +669,12 @@ void Liverpool::RecordLabelWrite(VAddr address, std::vector<u8> value,
         return;
     }
     const u64 job = ++label_jobs;
+    if (early_fences_mode) {
+        // PERF-063: a fence written by the recorder; the next window starts after it.
+        ++early_stats.normal;
+        fences_decoded.fetch_add(1, std::memory_order_relaxed);
+        NewWindow();
+    }
     if (waited_label != 0 && address <= waited_label && waited_label < address + value.size()) {
         ++labels_written_while_waiting; // DIAG-047
     }
@@ -503,6 +684,9 @@ void Liverpool::RecordLabelWrite(VAddr address, std::vector<u8> value,
     }
     draw_pipe->Push([this, address, job, work = std::move(work)] {
         work();
+        if (early_fences_mode) {
+            fences_delivered.fetch_add(1, std::memory_order_release);
+        }
         std::scoped_lock lk{pending_labels_mutex};
         if (const auto it = pending_labels.find(address);
             it != pending_labels.end() && it->second.job == job) {
@@ -530,6 +714,11 @@ bool Liverpool::PendingLabelSatisfies(const PM4CmdWaitRegMem& wait) {
 }
 
 void Liverpool::RecorderWaitRegMem(const PM4CmdWaitRegMem& wait) {
+    // PERF-063: a CPU fault does not wait for the recorder while it may wait for that CPU.
+    recorder_in_wait.store(true, std::memory_order_release);
+    SCOPE_EXIT {
+        recorder_in_wait.store(false, std::memory_order_release);
+    };
     // The job that writes the label ran before this one. If its fence was deferred, the value
     // reaches memory when the GPU finishes, written by the scheduler's completion thread.
     const auto& state_regs = recorder->regs.reg_array;
@@ -806,7 +995,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 const auto decoded = std::chrono::steady_clock::now();
                 // PERF-031: the submission is finished once its recorded work is.
-                Record([this, submitted, decoded, ranges] {
+                RecordSafe([this, submitted, decoded, ranges] {
                     --num_submits;
                     u64 gpu_range = 0;
                     if (ranges) {
@@ -858,7 +1047,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
             });
         }
-        Record([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle); });
+        RecordSafe([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle); });
     }
 }
 
@@ -1088,7 +1277,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         const auto marker_sz = nop->header.count.Value() * 2;
                         std::string label{reinterpret_cast<const char*>(&nop->data_block[1]),
                                           marker_sz};
-                        Record([this, label = std::move(label)] {
+                        RecordSafe([this, label = std::move(label)] {
                             rasterizer->ScopeMarkerBegin(label, true);
                         });
                     }
@@ -1101,7 +1290,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                           marker_sz};
                         const u32 color = *reinterpret_cast<const u32*>(
                             reinterpret_cast<const u8*>(&nop->data_block[1]) + marker_sz);
-                        Record([this, label = std::move(label), color] {
+                        RecordSafe([this, label = std::move(label), color] {
                             rasterizer->ScopedMarkerInsertColor(label, color, true);
                         });
                     }
@@ -1109,7 +1298,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPop: {
                     if (guest_markers_enabled) {
-                        Record([this] { rasterizer->ScopeMarkerEnd(true); });
+                        RecordSafe([this] { rasterizer->ScopeMarkerEnd(true); });
                     }
                     break;
                 }
@@ -1550,12 +1739,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         const u64 counter = pixel_counter;
                         pixel_counter += OcclusionCounterStep;
                         // PERF-031: written in order with the draws before it.
-                        Record([results, counter, pairs = num_counter_pairs] {
+                        const auto write_results = [results, counter, pairs = num_counter_pairs] {
                             u64* result = results;
                             for (s32 i = 0; i < s32(pairs); ++i, result += 2) {
                                 *result = counter | OcclusionCounterValidMask;
                             }
-                        });
+                        };
+                        if (early_fences_mode) {
+                            // PERF-063: the values do not depend on the draws; written now, so
+                            // the window's fence may be signaled at decode.
+                            write_results();
+                        } else {
+                            Record(write_results);
+                        }
                     }
                 }
                 break;
@@ -1564,13 +1760,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEos*>(header);
                 if (draw_pipe && rasterizer &&
                     event.command != PM4CmdEventWriteEos::Command::GdsStore &&
-                    EarlyFencesActive()) {
+                    (EarlyFencesActive() || EarlyFenceAllowed())) {
                     // EXP-063: signaled now; the recorder only submits at this point.
                     event.SignalFence([](void* address, u64 data, u32 num_bytes) {
                         Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
                     });
                     ++g_fences_early;
-                    Record([this] { rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEos); });
+                    RecordSafe(
+                        [this] { rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEos); });
+                    if (early_fences_mode) {
+                        NoteEarlyFence();
+                    }
                     break;
                 }
                 // PERF-031: fences are signaled in order behind the recorded work.
@@ -1613,7 +1813,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto event = *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                if (draw_pipe && rasterizer && EarlyFencesActive()) {
+                if (draw_pipe && rasterizer && (EarlyFencesActive() || EarlyFenceAllowed())) {
                     // EXP-063: signaled now; the recorder only submits at this point.
                     event.SignalFence(
                         [](void* address, u64 data, u32 num_bytes) {
@@ -1624,7 +1824,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                         });
                     ++g_fences_early;
-                    Record([this] { rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEop); });
+                    RecordSafe(
+                        [this] { rasterizer->OnFence(Vulkan::Rasterizer::DrainSource::GfxEop); });
+                    if (early_fences_mode) {
+                        NoteEarlyFence();
+                    }
                     break;
                 }
                 // PERF-031: fences are signaled in order behind the recorded work.
@@ -1890,7 +2094,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                      ? dcb.size() - header->type3.NumWords() - 1
                                      : 0);
                         const u64 after_hash = XXH3_64bits(after, after_dwords * sizeof(u32));
-                        Record([this, wait = *wait_reg_mem, after, after_dwords, after_hash] {
+                        RecordSafe([this, wait = *wait_reg_mem, after, after_dwords,
+                                    after_hash] {
                             RecorderWaitRegMem(wait);
                             ++diag_moved_waits_checked;
                             if (XXH3_64bits(after, after_dwords * sizeof(u32)) != after_hash) {
@@ -2492,7 +2697,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 // PERF-031: a queued fence writes the label; the recorder waits for it in order.
                 ++waits_moved;
                 waits_moved_after_turns += yielded;
-                Record([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
+                RecordSafe([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
                 break;
             }
             // PERF-031: what is waited on may be written by recorded work; the pending-fence

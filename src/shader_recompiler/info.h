@@ -9,6 +9,7 @@
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
+#include "common/read_capture.h"
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/copy_shader.h"
@@ -179,7 +180,8 @@ struct Info : InfoPersistent {
             std::memcpy(&base, &user_data[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
         }
-        std::memcpy(&data, base + dword_offset, sizeof(T));
+        // PERF-063: on the recorder, guest bytes captured at decode are read from the capture.
+        Common::CopyGuest(&data, base + dword_offset, sizeof(T));
         return data;
     }
 
@@ -207,9 +209,9 @@ struct Info : InfoPersistent {
         auto buf = ReadUdReg<AmdGpu::Buffer>(static_cast<u32>(tess_consts_ptr_base),
                                              static_cast<u32>(tess_consts_dword_offset));
         VAddr tess_constants_addr = buf.base_address;
-        memcpy(&tess_constants,
-               reinterpret_cast<TessellationDataConstantBuffer*>(tess_constants_addr),
-               sizeof(tess_constants));
+        Common::CopyGuest(&tess_constants,
+                          reinterpret_cast<TessellationDataConstantBuffer*>(tess_constants_addr),
+                          sizeof(tess_constants));
     }
 
     void Serialize(Serialization::Archive& ar) const;

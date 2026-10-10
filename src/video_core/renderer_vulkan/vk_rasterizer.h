@@ -15,6 +15,7 @@
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "common/read_capture.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -82,6 +83,31 @@ public:
     /// PERF-062 (command thread): hashes the pages of the selected draw's read-only buffers for
     /// the upload epoch it is decoded in.
     void HashDrawPagesAhead(const SelectedPipeline& selected, u32 epoch);
+    /// PERF-063 (command thread): copies into the capture the unprotected guest pages the
+    /// selected draw or dispatch reads (buffers, vertex buffers and their V# tables, textures,
+    /// the index buffer). False when that is not known for all of them; the work is then not
+    /// covered by the capture.
+    bool CaptureDrawReads(const SelectedPipeline& selected, Common::ReadCapture& capture,
+                          VAddr index_address, u64 index_size);
+    /// PERF-063 (any thread): fences waiting for the GPU to finish (deferred) right now.
+    bool DeferredFencesPending() const noexcept {
+        return deferred_fences.load(std::memory_order_acquire) != 0;
+    }
+    /// PERF-063 (any thread): when a fence last waited for readbacks (steady clock ns), or 0.
+    s64 LastReadbackFenceNs() const noexcept {
+        return last_readback_fence_ns.load(std::memory_order_relaxed);
+    }
+    /// PERF-063: a CPU fault on a game thread; waits while work the game was told is done
+    /// (an early fence) and that reads the page is not recorded yet.
+    void WaitForEarlyFences(VAddr page);
+
+    /// PERF-063 (recorder): the capture of the job being recorded, or null.
+    void SetReadCapture(const Common::ReadCapture* capture) {
+        read_capture = capture;
+        buffer_cache.SetReadCapture(capture);
+        Common::t_read_capture = capture;
+    }
+
     /// PERF-062 (recorder): the upload epoch of the draw being recorded (0 after it).
     void SetDrawEpoch(u32 epoch) {
         buffer_cache.SetDrawEpoch(epoch);
@@ -286,7 +312,14 @@ private:
         std::chrono::steady_clock::time_point since;
     } select_stats{};
     u64 select_verify_count{};
-    Common::Recycler<SelectedPipeline, 4096> selected_recycler; // PERF-056
+    Common::Recycler<SelectedPipeline, 4096> selected_recycler;
+    const Common::ReadCapture* read_capture{}; // PERF-063
+    struct CaptureScan {
+        // Ranges already scanned for the current capture (they repeat across draws).
+        u64 capture_id{};
+        std::unordered_set<u64> ranges;
+        u64 pages_checked{};
+    } capture_scan; // PERF-056
     /// The pipeline of a graphics draw: the one selected ahead when it still fits the memory the
     /// recorder sees, else looked up here. With PERF-047 the draw's infos are the copies.
     const GraphicsPipeline* AcquireGraphicsPipeline(const DrawIndirectParams& params,
@@ -351,6 +384,7 @@ private:
     u32 invalid_texture_context_count{};
     std::unordered_set<u64> logged_gpu_constant_shaders;
     std::atomic<u32> deferred_fences{};
+    std::atomic<s64> last_readback_fence_ns{}; // PERF-063
     /// PERF-014b: deferred fences that will also bring GPU data back to guest memory.
     std::atomic<u32> readback_fences{};
     u32 draws_since_submit{};
