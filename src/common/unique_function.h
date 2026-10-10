@@ -6,6 +6,8 @@
 #include <memory>
 #include <utility>
 
+#include "common/recycling_pool.h"
+
 namespace Common {
 
 /// General purpose function wrapper similar to std::function.
@@ -17,6 +19,20 @@ class UniqueFunction {
     public:
         virtual ~CallableBase() = default;
         virtual ResultType operator()(Args&&...) = 0;
+
+        // PERF-056: callables are often made on one thread and destroyed on another.
+        static void* operator new(std::size_t size) {
+            return RecyclingPool::Allocate(size);
+        }
+        static void operator delete(void* block, std::size_t size) {
+            RecyclingPool::Free(block, size);
+        }
+        static void* operator new(std::size_t size, std::align_val_t alignment) {
+            return ::operator new(size, alignment);
+        }
+        static void operator delete(void* block, std::size_t, std::align_val_t alignment) {
+            ::operator delete(block, alignment);
+        }
     };
 
     template <typename Functor>

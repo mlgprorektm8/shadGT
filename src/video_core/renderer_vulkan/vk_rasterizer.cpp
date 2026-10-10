@@ -178,7 +178,9 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
         return std::nullopt;
     }
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
-    SelectedPipeline selected;
+    SelectedPipeline selected = selected_recycler.Take(); // PERF-056
+    selected.is_compute = false;
+    selected.compute = nullptr;
     std::scoped_lock lk{pipeline_cache.LookupMutex()};
     selected.pipeline = pipeline_cache.GetGraphicsPipeline({
         .vertex_sgpr_offset = 0,
@@ -189,6 +191,102 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
         CopySelectedStages(selected.stages);
     }
     return selected;
+}
+
+void Rasterizer::CopyComputeStage(std::array<SelectedStage, Shader::MaxStageTypes>& out) {
+    // The cache's compute lookup leaves the program's info in its first slot; the pipeline keeps
+    // it in the compute slot.
+    const auto& infos = pipeline_cache.SelectedInfos();
+    for (auto& stage : out) {
+        stage.present = false;
+    }
+    const Shader::Info* info = infos[0];
+    auto& selected = out[u32(Shader::SwStage::Compute)];
+    selected.present = info != nullptr;
+    if (!info) {
+        return;
+    }
+    selected.pgm_base = info->pgm_base;
+    selected.num_user_data = static_cast<u32>(info->user_data.size());
+    ASSERT(selected.num_user_data <= selected.user_data.size());
+    std::ranges::copy(info->user_data, selected.user_data.begin());
+    selected.flattened = info->flattened_ud_buf;
+}
+
+std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhead() {
+    // PERF-055: as SelectPipelineAhead, for a direct dispatch. -DisablePerf 66 looks every
+    // compute pipeline up on the recorder, under the lookup lock, as before.
+    static const bool enabled = Common::PerfFeatureEnabled(66);
+    if (!enabled) {
+        return std::nullopt;
+    }
+    Common::PhaseTimer timer{Common::Phase::SelectAhead};
+    SelectedPipeline selected = selected_recycler.Take(); // PERF-056
+    selected.pipeline = nullptr;
+    selected.is_compute = true;
+    std::scoped_lock lk{pipeline_cache.LookupMutex()};
+    selected.compute = pipeline_cache.GetComputePipeline();
+    if (selected.compute) {
+        CopyComputeStage(selected.stages);
+    }
+    return selected;
+}
+
+const ComputePipeline* Rasterizer::AcquireComputePipeline() {
+    if (selected_pipeline && selected_pipeline->is_compute) {
+        const auto* pipeline = selected_pipeline->compute;
+        if (!pipeline) {
+            ++select_stats.compute_ahead;
+            return nullptr;
+        }
+        if (InstallDrawStages(pipeline, selected_pipeline->stages, true)) {
+            ++select_stats.compute_ahead;
+            static const bool verify = !Common::LeanRun();
+            if (!verify || ++select_verify_count % 64 != 0) {
+                return pipeline;
+            }
+            ++select_stats.verified;
+            const ComputePipeline* own;
+            {
+                std::scoped_lock lk{pipeline_cache.LookupMutex()};
+                own = pipeline_cache.GetComputePipeline();
+            }
+            if (own == pipeline) {
+                return pipeline;
+            }
+            ++select_stats.verify_failed;
+            static u32 reports = 0;
+            if (reports++ < 20) {
+                LOG_ERROR(Render_Vulkan,
+                          "PERF-055: compute pipeline selected on the command thread differs "
+                          "from the one selected here");
+            }
+            // Fall through: select here and use that one.
+        } else {
+            ++select_stats.mismatched;
+        }
+    }
+    // Copies are installed only when dispatches may have installed some before (PERF-055 on);
+    // otherwise the pipeline keeps using the cache's infos, as before.
+    static const bool copies = Common::PerfFeatureEnabled(66);
+    const bool install = copies && SelectsPipelinesAhead();
+    std::array<SelectedStage, Shader::MaxStageTypes> stages{};
+    const ComputePipeline* pipeline;
+    {
+        std::scoped_lock lk{pipeline_cache.LookupMutex()};
+        pipeline = pipeline_cache.GetComputePipeline();
+        if (!pipeline) {
+            return nullptr;
+        }
+        if (install) {
+            CopyComputeStage(stages);
+        }
+    }
+    if (install) {
+        // The pipeline may still point at copies installed for an earlier dispatch.
+        InstallDrawStages(pipeline, stages, false);
+    }
+    return pipeline;
 }
 
 Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical) {
@@ -203,7 +301,7 @@ Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical) {
     return shadow;
 }
 
-bool Rasterizer::InstallDrawStages(const GraphicsPipeline* pipeline,
+bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
                                    const std::array<SelectedStage, Shader::MaxStageTypes>& stages,
                                    bool validate) {
     const auto& canonical = pipeline->CanonicalStages();
@@ -241,13 +339,15 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
     auto& stats = select_stats;
     const auto now = std::chrono::steady_clock::now();
     if (now - stats.since >= std::chrono::seconds{2}) {
-        if (stats.ahead + stats.mismatched + stats.recorder != 0) {
+        if (stats.ahead + stats.compute_ahead + stats.mismatched + stats.recorder != 0) {
             LOG_WARNING(Render_Vulkan,
-                        "PERF-047 pipelines in {:.1f} s: {} selected on the command thread, {} "
-                        "selected again here (memory changed), {} selected here (quad lists, "
-                        "indirect draws); {} checked against a selection here, {} differed",
-                        std::chrono::duration<double>(now - stats.since).count(), stats.ahead,
-                        stats.mismatched, stats.recorder, stats.verified, stats.verify_failed);
+                        "PERF-047 pipelines in {:.1f} s: {} selected on the command thread "
+                        "(PERF-055: {} of them compute), {} selected again here (memory "
+                        "changed), {} selected here (quad lists, indirect draws); {} checked "
+                        "against a selection here, {} differed",
+                        std::chrono::duration<double>(now - stats.since).count(),
+                        stats.ahead + stats.compute_ahead, stats.compute_ahead, stats.mismatched,
+                        stats.recorder, stats.verified, stats.verify_failed);
         }
         stats = {};
         stats.since = now;
@@ -998,11 +1098,8 @@ void Rasterizer::DispatchDirect() {
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->DrawCsRegs();
-    const ComputePipeline* pipeline = [&] {
-        // PERF-047: the command thread may be selecting a graphics pipeline meanwhile.
-        std::scoped_lock lk{pipeline_cache.LookupMutex()};
-        return pipeline_cache.GetComputePipeline();
-    }();
+    // PERF-055: selected on the command thread when it decoded the dispatch.
+    const ComputePipeline* pipeline = AcquireComputePipeline();
     if (!pipeline) {
         return;
     }
@@ -1040,11 +1137,8 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->DrawCsRegs();
-    const ComputePipeline* pipeline = [&] {
-        // PERF-047: the command thread may be selecting a graphics pipeline meanwhile.
-        std::scoped_lock lk{pipeline_cache.LookupMutex()};
-        return pipeline_cache.GetComputePipeline();
-    }();
+    // PERF-055: looked up here (no selection for indirect dispatches), with fresh stage copies.
+    const ComputePipeline* pipeline = AcquireComputePipeline();
     if (!pipeline) {
         return;
     }

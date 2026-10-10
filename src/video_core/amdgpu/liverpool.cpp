@@ -320,7 +320,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         draw();
         return;
     }
-    std::vector<u32> delta;
+    // PERF-056: the delta vectors go back and forth between the threads with their capacity.
+    std::vector<u32> delta = delta_recycler.Take();
+    delta.clear();
     regs_dirty.Collect(std::span<const u32, Regs::NumRegs>{regs.reg_array}, delta);
     std::optional<ComputeProgram> cs;
     if (compute) {
@@ -333,12 +335,13 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // PERF-047: the pipeline is selected now, on this thread, from these registers; the
     // recorder checks the selection against the memory it sees before using it.
     std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
-    if (direct_draw && !compute && rasterizer->SelectsPipelinesAhead()) {
-        selected = rasterizer->SelectPipelineAhead();
+    if (direct_draw && rasterizer->SelectsPipelinesAhead()) {
+        selected = compute ? rasterizer->SelectComputePipelineAhead()
+                           : rasterizer->SelectPipelineAhead();
     }
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
-                     selected = std::move(selected), draw = std::move(draw)] {
+                     selected = std::move(selected), draw = std::move(draw)]() mutable {
         auto& state = *recorder;
         RegsDelta<Regs::NumRegs>::Apply(delta, std::span<u32, Regs::NumRegs>{state.regs.reg_array});
         if (cs) {
@@ -352,6 +355,10 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         rasterizer->SetSelectedPipeline(selected ? &*selected : nullptr);
         draw();
         rasterizer->SetSelectedPipeline(nullptr);
+        delta_recycler.Give(std::move(delta));
+        if (selected) {
+            rasterizer->RecycleSelectedPipeline(std::move(*selected));
+        }
     });
     if (read_ahead_states && !compute) {
         OfferDrawState();
@@ -1317,7 +1324,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                 fmt::make_format_args(cmd_address),
                                                 [&] { rasterizer->DispatchDirect(); });
                     },
-                    true);
+                    true, true);
                 break;
             }
             case PM4ItOpcode::DispatchIndirect: {
@@ -2190,7 +2197,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                             fmt::make_format_args(vqid, cmd_address),
                                             [&] { rasterizer->DispatchDirect(); });
                 },
-                true);
+                true, true);
             break;
         }
         case PM4ItOpcode::DispatchIndirect: {

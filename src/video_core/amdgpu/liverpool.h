@@ -25,6 +25,7 @@
 #include "common/assert.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
+#include "common/recycling_pool.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/read_ahead_states.h"
@@ -358,6 +359,7 @@ private:
     u64 commands_recorded{};
     // PERF-048: waits on labels another queue writes, found after letting it decode first.
     u64 waits_moved_after_turns{};
+    Common::Recycler<std::vector<u32>> delta_recycler; // PERF-056
     // DIAG-050: CPU fault flushes and how long the faulting threads waited for them.
     std::atomic<u64> fault_flushes{};
     std::atomic<u64> fault_flush_wait_us{};

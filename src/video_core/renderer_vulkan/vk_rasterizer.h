@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "common/recycling_pool.h"
+
 #include <optional>
 #include <span>
 
@@ -64,6 +66,9 @@ public:
     };
     struct SelectedPipeline {
         const GraphicsPipeline* pipeline{};
+        /// PERF-055: a direct dispatch's compute pipeline (then `pipeline` is unused).
+        bool is_compute{};
+        const ComputePipeline* compute{};
         std::array<SelectedStage, Shader::MaxStageTypes> stages{};
     };
     /// PERF-047: whether pipelines are selected on the command thread (draw pipe on and
@@ -72,9 +77,15 @@ public:
     /// PERF-047: on the command thread, for a direct draw it is decoding. Nothing for draws the
     /// recorder filters out or whose pipeline depends on the recorder's state (quad lists).
     std::optional<SelectedPipeline> SelectPipelineAhead();
+    /// PERF-055: the same for a direct dispatch it is decoding (-DisablePerf 66: none).
+    std::optional<SelectedPipeline> SelectComputePipelineAhead();
     /// PERF-047: on the recorder thread, around the draw it selected the pipeline for.
     void SetSelectedPipeline(const SelectedPipeline* selected) {
         selected_pipeline = selected;
+    }
+    /// PERF-056: a used selection goes back for reuse with its vectors' capacity.
+    void RecycleSelectedPipeline(SelectedPipeline&& selected) {
+        selected_recycler.Give(std::move(selected));
     }
 
     void Draw(bool is_indexed, u32 index_offset = 0);
@@ -258,6 +269,7 @@ private:
     const SelectedPipeline* selected_pipeline{};
     struct {
         u64 ahead;
+        u64 compute_ahead; // PERF-055
         u64 mismatched;
         u64 recorder;
         u64 verified;
@@ -265,17 +277,22 @@ private:
         std::chrono::steady_clock::time_point since;
     } select_stats{};
     u64 select_verify_count{};
+    Common::Recycler<SelectedPipeline> selected_recycler; // PERF-056
     /// The pipeline of a graphics draw: the one selected ahead when it still fits the memory the
     /// recorder sees, else looked up here. With PERF-047 the draw's infos are the copies.
     const GraphicsPipeline* AcquireGraphicsPipeline(const DrawIndirectParams& params,
                                                     bool selected_allowed);
     /// Points the pipeline's stages at copies holding the given user data; with `validate`,
     /// false if a stage's flattened user data now differs from what selection used.
-    bool InstallDrawStages(const GraphicsPipeline* pipeline,
+    bool InstallDrawStages(const Pipeline* pipeline,
                            const std::array<SelectedStage, Shader::MaxStageTypes>& stages,
                            bool validate);
     ShadowInfo& ShadowOf(const Shader::Info* canonical);
     /// The user data of the infos the pipeline cache just selected (under its lock).
+    /// PERF-055: the compute stage of the pipeline just looked up, in its pipeline slot.
+    void CopyComputeStage(std::array<SelectedStage, Shader::MaxStageTypes>& out);
+    /// PERF-055: the dispatch's compute pipeline, as selected ahead or looked up here.
+    const ComputePipeline* AcquireComputePipeline();
     void CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTypes>& out);
     // FIX-046: bumped on every unmap (any thread); the decoded T#s are checked again after it.
     std::atomic<u64> tsharp_epoch{};
