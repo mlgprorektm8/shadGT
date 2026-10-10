@@ -82,6 +82,14 @@ public:
     }
 
     /// Mark region as modified from the CPU
+    /// PERF-064: a hot page whose bytes stopped changing goes back to normal tracking: it is
+    /// clean (the GPU copy is current) and write-protected again.
+    void CoolHotPages(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->UntrackHotPages(offset, size);
+        });
+    }
+
     void MarkRegionAsCpuModified(VAddr cpu_addr, u64 size) noexcept {
         IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
             manager->template ChangeRegionState<StateOp::Set, StateOp::None>(offset, size);

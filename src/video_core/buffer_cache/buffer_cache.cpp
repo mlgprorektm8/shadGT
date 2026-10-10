@@ -432,10 +432,13 @@ void BufferCache::LogHotPageStats() {
     if (unchanged + uploaded != 0) {
         LOG_WARNING(Render_Vulkan,
                     "PERF-033 hot pages in 2.0 s: {} unchanged and not uploaded ({} MB), {} "
-                    "uploaded; PERF-049: {} hashes taken ahead, {} on the recorder",
+                    "uploaded; PERF-049: {} hashes taken ahead, {} on the recorder; PERF-064: "
+                    "{} cooled ({} written while cooling)",
                     unchanged, unchanged * BYTES_PER_PAGE >> 20, uploaded, prehashed_hits,
-                    prehashed_misses);
+                    prehashed_misses, hot_pages_cooled, hot_pages_cooled_changed);
     }
+    hot_pages_cooled = 0;
+    hot_pages_cooled_changed = 0;
     prehashed_hits = 0;
     prehashed_misses = 0;
     if (ahead_hits + ahead_misses != 0) {
@@ -1474,6 +1477,12 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     }
     u64 unchanged_count = 0;
     size_t hot_index = 0;
+    // PERF-064: hot pages unchanged for this many checks in a row go back to normal tracking;
+    // the game writes them rarely now. A page written every frame changes within ~10 checks.
+    // -DisablePerf 72 keeps every hot page hot.
+    static const bool cool_hot_pages = Common::PerfFeatureEnabled(72);
+    constexpr u8 CoolAfterChecks = 32;
+    boost::container::small_vector<std::pair<VAddr, u64>, 8> cool;
     for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
         const auto [addr, range_size] = ranges[range_index];
         VAddr cursor = addr;
@@ -1486,7 +1495,16 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 }
                 cursor = page + BYTES_PER_PAGE;
                 ++unchanged_count;
+                if (cool_hot_pages && !read_capture) {
+                    u8& streak = hot_unchanged_streak[page];
+                    if (++streak >= CoolAfterChecks) {
+                        cool.emplace_back(page, hash);
+                    }
+                }
             } else if (whole_page_from_guest(page)) {
+                if (cool_hot_pages) {
+                    hot_unchanged_streak.erase(page);
+                }
                 hot_uploads.push_back({page, generation, hash});
             } else {
                 std::scoped_lock lk{uploaded_pages_mutex};
@@ -1498,6 +1516,20 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         }
     }
     hot_pages_unchanged += unchanged_count;
+    for (const auto& [page, hash] : cool) {
+        hot_unchanged_streak.erase(page);
+        // Clean and write-protected again: the GPU copy holds these bytes (the last upload).
+        memory_tracker->CoolHotPages(page, BYTES_PER_PAGE);
+        ++hot_pages_cooled;
+        // A CPU write between the check and the protection did not fault; it is caught here.
+        if (XXH3_64bits(std::bit_cast<const void*>(page), BYTES_PER_PAGE) != hash) {
+            memory_tracker->MarkRegionAsCpuModified(page, BYTES_PER_PAGE);
+            ++hot_pages_cooled_changed;
+        }
+    }
+    if (hot_unchanged_streak.size() > 1 << 20) {
+        hot_unchanged_streak.clear();
+    }
     if (!copies.empty()) {
         for (const auto& copy : copies) {
             RecordWatchedUploads(copy.dstOffset, copy.dstOffset + copy.size);

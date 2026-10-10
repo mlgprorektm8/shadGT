@@ -314,6 +314,10 @@ private:
     std::vector<NoImageRange> no_image_memo = std::vector<NoImageRange>(65536);
     std::atomic<u64> hot_pages_unchanged{};
     std::atomic<u64> hot_pages_uploaded{};
+    // PERF-064: per hot page, how many checks in a row found it unchanged.
+    tsl::robin_map<VAddr, u8> hot_unchanged_streak;
+    u64 hot_pages_cooled{};
+    u64 hot_pages_cooled_changed{};
     // PERF-062: hot-page hashes taken by the command thread as it decodes draws.
     PageHashTable ahead_hashes;
     u32 draw_epoch{};
