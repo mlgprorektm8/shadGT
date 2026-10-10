@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <bitset>
 #include <span>
 #include <vector>
@@ -100,6 +101,14 @@ struct Info : InfoPersistent {
         Qualifier primary;
         Qualifier auxiliary;
     };
+
+    /// PERF-047: tells this info apart from a later one at the same address (the GPU recorder
+    /// keeps its own copies, found by address). Copies keep it.
+    u64 identity{NextIdentity()};
+    static u64 NextIdentity() {
+        static std::atomic<u64> next{1};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
 
     std::span<const u32> user_data;
     std::vector<u32> flattened_ud_buf;

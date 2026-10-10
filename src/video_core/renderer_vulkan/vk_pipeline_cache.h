@@ -71,6 +71,17 @@ public:
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
+    /// PERF-047: with pipelines selected on the command thread, both GPU threads look pipelines
+    /// up; every GetGraphicsPipeline/GetComputePipeline call holds this lock, and so does any
+    /// read of the infos below or copy of a cached info.
+    std::mutex& LookupMutex() {
+        return lookup_mutex;
+    }
+    /// The infos the last GetGraphicsPipeline selected, with that draw's user data.
+    const std::array<const Shader::Info*, MaxShaderStages>& SelectedInfos() const {
+        return infos;
+    }
+
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
@@ -276,6 +287,7 @@ private:
         std::chrono::steady_clock::time_point since{};
     } prewarm_stats;
     std::jthread prewarm_reader;
+    std::mutex lookup_mutex; // PERF-047
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
 };

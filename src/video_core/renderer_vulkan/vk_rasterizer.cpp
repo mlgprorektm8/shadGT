@@ -70,51 +70,216 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 
 Rasterizer::~Rasterizer() = default;
 
-bool Rasterizer::FilterDraw() {
-    const auto& regs = liverpool->DrawRegs();
+namespace {
+/// What FilterDraw does with a draw instead of drawing it, decided from the registers alone
+/// (PERF-047: the command thread selects pipelines only for draws that are drawn).
+enum class DrawFilter { Draw, EliminateFastClear, FmaskDecompress, Resolve, NoPrimitive, Copy };
+
+DrawFilter ClassifyDraw(const AmdGpu::Regs& regs, bool& depth_copy, bool& stencil_copy) {
+    depth_copy = false;
+    stencil_copy = false;
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
-        // Clears the render target if FCE is launched before any draws
-        EliminateFastClear();
-        return false;
+        return DrawFilter::EliminateFastClear;
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::FmaskDecompress) {
-        // TODO: check for a valid MRT1 to promote the draw to the resolve pass.
-        LOG_TRACE(Render_Vulkan, "FMask decompression pass skipped");
-        ScopedMarkerInsert("FmaskDecompress");
-        return false;
+        return DrawFilter::FmaskDecompress;
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
-        LOG_TRACE(Render_Vulkan, "Resolve pass");
-        Resolve();
-        return false;
+        return DrawFilter::Resolve;
     }
     if (regs.primitive_type == AmdGpu::PrimitiveType::None) {
-        LOG_TRACE(Render_Vulkan, "Primitive type 'None' skipped");
-        ScopedMarkerInsert("PrimitiveTypeNone");
-        return false;
+        return DrawFilter::NoPrimitive;
     }
-
     const bool cb_disabled =
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
-    const auto depth_copy =
+    depth_copy =
         regs.depth_render_override.force_z_dirty && regs.depth_render_override.force_z_valid &&
         regs.depth_buffer.DepthValid() && regs.depth_buffer.DepthWriteValid() &&
         regs.depth_buffer.DepthAddress() != regs.depth_buffer.DepthWriteAddress();
-    const auto stencil_copy =
+    stencil_copy =
         regs.depth_render_override.force_stencil_dirty &&
         regs.depth_render_override.force_stencil_valid && regs.depth_buffer.StencilValid() &&
         regs.depth_buffer.StencilWriteValid() &&
         regs.depth_buffer.StencilAddress() != regs.depth_buffer.StencilWriteAddress();
     if (cb_disabled && (depth_copy || stencil_copy)) {
+        return DrawFilter::Copy;
+    }
+    return DrawFilter::Draw;
+}
+} // namespace
+
+bool Rasterizer::FilterDraw() {
+    const auto& regs = liverpool->DrawRegs();
+    bool depth_copy;
+    bool stencil_copy;
+    switch (ClassifyDraw(regs, depth_copy, stencil_copy)) {
+    case DrawFilter::EliminateFastClear:
+        // Clears the render target if FCE is launched before any draws
+        EliminateFastClear();
+        return false;
+    case DrawFilter::FmaskDecompress:
+        // TODO: check for a valid MRT1 to promote the draw to the resolve pass.
+        LOG_TRACE(Render_Vulkan, "FMask decompression pass skipped");
+        ScopedMarkerInsert("FmaskDecompress");
+        return false;
+    case DrawFilter::Resolve:
+        LOG_TRACE(Render_Vulkan, "Resolve pass");
+        Resolve();
+        return false;
+    case DrawFilter::NoPrimitive:
+        LOG_TRACE(Render_Vulkan, "Primitive type 'None' skipped");
+        ScopedMarkerInsert("PrimitiveTypeNone");
+        return false;
+    case DrawFilter::Copy:
         // Games may disable color buffer and enable force depth/stencil dirty and valid to
         // do a copy from one depth-stencil surface to another, without a pixel shader.
         // We need to detect this case and perform the copy, otherwise it will have no effect.
         LOG_TRACE(Render_Vulkan, "Performing depth-stencil override copy");
         DepthStencilCopy(depth_copy, stencil_copy);
         return false;
+    case DrawFilter::Draw:
+        break;
     }
-
     return true;
+}
+
+bool Rasterizer::SelectsPipelinesAhead() const {
+    // PERF-047: -DisablePerf 59 selects every pipeline on the recorder thread as before.
+    static const bool enabled = Common::PerfFeatureEnabled(59);
+    return enabled && liverpool->Pipelined();
+}
+
+void Rasterizer::CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTypes>& out) {
+    const auto& infos = pipeline_cache.SelectedInfos();
+    for (u32 stage = 0; stage < Shader::MaxStageTypes; ++stage) {
+        auto& selected = out[stage];
+        const Shader::Info* info = stage < infos.size() ? infos[stage] : nullptr;
+        selected.present = info != nullptr;
+        if (!info) {
+            continue;
+        }
+        selected.pgm_base = info->pgm_base;
+        selected.num_user_data = static_cast<u32>(info->user_data.size());
+        ASSERT(selected.num_user_data <= selected.user_data.size());
+        std::ranges::copy(info->user_data, selected.user_data.begin());
+        selected.flattened = info->flattened_ud_buf;
+    }
+}
+
+std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
+    // The command thread's registers are those of the draw it is decoding.
+    const auto& regs = liverpool->DrawRegs();
+    bool depth_copy;
+    bool stencil_copy;
+    if (ClassifyDraw(regs, depth_copy, stencil_copy) != DrawFilter::Draw ||
+        regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
+        // A quad list's pipeline depends on whether its indices are GPU-written, which only
+        // the recorder's buffer cache knows.
+        return std::nullopt;
+    }
+    Common::PhaseTimer timer{Common::Phase::SelectAhead};
+    SelectedPipeline selected;
+    std::scoped_lock lk{pipeline_cache.LookupMutex()};
+    selected.pipeline = pipeline_cache.GetGraphicsPipeline({
+        .vertex_sgpr_offset = 0,
+        .instance_sgpr_offset = 0,
+        .tessellate_quads = false,
+    });
+    if (selected.pipeline) {
+        CopySelectedStages(selected.stages);
+    }
+    return selected;
+}
+
+Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical) {
+    auto& shadow = shadow_infos[canonical];
+    // A cached info's identity never changes; a different one means the address was reused.
+    if (!shadow.info || shadow.identity != canonical->identity) {
+        // The command thread rewrites the cached info's per-draw fields under the lock.
+        std::scoped_lock lk{pipeline_cache.LookupMutex()};
+        shadow.info = std::make_unique<Shader::Info>(*canonical);
+        shadow.identity = canonical->identity;
+    }
+    return shadow;
+}
+
+bool Rasterizer::InstallDrawStages(const GraphicsPipeline* pipeline,
+                                   const std::array<SelectedStage, Shader::MaxStageTypes>& stages,
+                                   bool validate) {
+    const auto& canonical = pipeline->CanonicalStages();
+    std::array<const Shader::Info*, Shader::MaxStageTypes> draw_stages{};
+    for (u32 stage = 0; stage < Shader::MaxStageTypes; ++stage) {
+        const auto& selected = stages[stage];
+        if (!canonical[stage] || !selected.present) {
+            if (canonical[stage] || selected.present) {
+                return false;
+            }
+            continue;
+        }
+        auto& shadow = ShadowOf(canonical[stage]);
+        auto& info = *shadow.info;
+        std::copy_n(selected.user_data.begin(), selected.num_user_data, shadow.user_data.begin());
+        info.user_data = std::span<const u32>{shadow.user_data.data(), selected.num_user_data};
+        info.pgm_base = selected.pgm_base;
+        // The sharps are read again from the memory as the recorder sees it now.
+        info.RefreshFlatBuf();
+        if (validate && info.flattened_ud_buf != selected.flattened) {
+            return false;
+        }
+        draw_stages[stage] = &info;
+    }
+    pipeline->SetDrawStages(draw_stages);
+    return true;
+}
+
+const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectParams& params,
+                                                            bool selected_allowed) {
+    if (!SelectsPipelinesAhead()) {
+        std::scoped_lock lk{pipeline_cache.LookupMutex()};
+        return pipeline_cache.GetGraphicsPipeline(params);
+    }
+    auto& stats = select_stats;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - stats.since >= std::chrono::seconds{2}) {
+        if (stats.ahead + stats.mismatched + stats.recorder != 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "PERF-047 pipelines in {:.1f} s: {} selected on the command thread, {} "
+                        "selected again here (memory changed), {} selected here (quad lists, "
+                        "indirect draws)",
+                        std::chrono::duration<double>(now - stats.since).count(), stats.ahead,
+                        stats.mismatched, stats.recorder);
+        }
+        stats = {};
+        stats.since = now;
+    }
+    if (selected_allowed && selected_pipeline) {
+        const auto* pipeline = selected_pipeline->pipeline;
+        if (!pipeline) {
+            ++stats.ahead;
+            return nullptr;
+        }
+        if (InstallDrawStages(pipeline, selected_pipeline->stages, true)) {
+            ++stats.ahead;
+            return pipeline;
+        }
+        // The user data now leads to other sharps than the selection read (memory written in
+        // between): select here, from what the recorder sees.
+        ++stats.mismatched;
+    } else {
+        ++stats.recorder;
+    }
+    std::array<SelectedStage, Shader::MaxStageTypes> stages{};
+    const GraphicsPipeline* pipeline;
+    {
+        std::scoped_lock lk{pipeline_cache.LookupMutex()};
+        pipeline = pipeline_cache.GetGraphicsPipeline(params);
+        if (!pipeline) {
+            return nullptr;
+        }
+        CopySelectedStages(stages);
+    }
+    InstallDrawStages(pipeline, stages, false);
+    return pipeline;
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
@@ -499,11 +664,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         const bool quad_list = regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
         quad_triangles = quad_list && Common::PerfFeatureEnabled(28) &&
                          CanDrawQuadListAsTriangles(is_indexed, index_offset);
-        pipeline = pipeline_cache.GetGraphicsPipeline({
-            .vertex_sgpr_offset = 0,
-            .instance_sgpr_offset = 0,
-            .tessellate_quads = quad_list && !quad_triangles,
-        });
+        pipeline = AcquireGraphicsPipeline(
+            {
+                .vertex_sgpr_offset = 0,
+                .instance_sgpr_offset = 0,
+                .tessellate_quads = quad_list && !quad_triangles,
+            },
+            !quad_list);
         if (!pipeline) {
             return;
         }
@@ -722,7 +889,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         // PERF-028: the vertex count is in GPU memory, so quads cannot be expanded here.
         .tessellate_quads = true,
     };
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
+    const GraphicsPipeline* pipeline = AcquireGraphicsPipeline(params, false);
     if (!pipeline) {
         return;
     }
@@ -798,7 +965,11 @@ void Rasterizer::DispatchDirect() {
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->DrawCsRegs();
-    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    const ComputePipeline* pipeline = [&] {
+        // PERF-047: the command thread may be selecting a graphics pipeline meanwhile.
+        std::scoped_lock lk{pipeline_cache.LookupMutex()};
+        return pipeline_cache.GetComputePipeline();
+    }();
     if (!pipeline) {
         return;
     }
@@ -836,7 +1007,11 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->DrawCsRegs();
-    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    const ComputePipeline* pipeline = [&] {
+        // PERF-047: the command thread may be selecting a graphics pipeline meanwhile.
+        std::scoped_lock lk{pipeline_cache.LookupMutex()};
+        return pipeline_cache.GetComputePipeline();
+    }();
     if (!pipeline) {
         return;
     }

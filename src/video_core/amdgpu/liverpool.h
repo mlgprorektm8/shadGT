@@ -374,7 +374,9 @@ private:
     /// Runs work on the recorder thread behind everything queued before it (inline without one).
     void Record(Common::UniqueFunction<void>&& work);
     /// Records a draw or dispatch together with the registers written since the previous one.
-    void RecordDraw(Common::UniqueFunction<void>&& draw, bool compute);
+    /// `direct_draw`: a draw packet with its counts in the packet (PERF-047 selects its pipeline
+    /// here, while decoding).
+    void RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw = false);
     /// Waits for the recorder thread to finish, before the command thread uses the rasterizer.
     void SyncRecorder(std::string_view reason);
     /// Whether [address, address + size) overlaps a command buffer being decoded.

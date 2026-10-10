@@ -157,6 +157,7 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
+    std::ranges::copy(infos, canonical_stages.begin());
     // PERF-038: `preloading` builds a stored pipeline in the background. Its shader infos carry no
     // user data and there are no guest buffers to read: vertex inputs and the tessellation
     // helpers come from the stored serialization data; the runtime infos are the ones stored

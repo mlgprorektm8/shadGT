@@ -122,6 +122,7 @@ public:
     /// cached infos once it is used.
     void SetStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos) {
         std::ranges::copy(infos, stages.begin());
+        std::ranges::copy(infos, canonical_stages.begin());
     }
 
 private:

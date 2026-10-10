@@ -74,6 +74,7 @@ enum class Phase : u32 {
     BufObtain,
     ReadAheadEval,
     ProgramMatch,
+    SelectAhead, ///< PERF-047: pipeline selection on the command thread (not part of draws)
     Count,
 };
 std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();

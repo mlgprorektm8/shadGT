@@ -19,6 +19,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
       compute_key{compute_key_} {
     auto& info = stages[int(Shader::SwStage::Compute)];
     info = &info_;
+    canonical_stages[int(Shader::SwStage::Compute)] = &info_;
     const auto debug_str = GetDebugString();
 
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {

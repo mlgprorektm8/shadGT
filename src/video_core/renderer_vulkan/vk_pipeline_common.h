@@ -59,6 +59,16 @@ public:
         return *stages[u32(stage)];
     }
 
+    /// PERF-047: the pipeline cache's infos the pipeline was made from (stages may point at the
+    /// GPU recorder's copies of them while a draw is recorded).
+    const std::array<const Shader::Info*, Shader::MaxStageTypes>& CanonicalStages() const {
+        return canonical_stages;
+    }
+    /// PERF-047: the infos the draw being recorded binds through (the recorder thread only).
+    void SetDrawStages(const std::array<const Shader::Info*, Shader::MaxStageTypes>& infos) const {
+        stages = infos;
+    }
+
     bool IsCompute() const {
         return is_compute;
     }
@@ -77,7 +87,8 @@ protected:
     std::atomic<VkPipeline> optimized_pipeline{};
     vk::UniquePipelineLayout pipeline_layout;
     vk::UniqueDescriptorSetLayout desc_layout;
-    std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
+    mutable std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
+    std::array<const Shader::Info*, Shader::MaxStageTypes> canonical_stages{};
     bool uses_push_descriptors{};
     bool is_compute;
 };

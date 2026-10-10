@@ -307,7 +307,7 @@ void Liverpool::Record(Common::UniqueFunction<void>&& work) {
     }
 }
 
-void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute) {
+void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw) {
     if (!draw_pipe) {
         draw();
         return;
@@ -322,9 +322,15 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute) {
     if (verify_interval != 0 && ++verify_count % verify_interval == 0) {
         expected = std::make_unique<Regs>(regs);
     }
+    // PERF-047: the pipeline is selected now, on this thread, from these registers; the
+    // recorder checks the selection against the memory it sees before using it.
+    std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
+    if (direct_draw && !compute && rasterizer->SelectsPipelinesAhead()) {
+        selected = rasterizer->SelectPipelineAhead();
+    }
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
-                     draw = std::move(draw)] {
+                     selected = std::move(selected), draw = std::move(draw)] {
         auto& state = *recorder;
         RegsDelta<Regs::NumRegs>::Apply(delta, std::span<u32, Regs::NumRegs>{state.regs.reg_array});
         if (cs) {
@@ -335,7 +341,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute) {
         if (expected) {
             VerifyRecorderRegs(*expected);
         }
+        rasterizer->SetSelectedPipeline(selected ? &*selected : nullptr);
         draw();
+        rasterizer->SetSelectedPipeline(nullptr);
     });
     if (read_ahead_states && !compute) {
         OfferDrawState();
@@ -1030,7 +1038,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                 fmt::make_format_args(cmd_address),
                                                 [&] { rasterizer->Draw(true); });
                     },
-                    false);
+                    false, true);
                 break;
             }
             case PM4ItOpcode::DrawIndexOffset2: {
@@ -1056,7 +1064,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                 fmt::make_format_args(cmd_address),
                                                 [&] { rasterizer->Draw(true, index_offset); });
                     },
-                    false);
+                    false, true);
                 break;
             }
             case PM4ItOpcode::DrawIndexAuto: {
@@ -1078,7 +1086,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                 fmt::make_format_args(cmd_address),
                                                 [&] { rasterizer->Draw(false); });
                     },
-                    false);
+                    false, true);
                 break;
             }
             case PM4ItOpcode::DrawIndirect: {

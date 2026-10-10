@@ -53,6 +53,30 @@ public:
         return texture_cache;
     }
 
+    /// PERF-047: a direct draw's pipeline, selected on the command thread as it decodes the
+    /// draw, with the user data each stage's specialization was decided on.
+    struct SelectedStage {
+        bool present{};
+        VAddr pgm_base{};
+        u32 num_user_data{};
+        std::array<u32, Shader::NUM_USER_DATA_REGS> user_data{};
+        std::vector<u32> flattened;
+    };
+    struct SelectedPipeline {
+        const GraphicsPipeline* pipeline{};
+        std::array<SelectedStage, Shader::MaxStageTypes> stages{};
+    };
+    /// PERF-047: whether pipelines are selected on the command thread (draw pipe on and
+    /// -DisablePerf 59 not given).
+    bool SelectsPipelinesAhead() const;
+    /// PERF-047: on the command thread, for a direct draw it is decoding. Nothing for draws the
+    /// recorder filters out or whose pipeline depends on the recorder's state (quad lists).
+    std::optional<SelectedPipeline> SelectPipelineAhead();
+    /// PERF-047: on the recorder thread, around the draw it selected the pipeline for.
+    void SetSelectedPipeline(const SelectedPipeline* selected) {
+        selected_pipeline = selected;
+    }
+
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
@@ -221,6 +245,34 @@ private:
         VideoCore::TextureCache::ImageDesc desc;
     };
     std::vector<DecodedTsharp> decoded_tsharps;
+
+    // PERF-047: the recorder thread binds a graphics draw through its own copies of the pipeline
+    // cache's infos, which the command thread keeps reusing for its lookups.
+    struct ShadowInfo {
+        std::unique_ptr<Shader::Info> info;
+        u64 identity{};
+        std::array<u32, Shader::NUM_USER_DATA_REGS> user_data{};
+    };
+    std::unordered_map<const Shader::Info*, ShadowInfo> shadow_infos;
+    const SelectedPipeline* selected_pipeline{};
+    struct {
+        u64 ahead;
+        u64 mismatched;
+        u64 recorder;
+        std::chrono::steady_clock::time_point since;
+    } select_stats{};
+    /// The pipeline of a graphics draw: the one selected ahead when it still fits the memory the
+    /// recorder sees, else looked up here. With PERF-047 the draw's infos are the copies.
+    const GraphicsPipeline* AcquireGraphicsPipeline(const DrawIndirectParams& params,
+                                                    bool selected_allowed);
+    /// Points the pipeline's stages at copies holding the given user data; with `validate`,
+    /// false if a stage's flattened user data now differs from what selection used.
+    bool InstallDrawStages(const GraphicsPipeline* pipeline,
+                           const std::array<SelectedStage, Shader::MaxStageTypes>& stages,
+                           bool validate);
+    ShadowInfo& ShadowOf(const Shader::Info* canonical);
+    /// The user data of the infos the pipeline cache just selected (under its lock).
+    void CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTypes>& out);
     // FIX-046: bumped on every unmap (any thread); the decoded T#s are checked again after it.
     std::atomic<u64> tsharp_epoch{};
     u64 decoded_epoch{};
