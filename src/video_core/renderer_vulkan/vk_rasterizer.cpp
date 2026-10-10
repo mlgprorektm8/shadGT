@@ -439,9 +439,11 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
                 tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid ||
                 !magic_enum::enum_contains(tsharp.GetDataFmt()) ||
                 !magic_enum::enum_contains(tsharp.GetNumberFmt()) ||
+                LiverpoolToVK::TrySurfaceFormat(tsharp.GetDataFmt(), tsharp.GetNumberFmt()) ==
+                    vk::Format::eUndefined ||
                 VideoCore::CheckImageDescriptorGeometry(tsharp, instance.GetImageLimits()) !=
                     VideoCore::ImageDescriptorGeometryError::None) {
-                continue; // Bound null by the recorder.
+                continue; // Bound null by the recorder (the same checks as BindTextures).
             }
             const VideoCore::TextureCache::ImageDesc image{tsharp, desc};
             capture_range(image.info.guest_address, image.info.guest_size);
