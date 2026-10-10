@@ -125,7 +125,11 @@ void Runtime::NoteSessionUse(vk::Buffer buffer, u64 offset, u64 size) {
         hoist_session = scheduler.SessionId();
         session_used.clear();
     }
-    session_used.emplace_back(buffer, offset, size);
+    if (size == 0) {
+        return;
+    }
+    const u64 end = offset + size < offset ? ~u64{0} : offset + size;
+    session_used[static_cast<VkBuffer>(buffer)].Add({offset, end});
 }
 
 void Runtime::NoteSessionDraw(std::span<const std::tuple<vk::Buffer, u64, u64, bool>> buffers) {
@@ -151,20 +155,18 @@ void Runtime::CopyBufferHoisted(const VideoCore::Buffer* src, const VideoCore::B
         session_used.clear();
     }
     const vk::Buffer handle = dst->Handle();
-    const bool conflict = std::ranges::any_of(copies, [&](const vk::BufferCopy& copy) {
-        return std::ranges::any_of(session_used, [&](const auto& used) {
-            const auto& [buffer, offset, size] = used;
-            return buffer == handle && copy.dstOffset < offset + size &&
-                   offset < copy.dstOffset + copy.size;
+    const auto used = session_used.find(static_cast<VkBuffer>(handle));
+    const bool conflict =
+        used != session_used.end() && std::ranges::any_of(copies, [&](const vk::BufferCopy& copy) {
+            return used->second.Overlaps(copy.dstOffset, copy.dstOffset + copy.size);
         });
-    });
     if (conflict) {
-        // A command of this session uses the bytes: the upload must come after it.
-        FlushBarriers();
-        scheduler.BeginSession();
-        hoist_session = scheduler.SessionId();
-        session_used.clear();
+        // A command of this session uses the bytes: the upload must come after it, so it is
+        // recorded in place as before. (Starting a new session here would lose the bindings
+        // already recorded for the draw being bound.)
         ++hoist_cuts;
+        CopyBuffer(src, dst, copies);
+        return;
     }
     scheduler.UploadCommandBuffer().copyBuffer(src->Handle(), handle, copies);
     ++hoisted_copies;
@@ -179,10 +181,9 @@ void Runtime::ReportHoisting() {
         return;
     }
     LOG_WARNING(Render_Vulkan,
-                "PERF-066 uploads in 2.0 s: {} copies recorded ahead of their draws, {} new "
-                "sessions for them ({:.1f} draws per session)",
-                hoisted_copies, hoist_cuts,
-                double(hoist_draws) / double(std::max<u64>(hoist_cuts, 1)));
+                "PERF-066 uploads in 2.0 s: {} copies recorded ahead of their draws, {} in place "
+                "(a draw of the session uses the bytes); {} draws",
+                hoisted_copies, hoist_cuts, hoist_draws);
     hoisted_copies = 0;
     hoist_cuts = 0;
     hoist_draws = 0;

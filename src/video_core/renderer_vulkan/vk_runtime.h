@@ -7,6 +7,7 @@
 #include <chrono>
 #include <span>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "common/interval_set.h"
@@ -94,8 +95,8 @@ public:
         return hoist_uploads;
     }
     /// PERF-066: a guest-memory upload recorded in the session's upload command buffer, ahead
-    /// of the session's draws; a new session starts first when it would overwrite a range a
-    /// command already recorded in this session uses.
+    /// of the session's draws; recorded in place (as CopyBuffer) when a command already
+    /// recorded in this session uses the bytes.
     void CopyBufferHoisted(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                            std::span<const vk::BufferCopy> copies);
     /// PERF-066: buffer ranges the draw just bound use in the session.
@@ -147,7 +148,8 @@ private:
     void ReportHoisting();
     bool hoist_uploads{};
     u64 hoist_session{};
-    std::vector<std::tuple<vk::Buffer, u64, u64>> session_used;
+    // Per buffer, the byte ranges commands of the current session use.
+    std::unordered_map<VkBuffer, IntervalList<>> session_used;
     u64 hoisted_copies{};
     u64 hoist_cuts{};
     u64 hoist_draws{};
