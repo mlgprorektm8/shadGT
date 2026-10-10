@@ -107,6 +107,22 @@ TEST(ReadCapture, ReaderSeesCompletePagesWhileWriterAdds) {
     EXPECT_EQ(capture.NumPages(), Count);
 }
 
+TEST(ReadCapture, ResetEmptiesForReuse) {
+    ReadCapture capture{8};
+    const auto bytes = Filled(4);
+    ASSERT_TRUE(capture.Add(0x1000, bytes.data()));
+    ASSERT_TRUE(capture.AddWatched(0x2000));
+    const u64 id = capture.Id();
+    capture.Reset();
+    EXPECT_NE(capture.Id(), id);
+    EXPECT_FALSE(capture.Lists(0x1000));
+    EXPECT_FALSE(capture.Lists(0x2000));
+    EXPECT_EQ(capture.NumPages(), 0u);
+    const auto other = Filled(5);
+    ASSERT_TRUE(capture.Add(0x3000, other.data()));
+    EXPECT_EQ(capture.Find(0x3000)[0], 5);
+}
+
 TEST(ReadCapture, IdsDiffer) {
     ReadCapture a{1};
     ReadCapture b{1};

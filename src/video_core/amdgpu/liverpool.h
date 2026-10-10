@@ -352,6 +352,8 @@ private:
     // window is signaled at decode.
     int early_fences_mode{};
     std::shared_ptr<Common::ReadCapture> window_capture;
+    // Captures are reused (a table per window is large); see TakeCapture.
+    static std::shared_ptr<Common::ReadCapture> TakeCapture();
     bool window_safe{true};
     std::atomic<u64> fences_decoded{};
     std::atomic<u64> fences_delivered{};

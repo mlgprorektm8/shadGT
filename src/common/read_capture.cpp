@@ -11,6 +11,10 @@ namespace Common {
 thread_local const ReadCapture* t_read_capture = nullptr;
 
 namespace {
+std::atomic<u64> g_next_capture_id{1};
+}
+
+namespace {
 // Chunks are kept for the next captures; a capture is made per graphics submission.
 constexpr size_t ChunkBytes = 256 * ReadCapture::PageSize;
 std::mutex g_chunk_mutex;
@@ -37,10 +41,6 @@ void GiveChunk(u8* chunk) {
     }
 }
 } // namespace
-
-namespace {
-std::atomic<u64> g_next_capture_id{1};
-}
 
 ReadCapture::ReadCapture(size_t max_pages_)
     : id{g_next_capture_id.fetch_add(1)}, max_pages{max_pages_},
@@ -80,6 +80,17 @@ bool ReadCapture::Add(VAddr page, const u8* source) {
     return true;
 }
 
+void ReadCapture::Reset() {
+    for (const u32 slot : used_slots) {
+        keys[slot].store(0, std::memory_order_relaxed);
+    }
+    used_slots.clear();
+    entries = 0;
+    count.store(0, std::memory_order_relaxed);
+    full.store(false, std::memory_order_relaxed);
+    id = g_next_capture_id.fetch_add(1);
+}
+
 bool ReadCapture::AddWatched(VAddr page) {
     if (entries >= max_entries) {
         full.store(true, std::memory_order_relaxed);
@@ -98,6 +109,7 @@ bool ReadCapture::Insert(VAddr page, u32 index) {
             indices[slot] = index;
             // The copy, its hash and index are visible to a reader that sees the key.
             keys[slot].store(page, std::memory_order_release);
+            used_slots.push_back(static_cast<u32>(slot));
             ++entries;
             return true;
         }

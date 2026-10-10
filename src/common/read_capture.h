@@ -45,6 +45,10 @@ public:
     /// Any thread: whether the page is copied or watched.
     bool Lists(VAddr page) const noexcept;
 
+    /// Writer, when no reader uses the capture any more: empties it for reuse (a new Id); only
+    /// the slots used are cleared.
+    void Reset();
+
     /// A number no other capture of this process has.
     u64 Id() const noexcept {
         return id;
@@ -97,6 +101,7 @@ private:
     size_t mask;
     size_t max_entries;
     size_t entries{};
+    std::vector<u32> used_slots;
     std::unique_ptr<std::atomic<VAddr>[]> keys;
     std::unique_ptr<u32[]> indices;
     std::unique_ptr<u64[]> hashes;

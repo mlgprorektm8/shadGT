@@ -382,6 +382,36 @@ void Liverpool::RecordSafe(Common::UniqueFunction<void>&& work) {
     }
 }
 
+// Captures go back to the pool when the last job reading them is done. The pool outlives
+// everything (left to the process exit), so a capture released late still has it.
+static std::mutex* const g_capture_pool_mutex = new std::mutex;
+static std::vector<Common::ReadCapture*>* const g_capture_pool =
+    new std::vector<Common::ReadCapture*>;
+
+std::shared_ptr<Common::ReadCapture> Liverpool::TakeCapture() {
+    Common::ReadCapture* capture = nullptr;
+    {
+        std::scoped_lock lk{*g_capture_pool_mutex};
+        if (!g_capture_pool->empty()) {
+            capture = g_capture_pool->back();
+            g_capture_pool->pop_back();
+        }
+    }
+    if (capture) {
+        capture->Reset();
+    } else {
+        capture = new Common::ReadCapture(16384);
+    }
+    return std::shared_ptr<Common::ReadCapture>(capture, [](Common::ReadCapture* c) {
+        std::scoped_lock lk{*g_capture_pool_mutex};
+        if (g_capture_pool->size() < 64) {
+            g_capture_pool->push_back(c);
+        } else {
+            delete c;
+        }
+    });
+}
+
 void Liverpool::UnsafeWindow(const char* reason) {
     if (window_safe) {
         window_safe = false;
@@ -543,7 +573,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     if (early_fences_mode) {
         if (selected) {
             if (!window_capture) {
-                window_capture = std::make_shared<Common::ReadCapture>(16384);
+                window_capture = TakeCapture();
             }
             VAddr index_address = 0;
             u64 index_size = 0;
