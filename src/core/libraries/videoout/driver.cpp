@@ -10,6 +10,7 @@
 #include "core/libraries/kernel/time.h"
 #include "common/nvtx.h"
 #include "core/libraries/videoout/driver.h"
+#include "core/libraries/videoout/fps_lock.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -427,7 +428,19 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        // PERF-075: SHADGT_FPS_LOCK=<fps> (30 in Run-GTSportPerformance.ps1) paces flips evenly
+        // at that rate; GT Sport's races vary between 25 and 40 FPS, which shows as judder.
+        static const u32 fps_lock = [] {
+            const char* env = std::getenv("SHADGT_FPS_LOCK");
+            const u32 fps = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0;
+            if (fps != 0) {
+                LOG_WARNING(Lib_VideoOut, "PERF-075: flips locked to at most {} per second", fps);
+            }
+            return fps;
+        }();
+        const int flip_rate =
+            LockedFlipRate(main_port.flip_rate, fps_lock, EmulatorSettings.GetVblankFrequency());
+        if (vblank_status.count % (flip_rate + 1) == 0) {
             {
                 std::scoped_lock lk{mutex, g_flip_stats.mutex};
                 ++g_flip_stats.vblanks;
