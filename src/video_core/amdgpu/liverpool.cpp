@@ -341,6 +341,7 @@ void Liverpool::StartDrawPipe() {
 #endif
     });
     pipe_report_start = std::chrono::steady_clock::now();
+    pipelined.store(true, std::memory_order_release);
     // PERF-063: SHADGT_EARLY_FENCES=1 signals graphics fences at decode when the work before
     // them reads guest memory only through a capture (=2: also right after fences that waited
     // for readbacks). Needs the command thread's selections as they are (PERF-061).
@@ -350,7 +351,6 @@ void Liverpool::StartDrawPipe() {
         early_fences_mode = env[0] - '0';
         LOG_WARNING(Render, "PERF-063: early fences on (mode {})", early_fences_mode);
     }
-    pipelined.store(true, std::memory_order_release);
     LOG_WARNING(
         Render, "PERF-031: draws are recorded on a second thread (draw pipe){}{}",
         read_ahead_states ? ", pipelines read ahead (PERF-034)" : "",
