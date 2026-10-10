@@ -60,20 +60,28 @@ public:
 
     /// The pieces of the next batch, to fill before Run.
     std::vector<Piece>& BeginBatch() {
-        // A helper that woke up late for the previous batch must be out before it is replaced.
+        // PERF-046 review: a helper that woke late for the previous batch must be out before it
+        // is replaced, and none may join until Run opens the new one. Both are decided under the
+        // lock: checking `active` outside it let a helper that slept through a batch join while
+        // the pieces were being refilled.
+        std::unique_lock lk{mutex};
         while (active.load(std::memory_order_acquire) != 0) {
+            lk.unlock();
             _mm_pause();
+            lk.lock();
         }
+        batch_open = false;
         pieces.clear();
         return pieces;
     }
 
     void Run(Core::MemoryManager* memory) {
-        memory_manager = memory;
-        next.store(0, std::memory_order_relaxed);
-        done.store(0, std::memory_order_relaxed);
         {
             std::scoped_lock lk{mutex};
+            memory_manager = memory;
+            next.store(0, std::memory_order_relaxed);
+            done.store(0, std::memory_order_relaxed);
+            batch_open = true;
             ++generation;
         }
         cv.notify_all();
@@ -98,7 +106,7 @@ private:
         while (true) {
             {
                 std::unique_lock lk{mutex};
-                cv.wait(lk, stop, [&] { return generation != seen; });
+                cv.wait(lk, stop, [&] { return batch_open && generation != seen; });
                 if (stop.stop_requested()) {
                     return;
                 }
@@ -126,6 +134,7 @@ private:
     std::atomic<size_t> done{};
     std::atomic<u32> active{};
     u64 generation{};
+    bool batch_open{}; ///< Between Run and the next BeginBatch; changed under the mutex.
     std::mutex mutex;
     std::condition_variable_any cv;
     std::vector<std::jthread> threads;
