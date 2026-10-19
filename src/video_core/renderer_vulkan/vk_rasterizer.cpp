@@ -5215,6 +5215,13 @@ void Rasterizer::Resolve() {
     VideoCore::TextureCache::ImageDesc mrt1_desc{liverpool->DrawRegs().color_buffers[1], mrt1_hint};
     auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
     auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
+    if (frame_dump_collecting) {
+        FrameDumpEvent(fmt::format("resolve {:#x} {}x{} x{} -> {:#x} {}x{} x{}", // NAT-122
+                                   mrt0_image.info.guest_address, mrt0_image.info.size.width,
+                                   mrt0_image.info.size.height, mrt0_image.info.num_samples,
+                                   mrt1_image.info.guest_address, mrt1_image.info.size.width,
+                                   mrt1_image.info.size.height, mrt1_image.info.num_samples));
+    }
 
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
                                  liverpool->DrawRegs().color_buffers[0].Address(),

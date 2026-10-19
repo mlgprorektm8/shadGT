@@ -1638,6 +1638,9 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
         return;
     }
     Stream& s = Begin();
+    for (const auto& pick : picks) {
+        ApplyRewrite(*pick.source); // NAT-122
+    }
     PrepareImages();  // the texture's own upload goes first
     GlobalBarrier();  // the sources' pictures are written
     const vk::Image dst{Handle<VkImage_T>(texture.image->NativeHandle())};
@@ -1738,6 +1741,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             const VideoCore::TextureCache::ImageDesc desc{col_buf, r.liverpool->DrawCbExtent(0)};
             if (Native::ImageEntry* entry = registry->Find(desc.info, true, frame)) {
                 Stream& s = Begin();
+                ApplyRewrite(*entry); // NAT-122
                 PrepareImages();
                 GlobalBarrier();
                 const vk::ImageSubresourceRange range{
@@ -2128,6 +2132,20 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
         return;
     }
     Stream& s = Begin();
+    // NAT-122: a fill before the resolve is applied before it (left pending, it cleared the
+    // resolved picture at its first read: GT Sport's minimaps, resolved into the scratch pool).
+    ApplyRewrite(*src);
+    ApplyRewrite(*dst);
+    if (r.FrameDumpCollecting()) {
+        r.FrameDumpEvent(fmt::format("resolve {:#x} {}x{} x{} -> {:#x} {}x{} x{}",
+                                     src->info.guest_address, src->info.size.width,
+                                     src->info.size.height, src->info.num_samples,
+                                     dst->info.guest_address, dst->info.size.width,
+                                     dst->info.size.height, dst->info.num_samples));
+        if (std::ranges::find(dump_entries, dst) == dump_entries.end()) {
+            dump_entries.push_back(dst);
+        }
+    }
     PrepareImages();
     GlobalBarrier();
     const auto layers = std::min(src_desc.view_info.range.extent.layers,
