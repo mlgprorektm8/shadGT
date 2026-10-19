@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "ryty_gpu/ryty_input_bridge.h"
 #include "ryty_gpu/ryty_library.h"
+#include "ryty_gpu/native/gts_hooks.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "core/debug_state.h"
@@ -562,6 +563,8 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         }
         RytyProtectGuestRedZones();
         RytyApplyGamePatches();
+        // NAT-002: hook points for the native renderer (RYGT_NATIVE_HOOKS=1).
+        Native::InstallGtsHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     }
     return TRUE;
 }
