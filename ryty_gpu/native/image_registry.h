@@ -57,6 +57,9 @@ struct SourcePlace {
     s32 layer = -1;
     u32 width = 0;
     u32 height = 0;
+    /// NAT-131: where in the target the picture comes from (a layer of a layered target).
+    s32 src_mip = 0;
+    s32 src_layer = 0;
 };
 
 class ImageEntry;

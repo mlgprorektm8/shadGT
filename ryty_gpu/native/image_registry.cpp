@@ -324,15 +324,24 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
         return {0, 0, texture.size.width, texture.size.height};
     }
     // A mip or layer of the texture drawn on its own.
-    const s32 mip = target.MipOf(texture);
-    if (mip < 0) {
-        return {};
+    if (const s32 mip = target.MipOf(texture); mip >= 0) {
+        const s32 layer = target.SliceOf(texture, mip);
+        if (layer < 0 || u32(layer) >= std::max<u32>(texture.resources.layers, 1)) {
+            return {};
+        }
+        return {mip, layer, target.size.width, target.size.height};
     }
-    const s32 layer = target.SliceOf(texture, mip);
-    if (layer < 0 || u32(layer) >= std::max<u32>(texture.resources.layers, 1)) {
-        return {};
+    // NAT-131: the texture is one layer (or mip) of the target: a face of a cube drawn as a
+    // layered target, read on its own (GT Sport's environment cube, whose faces the cockpit's
+    // reflection cube is made of; only face 0, at the target's own address, was found).
+    if (const s32 src_mip = texture.MipOf(target); src_mip >= 0) {
+        const s32 src_layer = texture.SliceOf(target, src_mip);
+        if (src_layer < 0 || u32(src_layer) >= std::max<u32>(target.resources.layers, 1)) {
+            return {};
+        }
+        return {0, 0, texture.size.width, texture.size.height, src_mip, src_layer};
     }
-    return {mip, layer, target.size.width, target.size.height};
+    return {};
 }
 
 void ImageRegistry::IndexEntry(ImageEntry& entry) {
@@ -575,6 +584,16 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
             if (!exact && size > 2 * std::max<u64>(entry.info.guest_size, 1)) {
                 return;
             }
+            // NAT-133: a fill that covers the whole texture fills it on the GPU at its next use
+            // (GT Sport clears its environment cube and motion targets with fills, and textures
+            // over that memory were uploaded again 60 times a second).
+            if (pattern && address <= entry.info.guest_address &&
+                address + size >= entry.info.guest_address + entry.info.guest_size) {
+                entry.rewrite = ImageEntry::Rewrite::Clear;
+                entry.rewrite_pattern = *pattern;
+                entry.rewrite_bytes = entry.info.guest_size;
+                return;
+            }
             bool made_of_targets;
             {
                 std::scoped_lock lock{entry.sources_mutex};
@@ -582,6 +601,16 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
             }
             if (!made_of_targets && entry.info.num_samples == 1) {
                 MarkStale(entry, Stale::GpuWrite);
+                static std::atomic<u32> logged{};
+                if (const u32 n = logged++; n < 40 || n % 2000 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NAT-129: texture {:#x} {}x{} ({:#x} bytes) is uploaded again: a "
+                                "{} wrote {:#x}+{:#x} ({} so far)",
+                                entry.info.guest_address, entry.info.size.width,
+                                entry.info.size.height, entry.info.guest_size,
+                                exact ? (pattern ? "fill" : "copy") : "storage buffer", address,
+                                size, n + 1);
+                }
             }
             return;
         }
@@ -598,6 +627,15 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
             ++stats.targets_rewritten;
             entry.rewrite = ImageEntry::Rewrite::Upload;
             entry.rewrite_bytes = entry.info.guest_size;
+            static std::atomic<u32> logged{};
+            if (const u32 n = logged++; n < 40 || n % 2000 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "NAT-129: target {:#x} {}x{} ({:#x} bytes) is uploaded again: a {} "
+                            "wrote {:#x}+{:#x} ({} so far)",
+                            entry.info.guest_address, entry.info.size.width,
+                            entry.info.size.height, entry.info.guest_size,
+                            exact ? "copy" : "storage buffer", address, size, n + 1);
+            }
         }
     });
 }

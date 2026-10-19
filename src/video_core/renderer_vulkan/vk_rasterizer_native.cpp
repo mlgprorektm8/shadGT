@@ -1347,9 +1347,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             bind_null(6);
             continue;
         }
-        if (!entry->from_cpu) {
-            ApplyRewrite(*entry); // NAT-120
-        }
+        ApplyRewrite(*entry); // NAT-120 (NAT-133: textures too)
         if (!storage && r.FrameDumpCollecting()) {
             bool gpu_written = !entry->from_cpu;
             if (!gpu_written) {
@@ -1660,20 +1658,22 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
     const vk::Image dst{Handle<VkImage_T>(texture.image->NativeHandle())};
     for (const auto& pick : picks) {
         const auto& place = pick.place;
-        const u32 width = std::min({place.width, std::max(texture.info.size.width >> place.mip, 1u),
-                                    pick.source->info.size.width});
-        const u32 height =
-            std::min({place.height, std::max(texture.info.size.height >> place.mip, 1u),
-                      pick.source->info.size.height});
+        const u32 width = std::min(
+            {place.width, std::max(texture.info.size.width >> place.mip, 1u),
+             std::max(pick.source->info.size.width >> place.src_mip, 1u)});
+        const u32 height = std::min(
+            {place.height, std::max(texture.info.size.height >> place.mip, 1u),
+             std::max(pick.source->info.size.height >> place.src_mip, 1u)});
         // NAT-125: a layered target (a cube's faces drawn in one pass, the layer from the
-        // vertex shader) gives all its layers.
+        // vertex shader) gives all its layers; NAT-131: from the layer the texture starts at.
         const u32 layers = std::max<u32>(
-            1u, std::min<u32>(std::max<u32>(pick.source->image->Desc().layers, 1u),
+            1u, std::min<u32>(std::max<u32>(pick.source->image->Desc().layers, 1u) -
+                                  u32(place.src_layer),
                               std::max<u32>(texture.image->Desc().layers, 1u) - u32(place.layer)));
         const vk::ImageCopy region{
             .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
-                            .mipLevel = 0,
-                            .baseArrayLayer = 0,
+                            .mipLevel = u32(place.src_mip),
+                            .baseArrayLayer = u32(place.src_layer),
                             .layerCount = layers},
             .srcOffset = {0, 0, 0},
             .dstSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -1926,6 +1926,118 @@ void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>*
     }
 }
 
+const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 bytes) {
+    // NAT-134: a device buffer holding lo, hi, lo, hi... for fills, made once per pattern and
+    // grown when a bigger picture needs it (only ever read afterwards).
+    const u64 key = u64(lo) | (u64(hi) << 32);
+    auto& slot = fill_patterns[key];
+    if (slot && slot->Size() >= bytes) {
+        return slot.get();
+    }
+    const u64 size = std::max<u64>(Common::AlignUp(bytes, 64_KB), 1_MB);
+    auto buffer = device->CreateBuffer({.size = size,
+                                        .usage = Native::Rhi::BufferUsageTransferDst |
+                                                 Native::Rhi::BufferUsageTransferSrc,
+                                        .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                                        .name = "native fill pattern"});
+    if (!buffer) {
+        return slot.get();
+    }
+    Stream& s = Begin();
+    EndRendering();
+    const vk::Buffer handle{Handle<VkBuffer_T>(buffer->NativeHandle())};
+    const auto transfer_barrier = [&] {
+        const vk::MemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+        };
+        s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+    };
+    if (lo == hi) {
+        s.cmd.fillBuffer(handle, 0, VK_WHOLE_SIZE, lo);
+    } else {
+        // 8 KB of the pattern written in, then doubled by copies until the buffer is full.
+        std::array<u32, 2048> words;
+        for (size_t i = 0; i < words.size(); i += 2) {
+            words[i] = lo;
+            words[i + 1] = hi;
+        }
+        u64 filled = sizeof(words);
+        s.cmd.updateBuffer(handle, 0, filled, words.data());
+        while (filled < size) {
+            transfer_barrier();
+            const u64 chunk = std::min(filled, size - filled);
+            s.cmd.copyBuffer(handle, handle, vk::BufferCopy{.srcOffset = 0, .dstOffset = filled,
+                                                            .size = chunk});
+            filled += chunk;
+        }
+    }
+    transfer_barrier();
+    ++s.commands;
+    if (slot) {
+        retired_patterns.push_back(std::move(slot)); // still read by recorded copies
+    }
+    slot = std::move(buffer);
+    return slot.get();
+}
+
+bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows) {
+    // NAT-132/134: a picture filled with the pattern (two dwords, repeated), as memory holds it
+    // after a fill: copied in from a buffer holding it (any format: every texel is the pattern's
+    // bytes). `rows` != 0: only those rows of the first mip and layer (NAT-124).
+    const auto& info = entry.info;
+    const u32 texel = info.props.is_depth
+                          ? (info.pixel_format == vk::Format::eD16Unorm ||
+                                     info.pixel_format == vk::Format::eD16UnormS8Uint
+                                 ? 2u
+                                 : 4u)
+                          : info.num_bits / 8;
+    if (texel == 0 || info.props.is_block || info.num_samples != 1 || !entry.image ||
+        (lo != hi && texel < 8 && texel != 4)) {
+        return false;
+    }
+    const auto& desc = entry.image->Desc();
+    const u32 layers = desc.dim == Native::Rhi::ImageDim::D3 ? 1u : std::max(desc.layers, 1u);
+    const u32 depth = desc.dim == Native::Rhi::ImageDim::D3 ? std::max(desc.depth, 1u) : 1u;
+    const u32 mips = rows ? 1u : std::max(desc.mips, 1u);
+    const u32 height0 = rows ? std::min(rows, desc.height) : desc.height;
+    const u64 bytes = u64(desc.width) * height0 * texel * (rows ? 1u : layers * depth);
+    const Native::Rhi::Buffer* pattern = PatternBuffer(lo, hi, bytes);
+    if (!pattern || pattern->Size() < bytes) {
+        return false;
+    }
+    Stream& s = Begin();
+    GlobalBarrier(); // the work before is done with the picture
+    const vk::Buffer buffer{Handle<VkBuffer_T>(pattern->NativeHandle())};
+    boost::container::small_vector<vk::BufferImageCopy, 16> copies;
+    for (u32 m = 0; m < mips; ++m) {
+        const u32 w = std::max(desc.width >> m, 1u);
+        const u32 h = rows ? height0 : std::max(desc.height >> m, 1u);
+        const u32 d = std::max(depth >> m, 1u);
+        copies.push_back(vk::BufferImageCopy{
+            .bufferOffset = 0,
+            .bufferRowLength = w,
+            .bufferImageHeight = h,
+            .imageSubresource{.aspectMask = info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                                : vk::ImageAspectFlagBits::eColor,
+                              .mipLevel = m,
+                              .baseArrayLayer = 0,
+                              .layerCount = rows ? 1u : layers},
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {w, h, d},
+        });
+    }
+    s.cmd.copyBufferToImage(buffer, vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
+                            vk::ImageLayout::eGeneral, static_cast<u32>(copies.size()),
+                            copies.data());
+    Written(&entry);
+    s.buffers_written = true; // the next work waits for the fill
+    ++s.commands;
+    return true;
+}
+
 void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
     using Rewrite = Native::ImageEntry::Rewrite;
     if (entry.rewrite == Rewrite::None && !entry.stencil_clear_pending) {
@@ -1933,84 +2045,16 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
     }
     const auto& info = entry.info;
     const Rewrite rewrite = std::exchange(entry.rewrite, Rewrite::None);
-    const bool stencil = std::exchange(entry.stencil_clear_pending, false);
+    const bool stencil = std::exchange(entry.stencil_clear_pending, false) &&
+                         info.props.has_stencil && entry.image;
     const u32 lo = entry.rewrite_pattern[0];
     const u32 hi = entry.rewrite_pattern[1];
-    // NAT-124: a fill of the first bytes only: those rows of the first mip and layer get the
-    // pattern (copied from a buffer filled with it, which suits any format).
-    if (rewrite == Rewrite::Clear && entry.rewrite_bytes < info.guest_size) {
-        const u32 texel = info.props.is_depth
-                              ? (info.pixel_format == vk::Format::eD16Unorm ||
-                                         info.pixel_format == vk::Format::eD16UnormS8Uint
-                                     ? 2u
-                                     : 4u)
-                              : info.num_bits / 8;
-        const u64 row_bytes = u64(std::max(info.pitch, info.size.width)) * texel;
-        const u32 rows = row_bytes ? u32(std::min<u64>((entry.rewrite_bytes + row_bytes - 1) /
-                                                           row_bytes,
-                                                       info.size.height))
-                                   : 0;
-        if (lo == hi && rows != 0 && texel != 0 && !info.props.is_block &&
-            info.num_samples == 1 && entry.image) {
-            const u64 bytes = u64(info.size.width) * rows * texel;
-            auto pattern = device->CreateBuffer({.size = Common::AlignUp(bytes, 4),
-                                                 .usage = Native::Rhi::BufferUsageTransferDst |
-                                                          Native::Rhi::BufferUsageTransferSrc,
-                                                 .memory = Native::Rhi::MemoryKind::DeviceLocal,
-                                                 .name = "native partial clear"});
-            if (pattern) {
-                Stream& s = Begin();
-                GlobalBarrier();
-                const vk::Buffer buffer{Handle<VkBuffer_T>(pattern->NativeHandle())};
-                s.cmd.fillBuffer(buffer, 0, Common::AlignUp(bytes, 4), lo);
-                const vk::BufferMemoryBarrier2 filled{
-                    .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-                    .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
-                    .buffer = buffer,
-                    .offset = 0,
-                    .size = VK_WHOLE_SIZE,
-                };
-                s.cmd.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1,
-                                                          .pBufferMemoryBarriers = &filled});
-                const vk::BufferImageCopy copy{
-                    .bufferOffset = 0,
-                    .bufferRowLength = info.size.width,
-                    .bufferImageHeight = rows,
-                    .imageSubresource{.aspectMask = info.props.is_depth
-                                                        ? vk::ImageAspectFlagBits::eDepth
-                                                        : vk::ImageAspectFlagBits::eColor,
-                                      .mipLevel = 0,
-                                      .baseArrayLayer = 0,
-                                      .layerCount = 1},
-                    .imageOffset = {0, 0, 0},
-                    .imageExtent = {info.size.width, rows, 1},
-                };
-                s.cmd.copyBufferToImage(buffer,
-                                        vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
-                                        vk::ImageLayout::eGeneral, copy);
-                Written(&entry);
-                s.buffers_written = true;
-                ++s.commands;
-                ++stats.rewrite_partial;
-                // the device frees the buffer once the GPU ran this list
-            }
-        }
-        if (!stencil) {
-            return;
-        }
-        // (the stencil plane's own fill is applied below)
-        entry.stencil_clear_pending = true;
-        entry.rewrite = Rewrite::None;
-        ApplyRewrite(entry);
-        return;
-    }
-    // What a clear can do: a depth plane filled with one value (32-bit float, or 16-bit
-    // unorm), a color picture filled with zeros. Anything else is uploaded from memory.
+    const bool partial = rewrite == Rewrite::Clear && entry.rewrite_bytes < info.guest_size;
+    // What a clear command can do: a depth plane filled with one value (32-bit float, or 16-bit
+    // unorm), a color picture filled with zeros.
     std::optional<float> depth_value;
     bool color_zero = false;
-    if (rewrite == Rewrite::Clear) {
+    if (rewrite == Rewrite::Clear && !partial) {
         if (info.props.is_depth) {
             const auto format = info.pixel_format;
             const bool d16 = format == vk::Format::eD16Unorm || format == vk::Format::eD16UnormS8Uint;
@@ -2023,14 +2067,30 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
             color_zero = true;
         }
     }
-    const bool clear = depth_value || color_zero || (stencil && info.props.has_stencil);
-    if (rewrite != Rewrite::None && !depth_value && !color_zero) {
-        if (info.num_samples == 1) {
+    if (rewrite == Rewrite::Clear && partial) {
+        // NAT-124: a fill of the first bytes only: those rows of the first mip and layer.
+        const u32 texel = info.props.is_depth ? 4u : std::max(info.num_bits / 8, 1u);
+        const u64 row_bytes = u64(std::max(info.pitch, info.size.width)) * texel;
+        const u32 rows = u32(std::min<u64>((entry.rewrite_bytes + row_bytes - 1) / row_bytes,
+                                           info.size.height));
+        if (rows != 0 && FillImage(entry, lo, hi, rows)) {
+            ++stats.rewrite_partial;
+        }
+    } else if (rewrite == Rewrite::Clear && !depth_value && !color_zero) {
+        // NAT-132: other patterns (GT Sport fills pictures in its scratch pool with non-zero
+        // values) are filled in on the GPU; uploading them from memory cost 1-3 GB a second in
+        // the menus.
+        if (FillImage(entry, lo, hi, 0)) {
+            ++stats.rewrite_fills;
+        } else if (info.num_samples == 1) {
             registry->RequestUpload(entry); // in GPU order, before the next draw or dispatch
             ++stats.rewrite_uploads;
         }
+    } else if (rewrite == Rewrite::Upload && info.num_samples == 1) {
+        registry->RequestUpload(entry);
+        ++stats.rewrite_uploads;
     }
-    if (!clear || !entry.image) {
+    if (!depth_value && !color_zero && !stencil) {
         return;
     }
     Stream& s = Begin();
@@ -2050,7 +2110,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
                                      vk::ClearDepthStencilValue{.depth = *depth_value},
                                      range(vk::ImageAspectFlagBits::eDepth));
     }
-    if (stencil && info.props.has_stencil) {
+    if (stencil) {
         s.cmd.clearDepthStencilImage(
             image, vk::ImageLayout::eGeneral,
             vk::ClearDepthStencilValue{.stencil = entry.stencil_clear_value},
@@ -2721,8 +2781,8 @@ void NativeRenderer::Report() {
              "empty, {} images bound empty; {} fills, {} copies, {} meta clears, {} inline "
              "writes, {} pictures copied from targets, {} written back, {} CPU writes to textures, "
              "{} ranges gathered, region binds/made/refreshes {}/{}/{} (NAT-114), "
-             "fill shaders {}, targets rewritten by clears/uploads/partial clears {}/{}/{} "
-             "(NAT-120/124), "
+             "fill shaders {}, targets rewritten by clears/uploads/partial clears/fills "
+             "{}/{}/{}/{} (NAT-120/124/132), "
              "on the GPU ({:.1f} MB), uploads from guest memory on the GPU/CPU {}/{}; images so far: "
              "{} lookups, {} textures and {} targets made, {} uploads ({:.1f} MB); {:.0f} draws/s, "
              "{:.2f} us a draw, {:.2f} us a dispatch on the recorder; images bound empty by "
@@ -2735,7 +2795,7 @@ void NativeRenderer::Report() {
              stats.cpu_writes.exchange(0),
              stats.gathers, stats.region_binds, stats.regions_made, stats.region_refreshes,
              stats.fill_shaders, stats.rewrite_clears, stats.rewrite_uploads,
-             stats.rewrite_partial,
+             stats.rewrite_partial, stats.rewrite_fills,
              stats.gathered_bytes / 1048576.0,
              registry->GetUploadStats().gpu.load(), registry->GetUploadStats().cpu.load(),
              registry_stats.lookups.load(),
@@ -2760,7 +2820,7 @@ void NativeRenderer::Report() {
     stats.gathers = stats.gathered_bytes = stats.writebacks = 0;
     stats.region_binds = stats.regions_made = stats.region_refreshes = 0;
     stats.fill_shaders = stats.rewrite_clears = stats.rewrite_uploads = 0;
-    stats.rewrite_partial = 0;
+    stats.rewrite_partial = stats.rewrite_fills = 0;
     stats.null_reasons = {};
     stats.phase_ns = {};
     (void)cpu_writes;

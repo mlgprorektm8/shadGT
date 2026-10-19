@@ -236,6 +236,13 @@ private:
     void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern, bool exact);
     /// NAT-120: a target's pending rewrite, before it is used: a clear, or an upload.
     void ApplyRewrite(Native::ImageEntry& entry);
+    /// NAT-132: fills the picture with a 32-bit pattern on the GPU (rows != 0: only those rows
+    /// of the first mip and layer); false when it can't (compressed, multisampled).
+    bool FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows);
+    /// NAT-134: a device buffer holding the pattern (lo, hi, lo, hi...), at least `bytes` long.
+    const Native::Rhi::Buffer* PatternBuffer(u32 lo, u32 hi, u64 bytes);
+    std::unordered_map<u64, std::unique_ptr<Native::Rhi::Buffer>> fill_patterns;
+    std::vector<std::unique_ptr<Native::Rhi::Buffer>> retired_patterns;
     /// NAT-120: GT Sport's fill shader (cs 0x8aa6e00c): its pattern and range, from the
     /// arguments it reads from memory.
     void ReadFillShader(const Shader::Info& cs, DrawBindings& b);
@@ -298,6 +305,7 @@ private:
     struct Stats {
         u64 rewrite_clears = 0, rewrite_uploads = 0, fill_shaders = 0; ///< NAT-120
         u64 rewrite_partial = 0; ///< NAT-124
+        u64 rewrite_fills = 0;   ///< NAT-132
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
             fills = 0, copies = 0, meta_clears = 0, inline_writes = 0, source_copies = 0,
