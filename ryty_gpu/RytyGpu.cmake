@@ -119,6 +119,9 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/native/entry_hook.cpp
         ryty_gpu/native/gts_hooks.cpp
         ryty_gpu/native/shadow.cpp
+        # NAT-010/011: the native renderer's backend interface and its Vulkan backend.
+        ryty_gpu/native/rhi/rhi_vulkan.cpp
+        ryty_gpu/native/rhi/rhi_selftest.cpp
         src/core/cpu_patches.cpp
         src/core/loader/dwarf.cpp
 )

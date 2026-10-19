@@ -552,6 +552,21 @@ extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
 void RytyProtectGuestRedZones(); // ryty_red_zone.cpp
 void RytyApplyGamePatches();     // ryty_game_patch.cpp (GTS-001)
 
+// Whether the process is a game converted by Ryty (its code has Ryty's guest-TLS section), and
+// not a tool or test harness that loaded this library (NAT-012).
+static bool HostIsConvertedGame() {
+    const auto* base = reinterpret_cast<const u8*>(GetModuleHandleA(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const auto* sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (std::memcmp(sections[i].Name, ".gtcode", 8) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Ryty loads this library before the game's code starts, so the game code can still be patched
 // safely here (FIX-074).
 extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
@@ -561,10 +576,12 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         if (GetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", nullptr, 0) == 0) {
             SetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", L"~implicit~");
         }
-        RytyProtectGuestRedZones();
-        RytyApplyGamePatches();
-        // NAT-002: hook points for the native renderer (RYGT_NATIVE_HOOKS=1).
-        Native::InstallGtsHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+        if (HostIsConvertedGame()) {
+            RytyProtectGuestRedZones();
+            RytyApplyGamePatches();
+            // NAT-002: hook points for the native renderer (RYGT_NATIVE_HOOKS=1).
+            Native::InstallGtsHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+        }
     }
     return TRUE;
 }
