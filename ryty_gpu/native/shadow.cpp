@@ -11,6 +11,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <string>
@@ -24,14 +25,19 @@
 #include "common/logging/log.h"
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/shadow.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/regs.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
+
+extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Native {
 namespace {
 
 using AmdGpu::PM4ItOpcode;
 using AmdGpu::Regs;
+using State = AmdGpu::Liverpool::RecorderState;
 
 const bool g_enabled = [] {
     const char* env = std::getenv("RYGT_NATIVE_SHADOW");
@@ -347,7 +353,10 @@ struct Entry {
     u64 relevant;      // the registers the draw depends on (NAT-007)
     std::unique_ptr<Sample> sample; // one draw in 32 keeps every value, to name what differs
     u32 epoch;
-    bool from_parent; // the job started from its parent's state at the fork (NAT-006)
+    bool from_parent;     // the job started from its parent's state at the fork (NAT-006)
+    bool looked_up;       // NAT-030: the job looked its pipeline up
+    const void* pipeline; // NAT-030: what it found (nullptr: none built, or a special draw)
+    const char* miss;     // NAT-030: why it found none
 };
 struct Shard {
     std::mutex mutex;
@@ -377,8 +386,24 @@ struct Stats {
     // NAT-009: jobs that move between threads, or end out of order.
     std::atomic<u64> forks_job_elsewhere, ends_out_of_order, ends_job_elsewhere, ends_unknown;
     std::atomic<u64> clear_states;
+    // NAT-030: pipelines looked up on job threads against the command processor's selection.
+    std::atomic<u64> lookups, lookup_ns, pipelines_same, pipelines_job_none, pipelines_different,
+        pipelines_cp_none, pipelines_unchecked;
+    std::atomic<u64> sharps_same, sharps_different, sharps_job_none, sharps_ns;
 };
 Stats g_stats{};
+// NAT-032: the sharps hash each job read at a draw (packet), checked by the recorder later.
+struct SharpsEntry {
+    u64 hash;
+    u32 epoch;
+};
+struct SharpsShard {
+    std::mutex mutex;
+    std::unordered_map<u64, SharpsEntry> map;
+};
+std::array<SharpsShard, 64> g_sharps;
+std::mutex g_miss_mutex;
+std::unordered_map<std::string, u64> g_misses; // NAT-030: why jobs had no pipeline the renderer had
 
 std::mutex g_register_mutex;
 struct RegisterDiff {
@@ -406,7 +431,7 @@ const u32* DcbCmdPtr(const u8* dcb) {
 struct Job {
     const u8* dcb = nullptr;
     const u32* end = nullptr; // where the job's commands end (set at job end)
-    std::unique_ptr<Regs> regs;
+    std::unique_ptr<State> state; // the walk's registers (installable as the thread's draw state)
     JobExtents extents{};
     JobCursor cursor;
     WalkStats walk{};
@@ -425,16 +450,16 @@ bool OpenElsewhere(const u8* dcb) {
 }
 thread_local Job t_ended{};
 thread_local bool t_has_ended = false;
-thread_local std::vector<std::unique_ptr<Regs>> t_free_regs; // Regs is large: reused
+thread_local std::vector<std::unique_ptr<State>> t_free_states; // large: reused
 thread_local u32 t_sample = 0;
 
-std::unique_ptr<Regs> TakeRegs() {
-    if (t_free_regs.empty()) {
-        return std::make_unique<Regs>();
+std::unique_ptr<State> TakeState() {
+    if (t_free_states.empty()) {
+        return std::make_unique<State>();
     }
-    std::unique_ptr<Regs> regs = std::move(t_free_regs.back());
-    t_free_regs.pop_back();
-    return regs;
+    std::unique_ptr<State> state = std::move(t_free_states.back());
+    t_free_states.pop_back();
+    return state;
 }
 
 // NAT-006: a child job starts with the GPU state its parent had at the fork (the GPU runs the
@@ -471,7 +496,7 @@ bool InitJobState(Job& job) {
             g_fork_states.erase(it);
         }
     }
-    u32* regs = job.regs->reg_array.data();
+    u32* regs = job.state->regs.reg_array.data();
     if (fork) {
         std::memcpy(regs + kShFirst, fork->sh.data(), kShCount * sizeof(u32));
         std::memcpy(regs + kCtxFirst, fork->ctx.data(), kCtxCount * sizeof(u32));
@@ -491,9 +516,13 @@ bool InitJobState(Job& job) {
     return true;
 }
 
-void Snapshot(const u32* packet, const Regs& regs, u32 epoch, bool from_parent) {
+void Snapshot(const u32* packet, const Regs& regs, u32 epoch, bool from_parent,
+              bool looked_up, const void* pipeline, const char* miss) {
     Entry entry;
     entry.from_parent = from_parent;
+    entry.looked_up = looked_up;
+    entry.pipeline = pipeline;
+    entry.miss = miss;
     HashRegs(regs.reg_array.data(), entry.hashes);
     if ((t_sample++ & 31) == 0) {
         entry.sample = std::make_unique<Sample>();
@@ -515,24 +544,68 @@ void Snapshot(const u32* packet, const Regs& regs, u32 epoch, bool from_parent) 
 }
 
 // Records a snapshot of the state at each draw of a job.
+// NAT-030 (RYGT_NATIVE_PIPELINES=1): each draw's pipeline is looked up on the job's thread too.
+const bool g_lookups = [] {
+    const char* env = std::getenv("RYGT_NATIVE_PIPELINES");
+    return env && env[0] == '1';
+}();
+
 class SnapshotVisitor final : public JobVisitor {
 public:
-    SnapshotVisitor(u32 epoch, bool from_parent) : epoch{epoch}, from_parent{from_parent} {}
-    void OnDraw(const u32* packet, PM4ItOpcode, const Regs& regs, const JobExtents&) override {
-        Snapshot(packet, regs, epoch, from_parent);
+    SnapshotVisitor(u32 epoch, bool from_parent, State* state)
+        : epoch{epoch}, from_parent{from_parent}, state{state} {}
+    void OnDraw(const u32* packet, PM4ItOpcode, const Regs& regs,
+                const JobExtents& extents) override {
+        const void* pipeline = nullptr;
+        const char* miss = nullptr;
+        bool looked_up = false;
+        if (g_lookups && state != nullptr && liverpool && liverpool->GetRasterizer()) {
+            // The walk's registers are the thread's draw state while the lookup runs.
+            state->cb_extent = extents.cb;
+            state->db_extent = extents.db;
+            AmdGpu::Liverpool::SetThreadDrawState(state);
+            const auto start = std::chrono::steady_clock::now();
+            pipeline = liverpool->GetRasterizer()->LookupJobPipeline(&miss);
+            if (pipeline) {
+                // NAT-032: the sharps the draw reads, as this thread sees them now.
+                const auto sharps_start = std::chrono::steady_clock::now();
+                const u64 hash = Vulkan::Rasterizer::JobSharpsHash();
+                g_stats.sharps_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - sharps_start)
+                                         .count();
+                const u64 key = reinterpret_cast<u64>(packet);
+                auto& shard = g_sharps[(key * 0x9E3779B97F4A7C15ULL) >> 58];
+                std::scoped_lock lock{shard.mutex};
+                if (shard.map.size() > 20000) {
+                    std::erase_if(shard.map, [this](const auto& item) {
+                        return epoch - item.second.epoch > 8;
+                    });
+                }
+                shard.map.insert_or_assign(key, SharpsEntry{hash, epoch});
+            }
+            g_stats.lookup_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count();
+            ++g_stats.lookups;
+            AmdGpu::Liverpool::SetThreadDrawState(nullptr);
+            looked_up = true;
+        }
+        Snapshot(packet, regs, epoch, from_parent, looked_up, pipeline, miss);
     }
 
 private:
     u32 epoch;
     bool from_parent;
+    State* state;
 };
 
 // Walks a job's commands up to `until` like the command processor does (NAT-004), recording a
 // snapshot of the state at each draw.
 void WalkJobTo(Job& job, const u32* until) {
     const auto start = std::chrono::steady_clock::now();
-    SnapshotVisitor visitor{g_epoch.load(std::memory_order_relaxed), job.from_parent};
-    job.cursor.WalkTo(until, *job.regs, job.extents, visitor, job.walk);
+    SnapshotVisitor visitor{g_epoch.load(std::memory_order_relaxed), job.from_parent,
+                            job.state.get()};
+    job.cursor.WalkTo(until, job.state->regs, job.extents, visitor, job.walk);
     job.walk_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                        std::chrono::steady_clock::now() - start)
                        .count();
@@ -594,7 +667,7 @@ void FinishJob(Job& job) {
     g_stats.overruns += walk.overrun;
     ++g_stats.jobs_decoded;
     g_stats.decode_ns += job.walk_ns;
-    t_free_regs.push_back(std::move(job.regs));
+    t_free_states.push_back(std::move(job.state));
 }
 
 void ReporterLoop() {
@@ -663,6 +736,43 @@ void ReporterLoop() {
                 LOG_INFO(Lib_GnmDriver, "NAT-005 failed walks by reason (10 s):{}", failures);
             }
         }
+        if (g_lookups) {
+            const u64 lookups = take(g_stats.lookups, last.lookups);
+            const u64 lookup_ns = take(g_stats.lookup_ns, last.lookup_ns);
+            LOG_INFO(Lib_GnmDriver,
+                     "NAT-030 pipelines (10 s): {} looked up on job threads ({:.2f} us each); "
+                     "against the command processor's selection: the same {}, the job had none "
+                     "{}, different {}, the command processor had none {}, not checked {}",
+                     lookups, lookups ? lookup_ns / 1000.0 / lookups : 0.0,
+                     take(g_stats.pipelines_same, last.pipelines_same),
+                     take(g_stats.pipelines_job_none, last.pipelines_job_none),
+                     take(g_stats.pipelines_different, last.pipelines_different),
+                     take(g_stats.pipelines_cp_none, last.pipelines_cp_none),
+                     take(g_stats.pipelines_unchecked, last.pipelines_unchecked));
+            const u64 sharps_same = take(g_stats.sharps_same, last.sharps_same);
+            const u64 sharps_different = take(g_stats.sharps_different, last.sharps_different);
+            const u64 sharps_job_none = take(g_stats.sharps_job_none, last.sharps_job_none);
+            const u64 sharps_ns = take(g_stats.sharps_ns, last.sharps_ns);
+            LOG_INFO(Lib_GnmDriver,
+                     "NAT-032 sharps (10 s): the recorder bound draws reading the same V#/T#/S# "
+                     "as their job read on its thread {}, different {}, the job had none {} "
+                     "(hashing {:.2f} us per draw on job threads)",
+                     sharps_same, sharps_different, sharps_job_none,
+                     sharps_same + sharps_different
+                         ? sharps_ns / 1000.0 / (sharps_same + sharps_different)
+                         : 0.0);
+            std::string reasons;
+            {
+                std::scoped_lock lock{g_miss_mutex};
+                for (const auto& [why, count] : g_misses) {
+                    reasons += fmt::format(" [{}: {}]", why, count);
+                }
+                g_misses.clear();
+            }
+            if (!reasons.empty()) {
+                LOG_INFO(Lib_GnmDriver, "NAT-030 why jobs had no pipeline (10 s):{}", reasons);
+            }
+        }
         const u64 checked = take(g_stats.checked, last.checked);
         const u64 relevant_same = take(g_stats.relevant_same, last.relevant_same);
         const u64 identical = take(g_stats.identical, last.identical);
@@ -723,10 +833,10 @@ void ShadowJobBegin(const u8* dcb) {
     ++g_stats.jobs_begun;
     Job job;
     job.dcb = dcb;
-    job.regs = TakeRegs();
+    job.state = TakeState();
     if (!InitJobState(job)) {
         ++g_stats.jobs_without_base;
-        t_free_regs.push_back(std::move(job.regs));
+        t_free_states.push_back(std::move(job.state));
     } else {
         ++g_stats.jobs_from[job.from_parent];
         job.cursor.Start(DcbBegin(dcb), DcbEnd(dcb), job.walk);
@@ -736,8 +846,8 @@ void ShadowJobBegin(const u8* dcb) {
         std::scoped_lock lock{g_open_mutex};
         for (auto it = t_jobs.begin(); it != t_jobs.begin() + 32; ++it) {
             g_open_jobs.erase(it->dcb);
-            if (it->regs) {
-                t_free_regs.push_back(std::move(it->regs));
+            if (it->state) {
+                t_free_states.push_back(std::move(it->state));
             }
         }
         t_jobs.erase(t_jobs.begin(), t_jobs.begin() + 32);
@@ -752,7 +862,7 @@ namespace {
 // Hands the parent's state at the fork to the child job.
 void HandOver(const Job& parent, const u8* child_context) {
     auto state = std::make_unique<ForkState>();
-    const u32* regs = parent.regs->reg_array.data();
+    const u32* regs = parent.state->regs.reg_array.data();
     std::memcpy(state->sh.data(), regs + kShFirst, kShCount * sizeof(u32));
     std::memcpy(state->ctx.data(), regs + kCtxFirst, kCtxCount * sizeof(u32));
     for (size_t i = 0; i < kDrawFields.size(); ++i) {
@@ -784,14 +894,14 @@ Job* RootFor(const u8* context, const u32* slot, const u32* run_begin, const u32
     // A new frame (the root's command buffer starts over), or the walk lost its way.
     if (!root) {
         root = std::make_unique<Job>();
-        root->regs = std::make_unique<Regs>();
+        root->state = std::make_unique<State>();
     }
     {
         std::shared_lock lock{g_base_mutex};
         if (!g_base) {
             return nullptr;
         }
-        CopyCompared(g_base->reg_array.data(), root->regs->reg_array.data());
+        CopyCompared(g_base->reg_array.data(), root->state->regs.reg_array.data());
     }
     ++g_stats.root_restarts;
     root->dcb = context + kContextDcb;
@@ -851,7 +961,7 @@ void ShadowFork(const u8* parent_context, const u32* slot, const u32* run_begin,
         HandOver(*root, child_context);
         return;
     }
-    if (!parent->regs) {
+    if (!parent->state) {
         ++g_stats.forks_other_context;
         return;
     }
@@ -898,7 +1008,7 @@ void ShadowJobDecode() {
         return;
     }
     t_has_ended = false;
-    if (!t_ended.regs) {
+    if (!t_ended.state) {
         return; // no start state
     }
     WalkJobTo(t_ended, t_ended.end);
@@ -918,6 +1028,56 @@ void ShadowSubmitBase(const Regs& regs) {
     }
 }
 
+namespace {
+// The command processor's last checked draw: what its job's pipeline lookup found (NAT-030).
+struct LastCheck {
+    bool valid;
+    bool looked_up;
+    const void* pipeline;
+    const char* miss;
+};
+thread_local LastCheck t_check{};
+} // namespace
+
+void ShadowCheckPipeline(const void* cp_pipeline, bool cp_selected) {
+    const LastCheck check = std::exchange(t_check, LastCheck{});
+    if (!check.valid || !check.looked_up) {
+        ++g_stats.pipelines_unchecked;
+        return;
+    }
+    if (!cp_selected || cp_pipeline == nullptr) {
+        ++g_stats.pipelines_cp_none;
+    } else if (check.pipeline == nullptr) {
+        ++g_stats.pipelines_job_none;
+        std::scoped_lock lock{g_miss_mutex};
+        ++g_misses[check.miss ? check.miss : "?"];
+    } else if (check.pipeline == cp_pipeline) {
+        ++g_stats.pipelines_same;
+    } else {
+        ++g_stats.pipelines_different;
+    }
+}
+
+void ShadowCheckSharps(const void* packet, u64 hash) {
+    const u64 key = reinterpret_cast<u64>(packet);
+    auto& shard = g_sharps[(key * 0x9E3779B97F4A7C15ULL) >> 58];
+    std::optional<u64> job;
+    {
+        std::scoped_lock lock{shard.mutex};
+        if (const auto it = shard.map.find(key); it != shard.map.end()) {
+            job = it->second.hash;
+            shard.map.erase(it);
+        }
+    }
+    if (!job) {
+        ++g_stats.sharps_job_none;
+    } else if (*job == hash) {
+        ++g_stats.sharps_same;
+    } else {
+        ++g_stats.sharps_different;
+    }
+}
+
 void ShadowCheckDraw(const void* packet, const Regs& regs) {
     if (!g_reporter_started.exchange(true)) {
         std::thread{ReporterLoop}.detach();
@@ -931,12 +1091,14 @@ void ShadowCheckDraw(const void* packet, const Regs& regs) {
         const auto it = shard.map.find(key);
         if (it == shard.map.end()) {
             ++g_stats.not_decoded;
+            t_check = {};
             return;
         }
         entry = std::move(it->second);
         shard.map.erase(it);
     }
     ++g_stats.checked_from[entry.from_parent];
+    t_check = {true, entry.looked_up, entry.pipeline, entry.miss};
     Hashes cp;
     HashRegs(regs.reg_array.data(), cp);
     bool same = true;

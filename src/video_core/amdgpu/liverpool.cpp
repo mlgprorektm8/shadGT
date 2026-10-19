@@ -760,6 +760,12 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         selected = compute ? rasterizer->SelectComputePipelineAhead()
                            : rasterizer->SelectPipelineAhead();
     }
+#ifdef RYTY_GPU
+    if (!compute && Native::ShadowEnabled()) {
+        // NAT-030: the pipeline the draw's job looked up on its thread, against this selection.
+        Native::ShadowCheckPipeline(selected ? selected->pipeline : nullptr, selected.has_value());
+    }
+#endif
     // PERF-062: the upload epoch this draw is decoded in; its pages are hashed now, on this
     // thread, and the recorder uses those hashes for this draw.
     const u32 decode_epoch = VideoCore::g_upload_epoch.load(std::memory_order_acquire);
@@ -1897,7 +1903,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     [this, cmd_address] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndex2",
                                                 fmt::make_format_args(cmd_address),
-                                                [&] { rasterizer->Draw(true); });
+                                                [&] {
+                                                    // NAT-032: shadow checks key by it
+                                                    Vulkan::Rasterizer::t_draw_packet = cmd_address;
+                                                    rasterizer->Draw(true);
+                                                    Vulkan::Rasterizer::t_draw_packet = nullptr;
+                                                });
                     },
                     false, true);
                 break;
@@ -1929,7 +1940,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     [this, cmd_address, index_offset] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndexOffset2",
                                                 fmt::make_format_args(cmd_address),
-                                                [&] { rasterizer->Draw(true, index_offset); });
+                                                [&] {
+                                                    // NAT-032: shadow checks key by it
+                                                    Vulkan::Rasterizer::t_draw_packet = cmd_address;
+                                                    rasterizer->Draw(true, index_offset);
+                                                    Vulkan::Rasterizer::t_draw_packet = nullptr;
+                                                });
                     },
                     false, true);
                 break;
@@ -1956,7 +1972,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     [this, cmd_address] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndexAuto",
                                                 fmt::make_format_args(cmd_address),
-                                                [&] { rasterizer->Draw(false); });
+                                                [&] {
+                                                    // NAT-032: shadow checks key by it
+                                                    Vulkan::Rasterizer::t_draw_packet = cmd_address;
+                                                    rasterizer->Draw(false);
+                                                    Vulkan::Rasterizer::t_draw_packet = nullptr;
+                                                });
                     },
                     false, true);
                 break;

@@ -32,6 +32,9 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/native/shadow.h"
+#endif
 #include "video_core/amdgpu/draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -258,6 +261,61 @@ void Rasterizer::CopyComputeStage(std::array<SelectedStage, Shader::MaxStageType
     ASSERT(selected.num_user_data <= selected.user_data.size());
     std::ranges::copy(info->user_data, selected.user_data.begin());
     selected.flattened = info->flattened_ud_buf;
+}
+
+const GraphicsPipeline* Rasterizer::LookupJobPipeline(const char** miss) {
+    const auto& regs = liverpool->DrawRegs();
+    bool depth_copy;
+    bool stencil_copy;
+    if (ClassifyDraw(regs, depth_copy, stencil_copy) != DrawFilter::Draw) {
+        if (miss) {
+            *miss = "special draw";
+        }
+        return nullptr;
+    }
+    // A quad list's pipeline here is the triangle-list one (PERF-068: the command thread selects
+    // both and the recorder picks); its tessellated twin is looked up the same way when needed.
+    std::shared_lock lk{pipeline_cache.LookupMutex()}; // NAT-031: job threads at once
+    const auto* pipeline = pipeline_cache.LookupBuiltPipeline({});
+    if (!pipeline && miss) {
+        *miss = pipeline_cache.LookupMiss();
+    }
+    return pipeline;
+}
+
+u64 Rasterizer::SharpsHash(std::span<const Shader::Info* const> stages) {
+    static thread_local std::vector<u32> words;
+    words.clear();
+    const auto add = [](const auto& sharp) {
+        const auto* data = reinterpret_cast<const u32*>(&sharp);
+        words.insert(words.end(), data, data + sizeof(sharp) / sizeof(u32));
+    };
+    for (u32 stage = 0; stage < stages.size(); ++stage) {
+        const Shader::Info* info = stages[stage];
+        if (!info) {
+            continue;
+        }
+        words.push_back(stage);
+        for (const auto& desc : info->buffers) {
+            if (!desc.IsSpecial()) {
+                add(desc.GetSharp(*info));
+            }
+        }
+        for (const auto& desc : info->images) {
+            add(desc.GetSharp(*info));
+        }
+        for (const auto& desc : info->samplers) {
+            add(desc.GetSharp(*info));
+        }
+        for (const auto& desc : info->fmasks) {
+            add(desc.GetSharp(*info));
+        }
+    }
+    return XXH3_64bits(words.data(), words.size() * sizeof(u32));
+}
+
+u64 Rasterizer::JobSharpsHash() {
+    return SharpsHash(PipelineCache::JobInfos());
 }
 
 std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhead() {
@@ -2918,6 +2976,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
     }
 
+#ifdef RYTY_GPU
+    if (t_draw_packet != nullptr && Native::ShadowEnabled()) {
+        // NAT-032: the sharps this draw reads here, against what its job read on its thread.
+        Native::ShadowCheckSharps(t_draw_packet, SharpsHash(pipeline->GetStages()));
+    }
+#endif
     ctx->set_write_index = 0;
     ctx->set_writes.clear();
     ctx->buffer_infos.clear();

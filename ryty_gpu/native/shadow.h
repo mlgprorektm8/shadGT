@@ -38,5 +38,10 @@ void ShadowJobDecode();
 /// start from), and at each draw packet.
 void ShadowSubmitBase(const AmdGpu::Regs& regs);
 void ShadowCheckDraw(const void* packet, const AmdGpu::Regs& regs);
+/// NAT-030: right after ShadowCheckDraw, the pipeline the command processor selected for that
+/// draw (nullptr if none; `cp_selected` false if it did not select one ahead).
+void ShadowCheckPipeline(const void* cp_pipeline, bool cp_selected);
+/// NAT-032: on the recorder, the sharps hash of the draw at `packet` as it binds it.
+void ShadowCheckSharps(const void* packet, u64 hash);
 
 } // namespace Native

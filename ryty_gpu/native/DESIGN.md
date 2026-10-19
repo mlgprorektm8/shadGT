@@ -130,6 +130,24 @@ game thread (render job)                     submit (PGL 0x1c56610 / sceGnmSubmi
    pipelines, bindings and lists per draw, checked against what the current renderer binds for
    the same draw packet, with the cost per draw. **N4.1** native mode for whole frames, boot
    screen and menus first. **N4.2** races, screenshots compared with the current renderer.
+
+   N4.0 so far (RYGT_NATIVE_PIPELINES=1 with shadow mode):
+   - NAT-030: job threads look each draw's pipeline up in shadGT's cache
+     (PipelineCache::LookupBuiltPipeline: only pipelines already built; nothing translated,
+     loaded, built or waited for) and the command processor compares with its own selection.
+   - NAT-031: the per-call key state (key, infos, modules, runtime infos, fetch shader, ...)
+     moved into KeyScratch; the threads above use the cache's own, a job thread its own. Job
+     threads match permutations in their own copies of the cached infos (GetProgramForJob,
+     read-only) under a shared lock that yields to the threads above (LookupLock).
+   - Eighth race: whenever a job thread found a pipeline it was the renderer's (rare
+     differences when two permutations match the same inputs, or programs change); the misses
+     were quad lists (now looked up too: their triangle-list pipeline) and new programs or
+     pipelines in loading screens. 1.2 us per lookup in light scenes; 9-16 us in races while the
+     command processor still takes the lock for its own selection of every draw (native mode
+     drops that).
+   - NAT-032: the V#/T#/S# each draw reads, hashed on the job thread and again by the recorder
+     as it binds the draw (keyed by the draw packet), to see whether the game rewrites resource
+     descriptors between a job's end and the GPU's turn.
 6. **N5 Speed**: lock-free pipeline lookups for repeated draws, pipelines built ahead from the
    shader pack.
 7. **N6 DX12**: the backend interface on D3D12, SPIR-V to DXIL, and pipelines built natively

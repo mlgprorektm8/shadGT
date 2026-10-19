@@ -90,6 +90,16 @@ public:
     std::optional<SelectedPipeline> SelectPipelineAhead();
     /// PERF-055: the same for a direct dispatch it is decoding (-DisablePerf 66: none).
     std::optional<SelectedPipeline> SelectComputePipelineAhead();
+    /// NAT-030: on a game job thread whose registers Liverpool::SetThreadDrawState installed,
+    /// the built pipeline of its draw, or nullptr (special draws, quad lists, not built yet).
+    const GraphicsPipeline* LookupJobPipeline(const char** miss = nullptr);
+    /// NAT-032: a hash of the resource descriptors (V#, T#, S#) the stages read for a draw.
+    static u64 SharpsHash(std::span<const Shader::Info* const> stages);
+    /// NAT-032: right after LookupJobPipeline found a pipeline, the sharps its draw reads, as
+    /// the job thread sees them.
+    static u64 JobSharpsHash();
+    /// NAT-032 (shadow mode): the guest packet of the draw this thread records now.
+    static inline thread_local const void* t_draw_packet = nullptr;
     /// PERF-062 (command thread): hashes the pages of the selected draw's read-only buffers for
     /// the upload epoch it is decoded in.
     void HashDrawPagesAhead(const SelectedPipeline& selected, u32 epoch);

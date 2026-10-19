@@ -151,6 +151,11 @@ public:
         vo_port = port;
     }
 
+    /// NAT-030: for the native renderer's job threads.
+    Vulkan::Rasterizer* GetRasterizer() const {
+        return rasterizer;
+    }
+
     void BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         rasterizer = rasterizer_;
     }
