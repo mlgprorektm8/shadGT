@@ -147,6 +147,13 @@ constexpr u32 kPaPointFirst = 0xA280;    // PA_SU_POINT_SIZE, PA_SU_POINT_MINMAX
 constexpr u32 kPaLineFirst = 0xA282;     // PA_SU_LINE_CNTL, PA_SC_LINE_STIPPLE: lines only
 constexpr u32 kVgtGsMaxVertOut = 0xA2CE; // geometry shader state (the field is a bit field)
 constexpr u32 kDbRenderControlBits = 0x1f;
+// SPI_PS_INPUT_CNTL_0 (0xA191) to SPI_SHADER_COL_FORMAT (0xA1C5): the pixel shader's inputs,
+// interpolation and export formats (with SPI_VS_OUT_CONFIG and SPI_SHADER_POS_FORMAT, which the
+// mask keeps through the vertex shader's side below).
+constexpr u32 kPsContextFirst = 0xA191;
+constexpr u32 kPsContextCount = 0xA1C6 - 0xA191;
+constexpr u32 kVsOutConfig = 0xA1B1;
+constexpr u32 kShaderPosFormat = 0xA1C3;
 
 u32 ValueMask(u32 full_index) {
     return full_index == FullIndex(NAT_REG(depth_render_control)) ? kDbRenderControlBits
@@ -220,10 +227,21 @@ void BuildMask(const Regs& regs, Mask& mask) {
         }
         const AmdGpu::ShaderProgram* program = regs.ProgramForStage(stage);
         const u32 first = static_cast<u32>(reinterpret_cast<const u32*>(program) - raw);
+        if (program->address == 0) {
+            SetRegs(mask, first, 2); // no program (the renderer skips the stage)
+            continue;
+        }
         // address, settings and the user data the program reads
         SetRegs(mask, first, 4 + std::min<u32>(program->settings.num_user_regs, 16));
     }
-    SetRegs(mask, NAT_REG(ps_inputs), std::min<u32>(regs.num_interp, 32));
+    if (regs.ps_program.address == 0) {
+        // No pixel shader (depth-only draws): its inputs and export formats are left over.
+        SetRegs(mask, kPsContextFirst, kPsContextCount, false);
+        SetRegs(mask, kVsOutConfig, 1);
+        SetRegs(mask, kShaderPosFormat, 1);
+    } else {
+        SetRegs(mask, NAT_REG(ps_inputs), std::min<u32>(regs.num_interp, 32));
+    }
     if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
         bool blending = false;
         for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {

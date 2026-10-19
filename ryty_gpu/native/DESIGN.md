@@ -26,6 +26,16 @@ Addresses are eboot.bin addresses; GTSport.exe RVA = address + 0x10000.
   rings, 0x1cafa0, 0x1db650); compute rings are kicked with DingDong (0x1d8b90).
 - **Submission.** One graphics submit per frame, from PGL 0x1c56610 (called by the submit thread
   0x1834210).
+- **Job tree (found with the check races, NAT-005..009).** Jobs are forked: PGL 0x1c56770
+  clones the current context into a child (so the child assumes the parent's GPU state), ends
+  the parent's command run with a 16-byte link slot that will lead into the child's commands,
+  and the parent goes on right after the slot (or in a fresh chunk), linked after the child's
+  last chunk through a link object (word handshake, xchg). The GPU runs the tree depth-first:
+  parent part 1, child, parent part 2, ... The frame's root context (0x1431cd240, not a job)
+  writes the frame setup and forks the frame's jobs from 0x1833d43. A job's own commands are
+  therefore read by skipping each fork's slot, starting from the parent's state at the fork;
+  jobs never moved between threads in the races, but ~1-2% of job ends are not the innermost
+  open job on the thread.
 - **Render jobs.** A job takes a PGL context from a pool (0x1c572c0), makes it current on its
   thread (TLS slot fs:[0]-8) with a fresh command chunk and state copied from a template, records,
   and ends (0x1c57860), linking its chunk after the previous job's. Jobs run in parallel on the
@@ -88,9 +98,18 @@ game thread (render job)                     submit (PGL 0x1c56610 / sceGnmSubmi
    guest address and layout, shared by all job threads; uploads untiled on the GPU with
    shadGT's tiling shaders; downloads re-tiled. Self test (RytyNativeImageSelfTest): exact round
    trips for Thin1DThin, Thin2DThin and Display2DThin with mips.
-4. **N3 Shadow mode** (built, not run yet, NAT-003/004): job_walker.cpp walks each job's own
-   commands at job end; shadow.cpp compares the state at every draw with the command
-   processor's. This decides whether jobs can start from a base state (are self-contained).
+4. **N3 Shadow mode** (done, NAT-003..009, five check races on 2026-10-19). job_walker.cpp's
+   JobCursor walks each job's own commands on its thread, up to each fork (handing the state
+   at that point to the child) and to the job's end; the frame's root context is walked the
+   same way. shadow.cpp compares, at every draw, the registers the renderer reads with the
+   command processor's (enabled stages' programs and the user data they take, written color
+   targets and blending, depth/stencil when used, raster state; not stale values in unused
+   registers, sample positions, HTILE details). Results: hooks see every draw; decoded draws
+   equal the game's draws; walks of all jobs succeed; menus, car list and light scenes 99.8 to
+   100% of draws the same where it matters (light scenes 100% on every register). The rest
+   (~0.1%) are draws whose pixel shader comes from earlier work outside the job's ancestry
+   (the job sees no pixel shader): detectable on the job thread, so such draws can fall back
+   to the command processor.
 5. **N4 Native mode, hybrid first.** Job threads record each job's draws into secondary command
    lists, split at the job's flushes, events, waits and writes. The command processor keeps
    walking packets and handling those (fences, labels, flips, compute rings, as today), and at
