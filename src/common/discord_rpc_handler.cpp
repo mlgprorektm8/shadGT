@@ -6,7 +6,7 @@
 namespace DiscordRPCHandler {
 
 #ifdef RYTY_GPU
-constexpr const char* RunningOn = "Running on ryGT"; // the Ryty build (RyGT)
+constexpr const char* RunningOn = nullptr; // Omit the client branding from RyGT presence.
 #else
 constexpr const char* RunningOn = "Running on shadGT";
 #endif
