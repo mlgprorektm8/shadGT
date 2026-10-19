@@ -8,7 +8,7 @@
 
 namespace Common::Log::StdoutLevel {
 inline constexpr unsigned Warning = 3;
-inline constexpr unsigned Default = 4;
+inline constexpr unsigned Default = Warning;
 inline constexpr std::array<std::string_view, 5> Names{"Trace", "Debug", "Info", "Warning", "Error"};
 
 inline std::string_view Trim(std::string_view text) {
@@ -26,6 +26,10 @@ inline unsigned Parse(std::string_view text) {
                      std::tolower(static_cast<unsigned char>(Names[level][i]));
         if (equal) return level;
     }
+    // Preserve the old Critical setting as Error, independent of the default.
+    std::string legacy(text);
+    for (char& c : legacy) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (legacy == "critical") return 4;
     return Default;
 }
 
