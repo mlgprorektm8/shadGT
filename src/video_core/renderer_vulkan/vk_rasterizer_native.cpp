@@ -294,6 +294,18 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         if (!direct || size == 0 || !direct->EnsureImported(address, size)) {
             return source;
         }
+        // NAT-146: the GPU's bytes there are in a region (shader-written memory lives in video
+        // memory): the upload reads the region.
+        if (Region* region = RegionOver(address, size);
+            region && address >= region->begin && address + size <= region->end &&
+            (address - region->begin) % r.instance.StorageMinAlignment() == 0) {
+            RefreshRegion(*region);
+            auto wrapped = device->WrapBuffer(region->buffer->NativeHandle(), region->buffer->Size());
+            source.buffer = wrapped.get();
+            source.offset = address - region->begin;
+            source.keep.push_back(std::move(wrapped));
+            return source;
+        }
         if (const auto found = direct->FindBuffer(address, size);
             found && found->second % r.instance.StorageMinAlignment() == 0) {
             auto wrapped = device->WrapBuffer(
@@ -679,6 +691,13 @@ void NativeRenderer::FlushWritebacks() {
             found->first->SizeBytes());
         if (registry->RecordDownload(*s.list, *entry, *out, found->second)) {
             ++stats.writebacks;
+            // NAT-146: regions over the picture's memory copy it in before their next use.
+            if (Region* region = RegionOver(address, size)) {
+                for (VAddr page = Common::AlignDown(std::max<VAddr>(address, region->begin), 4096);
+                     page < std::min<VAddr>(address + size, region->end); page += 4096) {
+                    region->dirty_pages.push_back(page);
+                }
+            }
         }
         s.keep.push_back(std::move(out));
     }
@@ -905,6 +924,17 @@ void NativeRenderer::RefreshRegion(Region& region) {
     if (pages.empty()) {
         return;
     }
+    const auto refresh_start = std::chrono::steady_clock::now();
+    struct Timed {
+        std::chrono::steady_clock::time_point start;
+        u64& total;
+        ~Timed() {
+            total += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+        }
+    } timed{refresh_start, stats.region_refresh_ns};
+    stats.region_refresh_pages += pages.size();
     auto* direct = r.buffer_cache.GetDirectMemory();
     if (!direct) {
         return;
@@ -929,7 +959,13 @@ void NativeRenderer::RefreshRegion(Region& region) {
                             });
     }
     s.buffers_written = true;
-    WatchPages(region.begin, region.end - region.begin);
+    // NAT-145: only the pages copied in are watched again (the region was watched whole when
+    // made; re-watching all of it at each refresh cost ~9 us a draw with big regions).
+    for (const VAddr page : pages) {
+        if (page >= region.begin && page < region.end) {
+            WatchPages(page, std::min<u64>(4096, region.end - page));
+        }
+    }
     ++stats.region_refreshes;
 }
 
@@ -938,6 +974,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     if (size == 0) {
         return std::nullopt;
     }
+    PhaseClock guest_clock{stats.guest_buffer_ns}; // NAT-145
+    ++stats.guest_buffer_calls;
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
         if (address < region->begin || address + size > region->end) {
@@ -945,6 +983,22 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
         }
         if (region) {
             RefreshRegion(*region);
+            ++stats.region_binds;
+            return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
+                             u64{address - region->begin}};
+        }
+    }
+    // NAT-144: every range shaders write lives in video memory (a region), not in guest memory
+    // over PCIe (the GPU was 85% busy waiting on PCIe, 55% with this; the race went from 25 to
+    // 33-39 FPS). What the GPU writes there doesn't reach guest memory: GT Sport's CPU doesn't
+    // read it back (the old renderer runs with buffer readbacks off too); small render targets
+    // still go back (NAT-112). RYGT_NATIVE_WRITE_REGIONS=0: written ranges in guest memory.
+    static const bool write_regions = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITE_REGIONS");
+        return !(env && env[0] == '0');
+    }();
+    if (write && write_regions && size <= 256_MB) {
+        if (Region* region = MakeRegion(address, size)) {
             ++stats.region_binds;
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
@@ -1630,12 +1684,12 @@ bool NativeRenderer::NeedsBarrierFor(const DrawBindings& b) const {
     return false;
 }
 
-void NativeRenderer::Written(const Native::ImageEntry* entry) {
+void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
     if (!entry) {
         return;
     }
     auto* written = const_cast<Native::ImageEntry*>(entry);
-    written->write_version.store(++write_clock, std::memory_order_relaxed);
+    written->write_version.store(at != 0 ? at : ++write_clock, std::memory_order_relaxed);
     // NAT-111: the textures made of it copy its picture in before their next read.
     std::scoped_lock lock{written->sources_mutex};
     for (auto* texture : written->dependents) {
@@ -1990,7 +2044,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
 
 void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
                               bool exact) {
-    registry->GpuWrote(address, size, pattern, exact);
+    const u64 clock = ++write_clock; // NAT-148: when the memory was rewritten
+    registry->GpuWrote(address, size, pattern, exact, clock);
     // A fill of a stencil plane: depth images whose stencil is there clear it at next use.
     const auto it = stencil_owners.find(address);
     if (it == stencil_owners.end() || !pattern) {
@@ -2004,6 +2059,7 @@ void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>*
     for (auto* entry : it->second) {
         entry->stencil_clear_pending = true;
         entry->stencil_clear_value = static_cast<u8>(lo);
+        entry->rewrite_clock = std::max(entry->rewrite_clock, clock);
     }
 }
 
@@ -2113,7 +2169,7 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     s.cmd.copyBufferToImage(buffer, vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
                             vk::ImageLayout::eGeneral, static_cast<u32>(copies.size()),
                             copies.data());
-    Written(&entry);
+    Written(&entry, entry.rewrite_clock); // NAT-148
     s.buffers_written = true; // the next work waits for the fill
     ++s.commands;
     return true;
@@ -2201,7 +2257,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         s.cmd.clearColorImage(image, vk::ImageLayout::eGeneral, vk::ClearColorValue{},
                               range(vk::ImageAspectFlagBits::eColor));
     }
-    Written(&entry);
+    Written(&entry, entry.rewrite_clock); // NAT-148
     s.buffers_written = true; // the next work waits for the clear
     ++s.commands;
     ++stats.rewrite_clears;
@@ -2522,6 +2578,16 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
     Stream& s = Begin();
     GlobalBarrier();
     CmdBuf{s.cmd}.updateBuffer(found->first->Handle(), found->second, data.size(), data.data());
+    // NAT-146: a region over the range holds what the GPU reads there: it gets the bytes too.
+    for (auto& [base, region] : regions) {
+        const VAddr begin = std::max<VAddr>(address, region.begin);
+        const VAddr end = std::min<VAddr>(address + data.size(), region.end);
+        if (begin < end) {
+            CmdBuf{s.cmd}.updateBuffer(vk::Buffer{Handle<VkBuffer_T>(region.buffer->NativeHandle())},
+                                       begin - region.begin, end - begin,
+                                       data.data() + (begin - address));
+        }
+    }
     s.buffers_written = true;
     ++s.commands;
     ++stats.inline_writes;
@@ -2529,7 +2595,18 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
 }
 
 void NativeRenderer::OnUnmap(VAddr address, u64 size) {
+    Native::ForgetReadable(address, size); // NAT-147
     registry->Invalidate(address, size, Native::ImageRegistry::Stale::Unmap);
+    // NAT-146: regions over unmapped memory go (the device frees their buffers once the GPU is
+    // done with them).
+    std::scoped_lock lock{mutex};
+    for (auto it = regions.begin(); it != regions.end();) {
+        if (it->second.begin < address + size && it->second.end > address) {
+            it = regions.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void NativeRenderer::EvictImages() {
@@ -2869,7 +2946,8 @@ void NativeRenderer::Report() {
              "run; {} reads copied ({:.1f} MB), {} ranges bound "
              "empty, {} images bound empty; {} fills, {} copies, {} meta clears, {} inline "
              "writes, {} pictures copied from targets, {} written back, {} CPU writes to textures, "
-             "{} ranges gathered, region binds/made/refreshes {}/{}/{} (NAT-114), "
+             "{} ranges gathered, region binds/made/refreshes {}/{}/{} (NAT-114; {} regions, "
+             "{:.1f} MB, {} pages refreshed in {:.1f} ms; {} guest buffers in {:.1f} ms), "
              "fill shaders {}, targets rewritten by clears/uploads/partial clears/fills "
              "{}/{}/{}/{} (NAT-120/124/132), "
              "on the GPU ({:.1f} MB), uploads from guest memory on the GPU/CPU {}/{}; images so far: "
@@ -2884,6 +2962,16 @@ void NativeRenderer::Report() {
              stats.inline_writes, stats.source_copies, stats.writebacks,
              stats.cpu_writes.exchange(0),
              stats.gathers, stats.region_binds, stats.regions_made, stats.region_refreshes,
+             regions.size(),
+             [&] {
+                 u64 bytes = 0;
+                 for (const auto& [base, region] : regions) {
+                     bytes += region.end - region.begin;
+                 }
+                 return bytes / 1048576.0;
+             }(),
+             stats.region_refresh_pages, stats.region_refresh_ns / 1e6, stats.guest_buffer_calls,
+             stats.guest_buffer_ns / 1e6,
              stats.fill_shaders, stats.rewrite_clears, stats.rewrite_uploads,
              stats.rewrite_partial, stats.rewrite_fills,
              stats.gathered_bytes / 1048576.0,
@@ -2922,6 +3010,8 @@ void NativeRenderer::Report() {
     stats.fill_shaders = stats.rewrite_clears = stats.rewrite_uploads = 0;
     stats.rewrite_partial = stats.rewrite_fills = 0;
     stats.pass_barriers = stats.passes_unblocked = 0;
+    stats.region_refresh_pages = stats.region_refresh_ns = 0;
+    stats.guest_buffer_calls = stats.guest_buffer_ns = 0;
     stats.null_reasons = {};
     stats.phase_ns = {};
     (void)cpu_writes;

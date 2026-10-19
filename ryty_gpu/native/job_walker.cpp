@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -52,7 +53,73 @@ void NoteExtentHints(u32 reg_addr, u32 count_field, const u32* payload, JobExten
 
 } // namespace
 
+namespace {
+// NAT-147: 64 KiB granules of the low 1 TiB known to be readable (committed, not no-access),
+// so the recorder's checks don't call VirtualQuery per draw (with many pages protected one by
+// one for write tracking, VirtualQuery walked them one region at a time: a quarter of the
+// recorder's time). Only "readable" is remembered; unmapping forgets it (ForgetReadable).
+constexpr u32 GranuleBits = 16;
+constexpr u64 Granules = (u64{1} << 40) >> GranuleBits;
+std::atomic<u64> readable_bits[Granules / 64];
+
+bool GranuleKnown(u64 granule) {
+    return granule < Granules &&
+           (readable_bits[granule / 64].load(std::memory_order_relaxed) >> (granule % 64)) & 1;
+}
+
+bool QueryReadable(const u8* p, const u8* end) {
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(p, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+            return false;
+        }
+        p = static_cast<const u8*>(info.BaseAddress) + info.RegionSize;
+    }
+    return true;
+}
+
+// Whether the whole granule is readable (checked once, then remembered).
+bool GranuleReadable(u64 granule) {
+    if (GranuleKnown(granule)) {
+        return true;
+    }
+    if (granule >= Granules) {
+        return false;
+    }
+    const auto* begin = reinterpret_cast<const u8*>(granule << GranuleBits);
+    if (!QueryReadable(begin, begin + (u64{1} << GranuleBits))) {
+        return false;
+    }
+    readable_bits[granule / 64].fetch_or(u64{1} << (granule % 64), std::memory_order_relaxed);
+    return true;
+}
+} // namespace
+
+void ForgetReadable(u64 address, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    for (u64 granule = address >> GranuleBits;
+         granule <= (address + size - 1) >> GranuleBits && granule < Granules; ++granule) {
+        readable_bits[granule / 64].fetch_and(~(u64{1} << (granule % 64)),
+                                               std::memory_order_relaxed);
+    }
+}
+
 u64 ReadablePrefix(const void* address, u64 size) {
+    {
+        // NAT-147: whole readable granules first.
+        const u64 begin = reinterpret_cast<u64>(address);
+        u64 granule = begin >> GranuleBits;
+        const u64 last = (begin + std::max<u64>(size, 1) - 1) >> GranuleBits;
+        while (granule <= last && GranuleReadable(granule)) {
+            ++granule;
+        }
+        if (granule > last) {
+            return size;
+        }
+    }
     const u8* const start = static_cast<const u8*>(address);
     const u8* p = start;
     const u8* const end = start + size;
@@ -68,6 +135,21 @@ u64 ReadablePrefix(const void* address, u64 size) {
 }
 
 bool Readable(const void* address, size_t size) {
+    {
+        // NAT-147: every granule of the range known readable (or found readable now).
+        const u64 begin = reinterpret_cast<u64>(address);
+        const u64 last = (begin + std::max<u64>(size, 1) - 1) >> GranuleBits;
+        bool all = true;
+        for (u64 granule = begin >> GranuleBits; granule <= last; ++granule) {
+            if (!GranuleReadable(granule)) {
+                all = false;
+                break;
+            }
+        }
+        if (all) {
+            return true;
+        }
+    }
     // The range may span several regions (separate mappings, or pages protected differently).
     const u8* p = static_cast<const u8*>(address);
     const u8* const end = p + size;

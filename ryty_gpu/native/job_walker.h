@@ -102,5 +102,7 @@ void WalkJob(const JobRange& job, AmdGpu::Regs& regs, JobExtents& extents, JobVi
 bool Readable(const void* address, size_t size);
 /// NAT-106: how many bytes from the start of the range the CPU can read.
 u64 ReadablePrefix(const void* address, u64 size);
+/// NAT-147: memory leaves the readable cache of Readable/ReadablePrefix (it was unmapped).
+void ForgetReadable(u64 address, u64 size);
 
 } // namespace Native

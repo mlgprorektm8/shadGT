@@ -254,7 +254,8 @@ private:
     /// arguments it reads from memory.
     void ReadFillShader(const Shader::Info& cs, DrawBindings& b);
     /// NAT-104: the picture was written now (in GPU order).
-    void Written(const Native::ImageEntry* entry);
+    /// `at` != 0: the version is that clock value (NAT-148: a rewrite applied late).
+    void Written(const Native::ImageEntry* entry, u64 at = 0);
     /// NAT-104: copies the newer pictures of the render targets a texture is made of into it.
     void RefreshSources(Native::ImageEntry& texture);
 
@@ -332,6 +333,8 @@ private:
         u64 rewrite_clears = 0, rewrite_uploads = 0, fill_shaders = 0; ///< NAT-120
         u64 rewrite_partial = 0; ///< NAT-124
         u64 pass_barriers = 0, passes_unblocked = 0; ///< NAT-140
+        u64 region_refresh_pages = 0, region_refresh_ns = 0; ///< NAT-145
+        u64 guest_buffer_calls = 0, guest_buffer_ns = 0;     ///< NAT-145
         u64 rewrite_fills = 0;   ///< NAT-132
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,

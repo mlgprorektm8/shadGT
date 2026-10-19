@@ -575,7 +575,7 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
 }
 
 void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
-                             bool exact) {
+                             bool exact, u64 clock) {
     ForEachOverlapping(address, address + std::max<u64>(size, 1), [&](ImageEntry& entry) {
         if (entry.from_cpu) {
             // NAT-129: a storage buffer as big as GT Sport's scratch pool would upload every
@@ -592,6 +592,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                 entry.rewrite = ImageEntry::Rewrite::Clear;
                 entry.rewrite_pattern = *pattern;
                 entry.rewrite_bytes = entry.info.guest_size;
+                entry.rewrite_clock = clock;
                 return;
             }
             bool made_of_targets;
@@ -622,11 +623,13 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
             entry.rewrite = ImageEntry::Rewrite::Clear;
             entry.rewrite_pattern = *pattern;
             entry.rewrite_bytes = std::min<u64>(size, entry.info.guest_size);
+            entry.rewrite_clock = clock;
         } else if (size >= entry.info.guest_size &&
                    (exact || size <= 2 * entry.info.guest_size)) {
             ++stats.targets_rewritten;
             entry.rewrite = ImageEntry::Rewrite::Upload;
             entry.rewrite_bytes = entry.info.guest_size;
+            entry.rewrite_clock = clock;
             static std::atomic<u32> logged{};
             if (const u32 n = logged++; n < 40 || n % 2000 == 0) {
                 LOG_WARNING(Render_Vulkan,

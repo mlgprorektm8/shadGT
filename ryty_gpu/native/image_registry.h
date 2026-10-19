@@ -108,6 +108,10 @@ public:
     Rewrite rewrite = Rewrite::None;
     std::array<u32, 2> rewrite_pattern{};
     u64 rewrite_bytes = 0; ///< how much of the picture's memory the fill wrote
+    /// NAT-148: the renderer's write clock when the memory was rewritten: the picture's
+    /// version once the rewrite is applied (later, at its next use), so targets drawn between
+    /// the fill and that use still count as newer for the textures made of them.
+    u64 rewrite_clock = 0;
     bool stencil_clear_pending = false;
     u8 stencil_clear_value = 0;
 
@@ -188,7 +192,8 @@ public:
     /// NAT-129: `exact` when the size is what was written (a fill, a CP copy); a storage buffer's
     /// size is only what the shader may write (GT Sport binds its whole scratch pool), so such a
     /// write uploads a target again only when the buffer is about the target's size.
-    void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern, bool exact);
+    void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern, bool exact,
+                  u64 clock);
     /// NAT-120: uploads the image from guest memory before its next use.
     void RequestUpload(ImageEntry& entry) {
         MarkStale(entry, Stale::GpuWrite);
