@@ -49,7 +49,8 @@ std::span<const u32> UntileCode(u32 num_bits, bool macro) {
     }
 }
 
-Rhi::ImageDesc DescOf(const VideoCore::ImageInfo& info, bool render_target, bool with_targets) {
+Rhi::ImageDesc DescOf(const VideoCore::ImageInfo& info, bool render_target, bool with_targets,
+                      bool with_storage) {
     Rhi::ImageDesc desc{};
     desc.format = ToRhi(info.pixel_format);
     desc.width = std::max(info.size.width, 1u);
@@ -81,6 +82,9 @@ Rhi::ImageDesc DescOf(const VideoCore::ImageInfo& info, bool render_target, bool
         desc.usage |= Rhi::ImageUsageMutableFormat;
         if (with_targets && !info.props.is_block) {
             desc.usage |= Rhi::ImageUsageColorTarget;
+        }
+        if (with_storage && !info.props.is_block && desc.samples == 1) {
+            desc.usage |= Rhi::ImageUsageStorage; // compute shaders write pictures too
         }
     }
     (void)render_target;
@@ -147,13 +151,40 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             }
         }
     }
+    if (!render_target) {
+        // NAT-040: a depth buffer read as a texture (the T# names R32/R16, the image is D32/D16):
+        // the depth image itself, viewed through its depth aspect.
+        std::shared_lock lock{shard.mutex};
+        const auto [first, last] = shard.images.equal_range(info.guest_address);
+        for (auto it = first; it != last; ++it) {
+            const auto& cached = it->second->info;
+            if (cached.props.is_depth && !info.props.is_depth &&
+                cached.size.width == info.size.width && cached.size.height == info.size.height &&
+                cached.num_bits == info.num_bits) {
+                ++stats.hits;
+                it->second->last_use.store(frame, std::memory_order_relaxed);
+                return it->second.get();
+            }
+        }
+    }
     auto entry = std::make_unique<ImageEntry>();
     entry->info = info;
     entry->from_cpu = !render_target;
-    entry->image = device.CreateImage(DescOf(info, render_target, true));
-    if (!entry->image) {
-        // Some formats cannot be render targets; a texture of such a format can still be made.
-        entry->image = device.CreateImage(DescOf(info, render_target, false));
+    if (image_factory) {
+        MadeImage made = image_factory(info, render_target);
+        entry->image = std::move(made.image);
+        entry->backend_usage = made.usage;
+        entry->backend_features = made.features;
+    } else {
+        entry->image = device.CreateImage(DescOf(info, render_target, true, true));
+    }
+    if (!entry->image && !image_factory) {
+        // Some formats can't be written by shaders, or be render targets; such images are made
+        // without those uses.
+        entry->image = device.CreateImage(DescOf(info, render_target, true, false));
+    }
+    if (!entry->image && !image_factory) {
+        entry->image = device.CreateImage(DescOf(info, render_target, false, false));
     }
     if (!entry->image) {
         LOG_WARNING(Render_Vulkan, "NAT-020: no image for {:#x} ({}x{}, format {})",
@@ -178,13 +209,138 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
     }
     if (render_target) {
         ++stats.created_targets;
+        LinkTarget(*result);
     } else {
         ++stats.created_textures;
+        LinkTexture(*result);
         result->needs_upload.store(true, std::memory_order_relaxed);
         std::scoped_lock lock{upload_mutex};
         pending_uploads.push_back(result);
     }
     return result;
+}
+
+bool ImageRegistry::HasImageAt(VAddr address) {
+    Shard& shard = ShardOf(address);
+    std::shared_lock lock{shard.mutex};
+    return shard.images.contains(address);
+}
+
+ImageEntry* ImageRegistry::FindExisting(VAddr address,
+                                        const std::function<bool(const ImageEntry&)>& accept) {
+    Shard& shard = ShardOf(address);
+    std::shared_lock lock{shard.mutex};
+    const auto [first, last] = shard.images.equal_range(address);
+    ImageEntry* best = nullptr;
+    for (auto it = first; it != last; ++it) {
+        // The most recently used one, when several layouts live at the address.
+        if (accept(*it->second) &&
+            (!best || it->second->last_use.load(std::memory_order_relaxed) >
+                          best->last_use.load(std::memory_order_relaxed))) {
+            best = it->second.get();
+        }
+    }
+    return best;
+}
+
+SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageInfo& texture) {
+    if (target.props.is_depth || texture.props.is_depth || target.props.is_block ||
+        texture.props.is_block || target.num_bits != texture.num_bits ||
+        target.num_samples != texture.num_samples) {
+        return {};
+    }
+    // A crop: the texture is the corner of the target in the same layout (as IsSubrectOf, any
+    // colour format of the texel size).
+    if (target.guest_address == texture.guest_address && target.resources.levels == 1 &&
+        target.resources.layers == 1 && texture.resources.levels == 1 &&
+        texture.resources.layers == 1 && target.pitch == texture.pitch &&
+        target.tile_mode == texture.tile_mode && target.bank_swizzle == texture.bank_swizzle &&
+        target.alt_tile == texture.alt_tile &&
+        target.mips_layout[0].pitch == texture.mips_layout[0].pitch &&
+        texture.size.width <= target.size.width && texture.size.height <= target.size.height &&
+        (texture.size.width < target.size.width || texture.size.height < target.size.height) &&
+        target.size.depth == 1 && texture.size.depth == 1 &&
+        target.type == AmdGpu::ImageType::Color2D && texture.type == target.type) {
+        return {0, 0, texture.size.width, texture.size.height};
+    }
+    // A mip or layer of the texture drawn on its own.
+    const s32 mip = target.MipOf(texture);
+    if (mip < 0) {
+        return {};
+    }
+    const s32 layer = target.SliceOf(texture, mip);
+    if (layer < 0 || u32(layer) >= std::max<u32>(texture.resources.layers, 1)) {
+        return {};
+    }
+    return {mip, layer, target.size.width, target.size.height};
+}
+
+void ImageRegistry::LinkTarget(ImageEntry& target) {
+    // NAT-104: textures made before this target over its memory may be made of it.
+    const VAddr begin = target.info.guest_address;
+    const VAddr end = begin + std::max<u64>(target.info.guest_size, 1);
+    for (Shard& other : shards) {
+        std::shared_lock lock{other.mutex};
+        for (const auto& [base, entry] : other.images) {
+            if (!entry->from_cpu || base >= end || base + entry->info.guest_size <= begin) {
+                continue;
+            }
+            if (PlaceOf(target.info, entry->info).mip >= 0) {
+                std::scoped_lock sources_lock{entry->sources_mutex};
+                entry->sources.push_back(&target);
+            }
+        }
+    }
+}
+
+void ImageRegistry::LinkTexture(ImageEntry& texture) {
+    // NAT-104: the render targets this texture is made of. NAT-041: a texture over a target
+    // of another kind of layout reads what the CPU last wrote there, not the picture; logged
+    // (a few times per layout pair) to learn which of these GT Sport has.
+    const VAddr begin = texture.info.guest_address;
+    const VAddr end = begin + std::max<u64>(texture.info.guest_size, 1);
+    for (Shard& other : shards) {
+        std::shared_lock lock{other.mutex};
+        for (const auto& [base, entry] : other.images) {
+            if (entry->from_cpu || base >= end || base + entry->info.guest_size <= begin) {
+                continue;
+            }
+            if (PlaceOf(entry->info, texture.info).mip >= 0) {
+                std::scoped_lock sources_lock{texture.sources_mutex};
+                texture.sources.push_back(entry.get());
+                continue;
+            }
+            const auto& a = texture.info;
+            const auto& b = entry->info;
+            const u64 key = (a.guest_address * 31 + b.guest_address) ^ (u64(a.size.width) << 40) ^
+                            (u64(b.size.width) << 20) ^ (u64(a.resources.levels) << 8) ^
+                            u64(b.resources.levels);
+            std::scoped_lock log_lock{overlap_log_mutex};
+            if (overlap_logged.size() < 4096 && overlap_logged.insert(key).second) {
+                LOG_WARNING(Render_Vulkan,
+                            "NAT-041: texture {:#x}+{:#x} {}x{} mips {} layers {} tile {} {} bits "
+                            "over render target {:#x}+{:#x} {}x{} mips {} layers {} tile {} {} "
+                            "bits{}",
+                            a.guest_address, a.guest_size, a.size.width, a.size.height,
+                            a.resources.levels, a.resources.layers, u32(a.tile_mode), a.num_bits,
+                            b.guest_address, b.guest_size, b.size.width, b.size.height,
+                            b.resources.levels, b.resources.layers, u32(b.tile_mode), b.num_bits,
+                            b.props.is_depth ? " (depth)" : "");
+            }
+        }
+    }
+}
+
+void ImageRegistry::ForEachOverlapping(VAddr begin, VAddr end,
+                                       const std::function<void(ImageEntry&)>& fn) {
+    for (Shard& shard : shards) {
+        std::shared_lock lock{shard.mutex};
+        for (auto& [base, entry] : shard.images) {
+            if (base < end && base + std::max<u64>(entry->info.guest_size, 1) > begin) {
+                fn(*entry);
+            }
+        }
+    }
 }
 
 void ImageRegistry::Invalidate(VAddr address, u64 size) {
@@ -316,7 +472,27 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
         if (!source || !source->Mapped()) {
             continue;
         }
-        std::memcpy(source->Mapped(), reinterpret_cast<const void*>(info.guest_address), size);
+        if (upload_hook) {
+            upload_hook(*entry); // NAT-105: CPU writes from here on are seen
+        }
+        // Only what is mapped is read (a T# can reach past the end of a mapping); the rest of
+        // the picture is zeros.
+        const u64 readable = memory_clamp ? memory_clamp(info.guest_address, size) : size;
+        if (readable < size) {
+            std::memset(source->Mapped() + readable, 0, size - readable);
+            static std::atomic<u32> logged{};
+            if (logged++ < 16) {
+                LOG_WARNING(Render_Vulkan,
+                            "NAT-042: texture {:#x}+{:#x} ({}x{}, {} mips) is mapped for {:#x} "
+                            "bytes only; the rest uploads as zeros",
+                            info.guest_address, size, info.size.width, info.size.height,
+                            info.resources.levels, readable);
+            }
+        }
+        if (readable != 0) {
+            std::memcpy(source->Mapped(), reinterpret_cast<const void*>(info.guest_address),
+                        readable);
+        }
         const Rhi::Buffer* linear = source.get();
         if (info.props.is_tiled) {
             const Rhi::Pipeline* untile = TilingPipeline(info, false);

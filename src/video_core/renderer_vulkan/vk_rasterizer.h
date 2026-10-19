@@ -35,6 +35,7 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+class NativeRenderer;
 
 class Rasterizer {
 public:
@@ -306,6 +307,16 @@ public:
         }
     }
 
+#ifdef RYTY_GPU
+    /// NAT-100: native mode's renderer (RYGT_NATIVE=1), or nullptr.
+    NativeRenderer* Native() const noexcept {
+        return native.get();
+    }
+    /// NAT-100: WRITE_DATA written on the GPU in command order (native mode); false when it
+    /// can't be (the caller writes it as before).
+    bool NativeInlineWrite(VAddr address, std::span<const u8> data);
+#endif
+
     std::thread::id GetGpuCommandProcessorThread();
     /// The command processor thread or the draw pipe's recorder thread (PERF-031).
     bool IsGpuThread() const;
@@ -319,6 +330,14 @@ public:
 #endif
 
 private:
+    friend class NativeRenderer;
+    /// NAT-101: the dynamic state the Update*State functions fill: the scheduler's, or a native
+    /// command list's while native mode records into it.
+    static inline thread_local DynamicState* t_dynamic_state = nullptr;
+    DynamicState& DynState() const {
+        return t_dynamic_state ? *t_dynamic_state : scheduler.GetDynamicState();
+    }
+
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
@@ -560,6 +579,9 @@ private:
     std::unordered_map<VAddr, std::vector<u8>> pending_fence_bytes;
     u64 gpu_constant_refresh_count{};
     u64 next_gpu_constant_refresh_report{1000};
+#ifdef RYTY_GPU
+    std::unique_ptr<NativeRenderer> native; // NAT-100
+#endif
 };
 
 } // namespace Vulkan

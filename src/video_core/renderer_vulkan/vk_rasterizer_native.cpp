@@ -1,0 +1,1850 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// NAT-100: native mode (RYGT_NATIVE=1, ryGT builds). Draws, dispatches and copies are recorded
+// with the native image registry and guest memory read in place, instead of the texture and
+// buffer caches, which keep images and buffers in step with guest memory draw by draw and are
+// most of the recorder's cost. Version 0 records on the recorder thread, in GPU order, into a
+// secondary command buffer; before anything else goes into the scheduler's command buffer (a
+// submit, a flip) that list is ended and run there, so fences, labels and presenting work as
+// before. Images stay in the general layout. Synchronisation is by global memory barriers: when
+// a pass starts with other targets, before a draw reads a picture written since the last
+// barrier, and around dispatches and copies. Later versions record the game's render jobs on its
+// own threads with this code (ryty_gpu/native/DESIGN.md, N4).
+
+#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+
+#include <algorithm>
+#include <bit>
+#include <cstdlib>
+#include <cstring>
+
+#include <magic_enum/magic_enum.hpp>
+#include <xxhash.h>
+
+#include "common/alignment.h"
+#include "common/assert.h"
+#include "common/logging/log.h"
+#include "common/perf_monitor.h"
+#include "core/memory.h"
+#include "ryty_gpu/native/image_registry.h"
+#include "ryty_gpu/native/rhi/rhi_vulkan.h"
+#include "shader_recompiler/info.h"
+#include "video_core/amdgpu/liverpool.h"
+#include "video_core/buffer_cache/direct_memory.h"
+#include "video_core/renderer_vulkan/depth_attachment.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/resource_binding.h"
+#include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/texture_cache/image_descriptor.h"
+#include "video_core/texture_cache/sampler.h"
+#include "video_core/texture_cache/texture_cache.h"
+
+namespace VideoCore {
+vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
+}
+
+namespace Vulkan {
+namespace {
+
+bool EnvFlag(const char* name) {
+    const char* env = std::getenv(name);
+    return env && env[0] == '1';
+}
+
+/// Logs the first few times and then every 1000th.
+bool Sample(std::atomic<u32>& counter) {
+    const u32 n = ++counter;
+    return n <= 8 || n % 1000 == 0;
+}
+
+// What vk_rasterizer.cpp's ClassifyDraw decides, from the registers alone.
+enum class Filter { Draw, EliminateFastClear, FmaskDecompress, Resolve, NoPrimitive, Copy };
+
+Filter Classify(const AmdGpu::Regs& regs) {
+    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
+        return Filter::EliminateFastClear;
+    }
+    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::FmaskDecompress) {
+        return Filter::FmaskDecompress;
+    }
+    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
+        return Filter::Resolve;
+    }
+    if (regs.primitive_type == AmdGpu::PrimitiveType::None) {
+        return Filter::NoPrimitive;
+    }
+    const bool cb_disabled =
+        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
+    const bool depth_copy =
+        regs.depth_render_override.force_z_dirty && regs.depth_render_override.force_z_valid &&
+        regs.depth_buffer.DepthValid() && regs.depth_buffer.DepthWriteValid() &&
+        regs.depth_buffer.DepthAddress() != regs.depth_buffer.DepthWriteAddress();
+    const bool stencil_copy =
+        regs.depth_render_override.force_stencil_dirty &&
+        regs.depth_render_override.force_stencil_valid && regs.depth_buffer.StencilValid() &&
+        regs.depth_buffer.StencilWriteValid() &&
+        regs.depth_buffer.StencilAddress() != regs.depth_buffer.StencilWriteAddress();
+    if (cb_disabled && (depth_copy || stencil_copy)) {
+        return Filter::Copy;
+    }
+    return Filter::Draw;
+}
+
+// As vk_rasterizer.cpp's MakeUserData.
+Shader::PushData UserData(const AmdGpu::Regs& regs) {
+    Shader::PushData push_data{};
+    push_data.xoffset = regs.viewport_control.xoffset_enable ? regs.viewports[0].xoffset : 0.f;
+    push_data.xscale = regs.viewport_control.xscale_enable ? regs.viewports[0].xscale : 1.f;
+    push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
+    push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
+    return push_data;
+}
+
+// As vk_rasterizer.cpp's GetDrawOffsets.
+std::pair<u32, u32> DrawOffsets(const AmdGpu::Regs& regs, const Shader::Info& info,
+                                const Shader::Gcn::FetchShaderData& fetch_shader) {
+    u32 vertex_offset = regs.index_offset;
+    u32 instance_offset = 0;
+    if (!fetch_shader.Empty()) {
+        if (vertex_offset == 0 && fetch_shader.vertex_offset_sgpr != -1) {
+            vertex_offset = info.user_data[fetch_shader.vertex_offset_sgpr];
+        }
+        if (fetch_shader.instance_offset_sgpr != -1) {
+            instance_offset = info.user_data[fetch_shader.instance_offset_sgpr];
+        }
+    }
+    return {vertex_offset, instance_offset};
+}
+
+// PERF-028's quad corners (vk_rasterizer.cpp).
+constexpr std::array<u32, 6> QuadFirstVertex{0, 1, 2, 0, 2, 3};
+constexpr std::array<u32, 6> QuadLastVertex{0, 1, 3, 1, 2, 3};
+constexpr u64 MaxQuadIndexBytes = 16ULL << 20;
+
+template <typename T>
+u32 ExpandQuads(const T* in, u32 count, const std::optional<T> restart,
+                const std::array<u32, 6>& corners, T* out) {
+    u32 written = 0;
+    if (!restart) {
+        for (u32 quad = 0; quad + 4 <= count; quad += 4) {
+            for (const u32 corner : corners) {
+                out[written++] = in[quad + corner];
+            }
+        }
+        return written;
+    }
+    std::array<T, 4> quad{};
+    u32 filled = 0;
+    for (u32 i = 0; i < count; ++i) {
+        if (in[i] == *restart) {
+            filled = 0;
+            continue;
+        }
+        quad[filled++] = in[i];
+        if (filled == 4) {
+            for (const u32 corner : corners) {
+                out[written++] = quad[corner];
+            }
+            filled = 0;
+        }
+    }
+    return written;
+}
+
+// The texture cache's image usage, features and type (texture_cache/image.cpp), so native
+// images are made as its images are.
+vk::ImageUsageFlags UsageOf(const Instance& instance, const VideoCore::ImageInfo& info) {
+    vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eTransferSrc |
+                                vk::ImageUsageFlagBits::eTransferDst |
+                                vk::ImageUsageFlagBits::eSampled;
+    if (!info.props.is_block) {
+        if (info.props.is_depth) {
+            usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        } else {
+            usage |= vk::ImageUsageFlagBits::eColorAttachment;
+            if (info.num_samples == 1 || instance.IsMultisampleStorageImageSupported()) {
+                usage |= vk::ImageUsageFlagBits::eStorage;
+            }
+        }
+    } else {
+        usage |= vk::ImageUsageFlagBits::eStorage;
+    }
+    return usage;
+}
+
+vk::FormatFeatureFlags2 FeaturesOf(vk::ImageUsageFlags usage) {
+    vk::FormatFeatureFlags2 features{};
+    if (usage & vk::ImageUsageFlagBits::eTransferSrc) {
+        features |= vk::FormatFeatureFlagBits2::eTransferSrc;
+    }
+    if (usage & vk::ImageUsageFlagBits::eTransferDst) {
+        features |= vk::FormatFeatureFlagBits2::eTransferDst;
+    }
+    if (usage & vk::ImageUsageFlagBits::eSampled) {
+        features |= vk::FormatFeatureFlagBits2::eSampledImage;
+    }
+    if (usage & vk::ImageUsageFlagBits::eColorAttachment) {
+        features |= vk::FormatFeatureFlagBits2::eColorAttachment;
+    }
+    if (usage & vk::ImageUsageFlagBits::eDepthStencilAttachment) {
+        features |= vk::FormatFeatureFlagBits2::eDepthStencilAttachment;
+    }
+    return features;
+}
+
+vk::ImageType TypeOf(AmdGpu::ImageType type) {
+    return type == AmdGpu::ImageType::Color3D ? vk::ImageType::e3D : vk::ImageType::e2D;
+}
+
+u32 RhiUsage(vk::ImageUsageFlags usage) {
+    u32 result = 0;
+    if (usage & vk::ImageUsageFlagBits::eSampled) {
+        result |= Native::Rhi::ImageUsageSampled;
+    }
+    if (usage & vk::ImageUsageFlagBits::eStorage) {
+        result |= Native::Rhi::ImageUsageStorage;
+    }
+    if (usage & vk::ImageUsageFlagBits::eColorAttachment) {
+        result |= Native::Rhi::ImageUsageColorTarget;
+    }
+    if (usage & vk::ImageUsageFlagBits::eDepthStencilAttachment) {
+        result |= Native::Rhi::ImageUsageDepthTarget;
+    }
+    if (usage & vk::ImageUsageFlagBits::eTransferSrc) {
+        result |= Native::Rhi::ImageUsageTransferSrc;
+    }
+    if (usage & vk::ImageUsageFlagBits::eTransferDst) {
+        result |= Native::Rhi::ImageUsageTransferDst;
+    }
+    return result | Native::Rhi::ImageUsageMutableFormat;
+}
+
+template <typename T>
+T* Handle(u64 handle) {
+    return reinterpret_cast<T*>(handle);
+}
+
+constexpr u64 ChunkSize = 8_MB;
+constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and submitted
+
+} // namespace
+
+bool NativeModeRequested() {
+    static const bool requested = EnvFlag("RYGT_NATIVE");
+    return requested;
+}
+
+void NativeRenderer::DrawBindings::Clear() {
+    writes.clear();
+    buffers.clear();
+    images.clear();
+    push = {};
+    sampled.clear();
+    stored.clear();
+    writes_buffers = false;
+    failed = false;
+}
+
+NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
+    device = Native::Rhi::CreateVulkanDevice(r.instance);
+    ASSERT_MSG(device, "NAT-100: no native device");
+    const VkSemaphore semaphore = r.scheduler.GetWorkSemaphore()->Handle();
+    timeline = device->ImportFence(reinterpret_cast<u64>(semaphore));
+    device->UseExternalTimeline(timeline.get(), [this] { return r.scheduler.CurrentTick(); });
+    registry = std::make_unique<Native::ImageRegistry>(*device);
+    registry->SetImageFactory([this](const VideoCore::ImageInfo& info, bool render_target) {
+        return MakeImage(info, render_target);
+    });
+    registry->SetMemoryClamp([this](VAddr address, u64 size) -> u64 {
+        return r.memory->IsValidMapping(address) ? r.memory->ClampRangeSize(address, size) : 0;
+    });
+    registry->SetUploadHook([this](Native::ImageEntry& entry) {
+        // NAT-105: CPU writes to a texture's memory from now on fault once, and the texture
+        // is uploaded again.
+        WatchPages(entry.info.guest_address, std::max<u64>(entry.info.guest_size, 1));
+    });
+    gds = device->CreateBuffer({.size = 64_KB,
+                                .usage = Native::Rhi::BufferUsageStorage |
+                                         Native::Rhi::BufferUsageTransferSrc |
+                                         Native::Rhi::BufferUsageTransferDst,
+                                .memory = Native::Rhi::MemoryKind::Upload,
+                                .name = "native gds"});
+    ASSERT_MSG(gds && gds->Mapped(), "NAT-100: no GDS buffer");
+    std::memset(gds->Mapped(), 0, gds->Size());
+    LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
+                            "native images and guest memory read in place");
+}
+
+NativeRenderer::~NativeRenderer() {
+    std::scoped_lock lock{mutex};
+    const vk::Device vk_device = r.instance.GetDevice();
+    for (const auto pool : free_pools) {
+        vk_device.destroyDescriptorPool(pool);
+    }
+    for (const auto& [tick, pool] : retiring_pools) {
+        vk_device.destroyDescriptorPool(pool);
+    }
+    for (const auto pool : stream.pools) {
+        vk_device.destroyDescriptorPool(pool);
+    }
+    views.clear();
+    samplers.clear();
+}
+
+Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bool) {
+    Native::MadeImage made{};
+    if (info.pixel_format == vk::Format::eUndefined) {
+        return made;
+    }
+    const Instance& instance = r.instance;
+    vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
+                               vk::ImageCreateFlagBits::eExtendedUsage};
+    if (info.props.is_volume) {
+        flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
+        if (instance.Is2dViewOf3dSupported()) {
+            flags |= vk::ImageCreateFlagBits::e2DViewCompatibleEXT;
+        }
+    }
+    if (info.props.is_block && instance.IsBlockTexelViewSupported()) {
+        flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
+    }
+    const vk::ImageUsageFlags usage = UsageOf(instance, info);
+    const vk::FormatFeatureFlags2 features = FeaturesOf(usage);
+    const vk::Format format = instance.GetSupportedFormat(info.pixel_format, features);
+    const vk::ImageType type = TypeOf(info.type);
+    const auto properties =
+        instance.GetPhysicalDevice().getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
+            .format = format,
+            .type = type,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = usage,
+            .flags = flags,
+        });
+    if (properties.result != vk::Result::eSuccess) {
+        static std::atomic<u32> logged{};
+        if (Sample(logged)) {
+            LOG_ERROR(Render_Vulkan, "NAT-100: no image of format {} ({}x{}) at {:#x}",
+                      vk::to_string(format), info.size.width, info.size.height,
+                      info.guest_address);
+        }
+        return made;
+    }
+    const vk::ImageCreateInfo image_ci{
+        .flags = flags,
+        .imageType = type,
+        .format = format,
+        .extent{info.size.width, info.size.height, std::max(info.size.depth, 1u)},
+        .mipLevels = std::max<u32>(info.resources.levels, 1),
+        .arrayLayers = type == vk::ImageType::e3D ? 1u : std::max<u32>(info.resources.layers, 1),
+        .samples = LiverpoolToVK::NumSamples(
+            info.num_samples, properties.value.imageFormatProperties.sampleCounts),
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = usage,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+    Native::Rhi::ImageDesc desc{};
+    desc.dim = type == vk::ImageType::e3D ? Native::Rhi::ImageDim::D3 : Native::Rhi::ImageDim::D2;
+    desc.format = Native::Rhi::FormatFromVk(static_cast<u32>(format));
+    desc.width = image_ci.extent.width;
+    desc.height = image_ci.extent.height;
+    desc.depth = image_ci.extent.depth;
+    desc.mips = image_ci.mipLevels;
+    desc.layers = image_ci.arrayLayers;
+    desc.samples = static_cast<u32>(image_ci.samples);
+    desc.usage = RhiUsage(usage);
+    made.image = Native::Rhi::CreateVulkanImage(
+        *device, static_cast<const VkImageCreateInfo&>(image_ci), desc);
+    made.usage = static_cast<u32>(static_cast<VkImageUsageFlags>(usage));
+    made.features = static_cast<u64>(static_cast<VkFormatFeatureFlags2>(features));
+    return made;
+}
+
+vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
+                                   const VideoCore::ImageViewInfo& requested, ViewUse use) {
+    std::scoped_lock lock{views_mutex};
+    auto& records = views[&entry];
+    for (const auto& record : records) {
+        if (record.use == use && record.info == requested) {
+            return *record.view;
+        }
+    }
+    // As the texture cache's ImageView (texture_cache/image_view.cpp), on the native image.
+    const auto& image_desc = entry.image->Desc();
+    const vk::Image image{Handle<VkImage_T>(entry.image->NativeHandle())};
+    const vk::Format image_format = static_cast<vk::Format>(image_desc.format);
+    const bool volume = image_desc.dim == Native::Rhi::ImageDim::D3;
+    VideoCore::ImageViewInfo info = requested;
+    // A view never reaches past the image (a T# may name more levels or layers than the
+    // layout the image was made for).
+    const u32 mips = std::max<u32>(image_desc.mips, 1);
+    const u32 layers = volume ? 1u : std::max<u32>(image_desc.layers, 1);
+    info.range.base.level = std::min<u32>(info.range.base.level, mips - 1);
+    info.range.extent.levels =
+        std::clamp<u32>(info.range.extent.levels, 1, mips - info.range.base.level);
+    info.range.base.layer = std::min<u32>(info.range.base.layer, layers - 1);
+    info.range.extent.layers =
+        std::clamp<u32>(info.range.extent.layers, 1, layers - info.range.base.layer);
+
+    vk::ImageUsageFlags usage{entry.backend_usage};
+    if (use != ViewUse::Storage) {
+        usage &= ~vk::ImageUsageFlagBits::eStorage;
+    }
+    vk::ImageViewUsageCreateInfo usage_ci{.usage = usage};
+    vk::ImageViewMinLodCreateInfoEXT min_lod_ci{};
+    if (info.min_lod != 0 && r.instance.IsImageViewMinLodSupported()) {
+        const float last_level =
+            static_cast<float>(info.range.base.level + info.range.extent.levels - 1);
+        min_lod_ci.minLod = std::min(static_cast<float>(info.min_lod) / 256.f, last_level);
+        usage_ci.pNext = &min_lod_ci;
+    }
+    vk::Format format = info.format;
+    vk::ImageAspectFlags aspect = vk::ImageAspectFlagBits::eColor;
+    if (entry.info.props.is_depth) {
+        // A depth image: attachments see depth (and stencil); a T# names R32/R16 for depth and
+        // R8 for stencil.
+        const vk::ImageAspectFlags all =
+            entry.info.props.has_stencil
+                ? vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil
+                : vk::ImageAspectFlagBits::eDepth;
+        if (use == ViewUse::Attachment) {
+            aspect = all;
+        } else if (entry.info.props.has_stencil && !LiverpoolToVK::IsFormatDepthCompatible(format) &&
+                   LiverpoolToVK::IsFormatStencilCompatible(format)) {
+            aspect = vk::ImageAspectFlagBits::eStencil;
+        } else {
+            aspect = vk::ImageAspectFlagBits::eDepth;
+        }
+        format = image_format;
+    } else {
+        format = r.instance.GetSupportedFormat(format, vk::FormatFeatureFlags2{entry.backend_features});
+    }
+    vk::ImageViewType view_type = VideoCore::ConvertImageViewType(info.type);
+    if (volume) {
+        view_type = vk::ImageViewType::e3D;
+    } else if (view_type == vk::ImageViewType::e3D) {
+        view_type = info.range.extent.layers > 1 ? vk::ImageViewType::e2DArray
+                                                 : vk::ImageViewType::e2D;
+    } else if (view_type == vk::ImageViewType::e2D && info.range.extent.layers > 1) {
+        view_type = vk::ImageViewType::e2DArray;
+    }
+    const vk::ImageViewCreateInfo view_ci{
+        .pNext = &usage_ci,
+        .image = image,
+        .viewType = view_type,
+        .format = format,
+        .components = info.mapping == AmdGpu::IdentityMapping
+                          ? vk::ComponentMapping{}
+                          : LiverpoolToVK::ComponentMapping(info.mapping),
+        .subresourceRange{
+            .aspectMask = aspect,
+            .baseMipLevel = info.range.base.level,
+            .levelCount = info.range.extent.levels,
+            .baseArrayLayer = info.range.base.layer,
+            .layerCount = info.range.extent.layers,
+        },
+    };
+    auto [result, view] = r.instance.GetDevice().createImageViewUnique(view_ci);
+    if (result != vk::Result::eSuccess) {
+        static std::atomic<u32> logged{};
+        if (Sample(logged)) {
+            LOG_ERROR(Render_Vulkan, "NAT-100: no view {} of image {:#x} ({})",
+                      vk::to_string(format), entry.info.guest_address, vk::to_string(result));
+        }
+        return {};
+    }
+    const vk::ImageView handle = *view;
+    records.push_back({requested, use, std::move(view)});
+    return handle;
+}
+
+vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& sharp,
+                                       AmdGpu::BorderColorBuffer border, bool is_depth) {
+    const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
+                     (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^ (u64(border.Address()) << 1);
+    std::scoped_lock lock{sampler_mutex};
+    auto& slot = samplers[hash];
+    if (!slot) {
+        slot = std::make_unique<VideoCore::Sampler>(r.instance, sharp, border, is_depth);
+    }
+    return slot->Handle();
+}
+
+NativeRenderer::Stream& NativeRenderer::Begin() {
+    Stream& s = stream;
+    if (s.list) {
+        return s;
+    }
+    s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
+    s.list->Begin();
+    s.cmd = vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())};
+    s.rendering = false;
+    s.dynamic.Invalidate();
+    s.pipeline = vk::Pipeline{};
+    s.commands = 0;
+    // What was recorded before this list (earlier lists, the presenter) is finished first.
+    GlobalBarrier();
+    return s;
+}
+
+void NativeRenderer::EndRendering() {
+    if (stream.rendering) {
+        stream.cmd.endRendering();
+        stream.rendering = false;
+    }
+}
+
+void NativeRenderer::BeginRendering(const RenderState& state) {
+    Stream& s = stream;
+    if (s.rendering && s.render == state) {
+        return;
+    }
+    EndRendering();
+    // As Scheduler::BeginRendering.
+    std::array<vk::RenderingAttachmentInfo, 8> colors;
+    for (u32 i = 0; i < state.num_color_attachments; ++i) {
+        const auto& cb = state.color_attachments[i];
+        colors[i] = vk::RenderingAttachmentInfo{
+            .imageView = cb.image_view,
+            .imageLayout = vk::ImageLayout::eGeneral,
+            .loadOp = cb.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
+            .storeOp = vk::AttachmentStoreOp::eStore,
+            .clearValue = vk::ClearValue{.color = vk::ClearColorValue{.uint32 = cb.clear_value}},
+        };
+    }
+    const auto& db = state.depth_stencil_attachment;
+    const vk::RenderingAttachmentInfo depth{
+        .imageView = db.image_view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+        .loadOp = db.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
+        .storeOp = vk::AttachmentStoreOp::eStore,
+        .clearValue = vk::ClearValue{.depthStencil = vk::ClearDepthStencilValue{
+                                         .depth = std::bit_cast<float>(db.clear_value[0])}},
+    };
+    const vk::RenderingAttachmentInfo stencil{
+        .imageView = db.image_view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+        .loadOp = db.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
+        .storeOp = vk::AttachmentStoreOp::eStore,
+        .clearValue = vk::ClearValue{.depthStencil =
+                                         vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
+    };
+    s.cmd.beginRendering(vk::RenderingInfo{
+        .renderArea{.offset = {0, 0}, .extent = {state.width, state.height}},
+        .layerCount = state.num_layers,
+        .colorAttachmentCount = state.num_color_attachments,
+        .pColorAttachments = colors.data(),
+        .pDepthAttachment = db.has_depth ? &depth : nullptr,
+        .pStencilAttachment = db.has_stencil ? &stencil : nullptr,
+    });
+    s.rendering = true;
+    s.render = state;
+    ++stats.passes;
+}
+
+void NativeRenderer::GlobalBarrier() {
+    Stream& s = stream;
+    EndRendering();
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+    s.written.clear();
+    s.buffers_written = false;
+    ++stats.barriers;
+}
+
+void NativeRenderer::PrepareImages() {
+    const bool init = device->PendingImageInit();
+    const bool uploads = registry->HasPendingUploads();
+    if (!init && !uploads) {
+        return;
+    }
+    Stream& s = stream;
+    EndRendering();
+    if (init) {
+        device->RecordPendingImageInit(*s.list);
+    }
+    if (uploads) {
+        registry->RecordUploads(*s.list);
+        s.pipeline = vk::Pipeline{}; // the uploads bind their own pipelines
+    }
+}
+
+void NativeRenderer::ChunkFlushCheck() {
+    // Long lists are run and submitted as they grow, so the GPU starts on them (as the old
+    // path's SubmitChunkIfNeeded does).
+    if (stream.commands >= SpliceAfter) {
+        Splice();
+        r.scheduler.Flush();
+    }
+}
+
+NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
+    auto* semaphore = r.scheduler.GetWorkSemaphore();
+    std::scoped_lock lock{chunk_mutex};
+    if (free_chunks.empty() && !retiring_chunks.empty()) {
+        semaphore->Refresh();
+    }
+    const u64 known = semaphore->KnownGpuTick();
+    while (!retiring_chunks.empty() && retiring_chunks.front().retire_tick <= known) {
+        if (retiring_chunks.front().buffer->Size() == ChunkSize) {
+            free_chunks.push_back(std::move(retiring_chunks.front()));
+        }
+        retiring_chunks.pop_front(); // larger ones are freed (after the GPU, by the device)
+    }
+    if (size <= ChunkSize && !free_chunks.empty()) {
+        Chunk chunk = std::move(free_chunks.back());
+        free_chunks.pop_back();
+        return chunk;
+    }
+    Chunk chunk;
+    chunk.buffer = device->CreateBuffer({
+        .size = std::max(size, ChunkSize),
+        .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
+                 Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
+                 Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
+        .memory = Native::Rhi::MemoryKind::Upload,
+        .name = "native upload",
+    });
+    ASSERT_MSG(chunk.buffer && chunk.buffer->Mapped(), "NAT-100: no upload memory ({} bytes)",
+               size);
+    return chunk;
+}
+
+std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align) {
+    Stream& s = stream;
+    align = std::max<u64>(align, 16);
+    if (s.chunks.empty() ||
+        Common::AlignUp(s.chunk_used, align) + size > s.chunks.back().buffer->Size()) {
+        s.chunks.push_back(TakeChunk(size));
+        s.chunk_used = 0;
+    }
+    const auto& buffer = *s.chunks.back().buffer;
+    const u64 offset = Common::AlignUp(s.chunk_used, align);
+    s.chunk_used = offset + size;
+    return {vk::Buffer{Handle<VkBuffer_T>(buffer.NativeHandle())}, offset, buffer.Mapped() + offset};
+}
+
+vk::DescriptorPool NativeRenderer::TakeDescriptorPool() {
+    const vk::Device vk_device = r.instance.GetDevice();
+    {
+        std::scoped_lock lock{chunk_mutex};
+        const u64 known = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+        while (!retiring_pools.empty() && retiring_pools.front().first <= known) {
+            std::ignore = vk_device.resetDescriptorPool(retiring_pools.front().second);
+            free_pools.push_back(retiring_pools.front().second);
+            retiring_pools.pop_front();
+        }
+        if (!free_pools.empty()) {
+            const auto pool = free_pools.back();
+            free_pools.pop_back();
+            return pool;
+        }
+    }
+    static constexpr std::array<vk::DescriptorPoolSize, 4> sizes{{
+        {vk::DescriptorType::eStorageBuffer, 8192},
+        {vk::DescriptorType::eSampledImage, 8192},
+        {vk::DescriptorType::eStorageImage, 1024},
+        {vk::DescriptorType::eSampler, 4096},
+    }};
+    const auto [result, pool] = vk_device.createDescriptorPool(vk::DescriptorPoolCreateInfo{
+        .maxSets = 512,
+        .poolSizeCount = static_cast<u32>(sizes.size()),
+        .pPoolSizes = sizes.data(),
+    });
+    ASSERT_MSG(result == vk::Result::eSuccess, "NAT-100: no descriptor pool");
+    return pool;
+}
+
+std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr address, u64 size,
+                                                                      bool write) {
+    if (size == 0) {
+        return std::nullopt;
+    }
+    if (auto* direct = r.buffer_cache.GetDirectMemory();
+        direct && direct->EnsureImported(address, size)) {
+        if (const auto found = direct->FindBuffer(address, size)) {
+            return std::pair{found->first->Handle(), found->second};
+        }
+    }
+    if (write) {
+        // Written ranges must be the game's memory itself.
+        ++stats.unbound;
+        static std::atomic<u32> logged{};
+        if (Sample(logged)) {
+            LOG_WARNING(Render_Vulkan,
+                        "NAT-101: written range {:#x}+{:#x} is not in one imported view; bound "
+                        "empty",
+                        address, size);
+        }
+        return std::nullopt;
+    }
+    if (size > 64_MB) {
+        ++stats.unbound;
+        static std::atomic<u32> logged{};
+        if (Sample(logged)) {
+            LOG_WARNING(Render_Vulkan,
+                        "NAT-101: read range {:#x}+{:#x} is not in one imported view and too "
+                        "large to copy; bound empty",
+                        address, size);
+        }
+        return std::nullopt;
+    }
+    // A snapshot of what the range holds now, in the list's upload memory.
+    const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
+    std::memcpy(data, reinterpret_cast<const void*>(address), size);
+    ++stats.copied_reads;
+    stats.copied_bytes += size;
+    return std::pair{buffer, offset};
+}
+
+bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
+                                    Targets& out) {
+    const auto& key = pipeline.GetGraphicsKey();
+    RenderState& state = out.state;
+    state = {};
+    out.colors = {};
+    out.depth = nullptr;
+    u32 width = r.instance.GetMaxFramebufferWidth();
+    u32 height = r.instance.GetMaxFramebufferHeight();
+    u32 num_layers = std::numeric_limits<u16>::max();
+    state.num_color_attachments = static_cast<u16>(std::bit_width(key.mrt_mask));
+    const bool skip_cb = regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
+    for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+        auto& attachment = state.color_attachments[cb];
+        attachment = {};
+        attachment.image_layout = vk::ImageLayout::eGeneral;
+        const auto& col_buf = regs.color_buffers[cb];
+        if (skip_cb || !col_buf || !regs.color_target_mask.GetMask(cb) ||
+            (key.mrt_mask & (1u << cb)) == 0) {
+            continue;
+        }
+        const VideoCore::TextureCache::ImageDesc desc{col_buf, r.liverpool->DrawCbExtent(cb)};
+        Native::ImageEntry* entry = registry->Find(desc.info, true, frame);
+        if (!entry) {
+            ++stats.null_images;
+            continue;
+        }
+        const vk::ImageView view = View(*entry, desc.view_info, ViewUse::Attachment);
+        if (!view) {
+            continue;
+        }
+        out.colors[cb] = entry;
+        const u32 mip = desc.view_info.range.base.level;
+        width = std::min<u32>(width, std::max(entry->info.size.width >> mip, 1u));
+        height = std::min<u32>(height, std::max(entry->info.size.height >> mip, 1u));
+        num_layers = std::min<u32>(num_layers, desc.view_info.range.extent.layers);
+        const VAddr cmask = col_buf.CmaskAddress();
+        bool is_clear = false;
+        if (cmask != 0) {
+            known_meta.insert(cmask);
+            is_clear = cleared_meta.erase(cmask) != 0;
+        }
+        attachment.image_view = view;
+        attachment.clear_value =
+            is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf).color.uint32
+                     : std::array<u32, 4>{};
+        attachment.is_clear = is_clear;
+    }
+    auto& db = state.depth_stencil_attachment;
+    db = {};
+    db.image_layout = vk::ImageLayout::eGeneral;
+    if ((regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid())) {
+        const VAddr htile = regs.depth_htile_data_base.GetAddress();
+        const VideoCore::TextureCache::ImageDesc desc{regs.depth_buffer, regs.depth_view,
+                                                      regs.depth_control, htile,
+                                                      r.liverpool->DrawDbExtent()};
+        Native::ImageEntry* entry = registry->Find(desc.info, true, frame);
+        const vk::ImageView view =
+            entry ? View(*entry, desc.view_info, ViewUse::Attachment) : vk::ImageView{};
+        if (view) {
+            bool meta_clear = false;
+            if (htile != 0) {
+                known_meta.insert(htile);
+                meta_clear = cleared_meta.erase(htile) != 0;
+            }
+            const auto aspects =
+                DepthStencilClearAspects(regs.depth_buffer, regs.depth_control,
+                                         regs.depth_render_control, meta_clear);
+            const bool depth_clear = bool(aspects & vk::ImageAspectFlagBits::eDepth);
+            const bool stencil_clear = bool(aspects & vk::ImageAspectFlagBits::eStencil);
+            db.image_view = view;
+            if (regs.depth_buffer.DepthValid()) {
+                db.clear_value[0] = depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
+                db.has_depth = true;
+                db.depth_clear = depth_clear;
+            }
+            if (regs.depth_buffer.StencilValid() && entry->info.props.has_stencil) {
+                db.clear_value[1] = stencil_clear ? regs.stencil_clear : 0u;
+                db.has_stencil = true;
+                db.stencil_clear = stencil_clear;
+            }
+            width = std::min<u32>(width, entry->info.size.width);
+            height = std::min<u32>(height, entry->info.size.height);
+            num_layers = std::min<u32>(num_layers, desc.view_info.range.extent.layers);
+            out.depth = entry;
+        } else {
+            ++stats.null_images;
+        }
+    }
+    state.width = static_cast<u16>(std::min<u32>(width, 0xffff));
+    state.height = static_cast<u16>(std::min<u32>(height, 0xffff));
+    state.num_layers = static_cast<u16>(
+        num_layers == std::numeric_limits<u16>::max() ? 1u : std::max(num_layers, 1u));
+    return true;
+}
+
+void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
+                                const AmdGpu::Regs& regs, bool compute, DrawBindings& b) {
+    size_t total = 0;
+    for (const auto* stage : stages) {
+        if (stage) {
+            total += stage->buffers.size() + stage->images.size() + stage->samplers.size();
+        }
+    }
+    b.writes.reserve(total);
+    Shader::Backend::Bindings binding{};
+    std::array<StageResourceBindings, Shader::MaxStageTypes> plans{};
+    for (u32 i = 0; i < stages.size(); ++i) {
+        const auto* stage = stages[i];
+        if (!stage) {
+            continue;
+        }
+        plans[i] = PlanStageResourceBindings(*stage, binding);
+        auto buffer_binding = plans[i].buffers;
+        BindBuffers(*stage, regs, compute, buffer_binding, b);
+        binding = plans[i].next;
+    }
+    for (u32 i = 0; i < stages.size(); ++i) {
+        if (const auto* stage = stages[i]) {
+            auto texture_binding = plans[i].textures;
+            BindTextures(*stage, regs, texture_binding, b);
+        }
+    }
+}
+
+void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
+                                 Shader::Backend::Bindings& binding, DrawBindings& b) {
+    const u64 alignment = r.instance.StorageMinAlignment();
+    auto* direct = stage.uses_direct ? r.buffer_cache.GetDirectMemory() : nullptr;
+    // D3's table: page table L1 and zero page, then base, size and valid of each buffer read
+    // through it.
+    static thread_local std::vector<std::array<u32, 4>> direct_entries;
+    direct_entries.assign(stage.buffers.size(), {});
+    constexpr u64 GpuAddressLimit = 1ULL << 40;
+    u32 index = 0;
+    for (const auto& desc : stage.buffers) {
+        const u32 buffer_index = index++;
+        vk::DescriptorBufferInfo info{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
+        if (desc.IsSpecial()) {
+            switch (desc.buffer_type) {
+            case Shader::BufferType::GdsBuffer:
+                info = {Handle<VkBuffer_T>(gds->NativeHandle()), 0, gds->Size()};
+                break;
+            case Shader::BufferType::Flatbuf: {
+                const u32 size = static_cast<u32>(stage.flattened_ud_buf.size() * sizeof(u32));
+                if (size != 0) {
+                    const auto [buffer, offset, data] = Allocate(size, alignment);
+                    std::memcpy(data, stage.flattened_ud_buf.data(), size);
+                    info = {buffer, offset, size};
+                }
+                break;
+            }
+            case Shader::BufferType::ClipPlanes:
+                if (regs.clipper_control.user_clip_plane_enable != 0) {
+                    std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+                    for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+                        const auto& plane = regs.clip_user_data[i];
+                        planes[i * 4 + 0] = std::bit_cast<float>(plane.data_x);
+                        planes[i * 4 + 1] = std::bit_cast<float>(plane.data_y);
+                        planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
+                        planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
+                    }
+                    const auto [buffer, offset, data] = Allocate(sizeof(planes), alignment);
+                    std::memcpy(data, planes.data(), sizeof(planes));
+                    info = {buffer, offset, sizeof(planes)};
+                }
+                break;
+            case Shader::BufferType::DirectTable: {
+                const u32 words = static_cast<u32>(4 + stage.buffers.size() * 4);
+                const auto [buffer, offset, data] = Allocate(words * sizeof(u32), alignment);
+                auto* table = reinterpret_cast<u32*>(data);
+                std::memset(table, 0, words * sizeof(u32));
+                if (auto* memory = r.buffer_cache.GetDirectMemory()) {
+                    const u64 l1 = memory->L1Address();
+                    const u64 zero = memory->ZeroPageAddress();
+                    table[0] = u32(l1);
+                    table[1] = u32(l1 >> 32);
+                    table[2] = u32(zero);
+                    table[3] = u32(zero >> 32);
+                    for (size_t i = 0; i < stage.buffers.size(); ++i) {
+                        std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
+                    }
+                }
+                info = {buffer, offset, words * sizeof(u32)};
+                break;
+            }
+            case Shader::BufferType::SharedMemory: {
+                const auto& cs_program = r.liverpool->DrawCsRegs();
+                const u64 lds_size =
+                    std::max<u64>(u64(cs_program.SharedMemSize()) * cs_program.NumWorkgroups(), 16);
+                // GCN LDS is undefined when a workgroup starts: one GPU-only buffer serves every
+                // dispatch (they are separated by barriers).
+                if (!lds || lds->Size() < lds_size) {
+                    lds = device->CreateBuffer({
+                        .size = std::max<u64>(Common::AlignUp(lds_size, 1_MB), 4_MB),
+                        .usage = Native::Rhi::BufferUsageStorage,
+                        .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                        .name = "native lds",
+                    });
+                }
+                if (lds) {
+                    info = {Handle<VkBuffer_T>(lds->NativeHandle()), 0, lds_size};
+                }
+                break;
+            }
+            default: {
+                static std::atomic<u32> logged{};
+                if (Sample(logged)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NAT-101: shader {:#x} uses buffer type {}, not supported in "
+                                "native mode; bound empty",
+                                stage.pgm_hash, u32(desc.buffer_type));
+                }
+                break;
+            }
+            }
+        } else {
+            const auto vsharp = desc.GetSharp(stage);
+            const u64 base = vsharp.base_address;
+            const u64 sharp_size = vsharp.GetSize();
+            // FIX-031 / FIX-036 / FIX-046: V#s that are not buffers are bound empty.
+            const bool impossible =
+                vsharp.num_records != UINT32_MAX &&
+                (sharp_size >= GpuAddressLimit || base + sharp_size > GpuAddressLimit ||
+                 (sharp_size >= 1_GB && base != 0 && !r.memory->IsValidMapping(base)));
+            const bool unmapped =
+                !impossible && base != 0 && sharp_size != 0 && !r.IsMappedStart(base);
+            if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
+                const u64 size = r.memory->ClampRangeSize(base, sharp_size);
+                if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) &&
+                    direct->EnsureImported(base, size)) {
+                    // D3: read in place through the page table; nothing bound.
+                    direct_entries[buffer_index] = {u32(base), u32(base >> 32), u32(size), 1u};
+                } else if (const auto found = GuestBuffer(base, size, desc.is_written)) {
+                    const u64 aligned = Common::AlignDown(found->second, alignment);
+                    const u64 adjust = found->second - aligned;
+                    b.push.AddOffset(binding.buffer, static_cast<u32>(adjust));
+                    info = {found->first, aligned, size + adjust};
+                    b.writes_buffers |= desc.is_written;
+                }
+            }
+        }
+        b.buffers.push_back(info);
+        b.writes.push_back(vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = binding.unified++,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &b.buffers.back(),
+        });
+        ++binding.buffer;
+    }
+    (void)compute;
+}
+
+void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
+                                  Shader::Backend::Bindings& binding, DrawBindings& b) {
+    for (const auto& image_desc : stage.images) {
+        const auto tsharp = image_desc.GetSharp(stage);
+        const u32 num_bindings = image_desc.NumBindings(stage);
+        const u32 first = static_cast<u32>(b.images.size());
+        const bool storage = image_desc.is_written;
+        const auto add_write = [&] {
+            b.writes.push_back(vk::WriteDescriptorSet{
+                .dstSet = VK_NULL_HANDLE,
+                .dstBinding = binding.unified,
+                .dstArrayElement = 0,
+                .descriptorCount = num_bindings,
+                .descriptorType =
+                    storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage,
+                .pImageInfo = &b.images[first],
+            });
+            binding.unified += num_bindings;
+        };
+        const auto bind_null = [&] {
+            for (u32 i = 0; i < num_bindings; ++i) {
+                b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
+            }
+            ++stats.null_images;
+            add_write();
+        };
+        const auto data_fmt = tsharp.GetDataFmt();
+        const auto num_fmt = tsharp.GetNumberFmt();
+        if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid ||
+            !r.memory->IsValidGpuMapping(tsharp.Address(), 0) ||
+            !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt) ||
+            LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt) == vk::Format::eUndefined ||
+            VideoCore::CheckImageDescriptorGeometry(tsharp, r.instance.GetImageLimits()) !=
+                VideoCore::ImageDescriptorGeometryError::None) {
+            bind_null();
+            continue;
+        }
+        const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        // FIX-046: an image must start inside the guest address space. FIX-081: GT Sport's grass
+        // shader reads garbage T#s from one slot when the texture is unused; from there only an
+        // image the game already made is bound.
+        if (!r.IsMappedStart(desc.info.guest_address) ||
+            (stage.pgm_hash == 0xaa3822a3 && image_desc.sharp_fetch.offsets[0] == 109 &&
+             !registry->HasImageAt(desc.info.guest_address))) {
+            bind_null();
+            continue;
+        }
+        Native::ImageEntry* entry = registry->Find(desc.info, storage, frame);
+        if (!entry) {
+            bind_null();
+            continue;
+        }
+        if (!storage && entry->from_cpu) {
+            RefreshSources(*entry); // NAT-104
+        }
+        const auto fallback = image_desc.mip_fallback_mode;
+        for (u32 i = 0; i < num_bindings; ++i) {
+            auto view_info = desc.view_info;
+            if (fallback == Shader::MipStorageFallbackMode::ConstantIndex) {
+                view_info.range.base.level += image_desc.constant_mip_index;
+                view_info.range.extent.levels = 1;
+            } else if (fallback == Shader::MipStorageFallbackMode::DynamicIndex) {
+                view_info.range.base.level += i;
+                view_info.range.extent.levels = 1;
+            }
+            const vk::ImageView view =
+                View(*entry, view_info, storage ? ViewUse::Storage : ViewUse::Sampled);
+            b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
+        }
+        (storage ? b.stored : b.sampled).push_back(entry);
+        add_write();
+    }
+    for (const auto& sampler : stage.samplers) {
+        auto ssharp = sampler.GetSharp(stage);
+        if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                                regs.ta_bc_base.Address() == 0)) {
+            ssharp = AmdGpu::Sampler{};
+        }
+        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
+                            vk::ImageLayout::eGeneral});
+        b.writes.push_back(vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = binding.unified++,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eSampler,
+            .pImageInfo = &b.images.back(),
+        });
+    }
+}
+
+void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
+                                  DrawBindings& b) {
+    Stream& s = stream;
+    const CmdBuf cmdbuf{s.cmd};
+    const auto stage_flags =
+        pipeline.IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
+    cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(b.push), &b.push);
+    if (b.writes.empty()) {
+        return;
+    }
+    if (pipeline.UsesPushDescriptors()) {
+        cmdbuf.pushDescriptorSetKHR(bind_point, pipeline.GetLayout(), 0, b.writes);
+        return;
+    }
+    const vk::Device vk_device = r.instance.GetDevice();
+    const vk::DescriptorSetLayout layout = pipeline.DescriptorSetLayout();
+    vk::DescriptorSet set{};
+    for (u32 attempt = 0; attempt < 2 && !set; ++attempt) {
+        if (s.pools.empty() || attempt == 1) {
+            s.pools.push_back(TakeDescriptorPool());
+        }
+        vk::DescriptorSetAllocateInfo alloc{
+            .descriptorPool = s.pools.back(),
+            .descriptorSetCount = 1,
+            .pSetLayouts = &layout,
+        };
+        VkDescriptorSet raw{};
+        if (vk_device.allocateDescriptorSets(&alloc, reinterpret_cast<vk::DescriptorSet*>(&raw)) ==
+            vk::Result::eSuccess) {
+            set = raw;
+        }
+    }
+    if (!set) {
+        static std::atomic<u32> logged{};
+        if (Sample(logged)) {
+            LOG_ERROR(Render_Vulkan, "NAT-100: no descriptor set for a draw");
+        }
+        return;
+    }
+    for (auto& write : b.writes) {
+        write.dstSet = set;
+    }
+    vk_device.updateDescriptorSets(b.writes, {});
+    cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), 0, set, {});
+}
+
+void NativeRenderer::BindVertexBuffers(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs) {
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> input_bindings;
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    VertexInputs<AmdGpu::Buffer> guest_buffers;
+    pipeline.GetVertexInputs(attributes, input_bindings, divisors, guest_buffers,
+                             regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+    const CmdBuf cmdbuf{stream.cmd};
+    const bool dynamic_input = r.instance.IsVertexInputDynamicState();
+    if (dynamic_input) {
+        cmdbuf.setVertexInputEXT(input_bindings, attributes);
+    }
+    if (guest_buffers.empty()) {
+        return;
+    }
+    VertexInputs<vk::Buffer> buffers;
+    VertexInputs<vk::DeviceSize> offsets;
+    VertexInputs<vk::DeviceSize> sizes;
+    VertexInputs<vk::DeviceSize> strides;
+    for (const auto& guest : guest_buffers) {
+        std::optional<std::pair<vk::Buffer, u64>> found;
+        u64 size = 0;
+        if (guest.base_address != 0 && guest.GetSize() > 0 &&
+            r.memory->MappedAreaEnd(guest.base_address, guest.base_address + 1) != 0) {
+            size = r.memory->ClampRangeSize(guest.base_address, guest.GetSize());
+            found = GuestBuffer(guest.base_address, size, false);
+        }
+        buffers.push_back(found ? found->first : vk::Buffer{});
+        offsets.push_back(found ? found->second : 0);
+        sizes.push_back(found ? size : 0);
+        strides.push_back(guest.GetStride());
+    }
+    const u32 count = static_cast<u32>(guest_buffers.size());
+    if (dynamic_input) {
+        cmdbuf.bindVertexBuffers(0, count, buffers.data(), offsets.data());
+    } else {
+        cmdbuf.bindVertexBuffers2(0, count, buffers.data(), offsets.data(), sizes.data(),
+                                  strides.data());
+    }
+}
+
+bool NativeRenderer::BindIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
+                                 bool quad_triangles, u32& index_count) {
+    const CmdBuf cmdbuf{stream.cmd};
+    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+    if (quad_triangles) {
+        const auto& corners =
+            regs.polygon_control.provoking_vtx_last == AmdGpu::ProvokingVtxLast::Last
+                ? QuadLastVertex
+                : QuadFirstVertex;
+        const u32 count = regs.num_indices;
+        const u32 max_indices = count / 4 * 6;
+        index_count = 0;
+        if (max_indices == 0) {
+            return true;
+        }
+        if (!is_indexed) {
+            const auto [buffer, offset, data] = Allocate(u64(max_indices) * sizeof(u32), 4);
+            auto* out = reinterpret_cast<u32*>(data);
+            for (u32 quad = 0; quad + 4 <= count; quad += 4) {
+                for (const u32 corner : corners) {
+                    *out++ = quad + corner;
+                }
+            }
+            cmdbuf.bindIndexBuffer(buffer, offset, vk::IndexType::eUint32);
+            index_count = max_indices;
+            return true;
+        }
+        const VAddr address =
+            regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+        const bool restart = (regs.enable_primitive_restart & 1) != 0;
+        const auto [buffer, offset, data] = Allocate(u64(max_indices) * index_size, 4);
+        if (is_index16) {
+            index_count = ExpandQuads<u16>(
+                reinterpret_cast<const u16*>(address), count,
+                restart ? std::optional<u16>{u16(regs.primitive_restart_index)} : std::nullopt,
+                corners, reinterpret_cast<u16*>(data));
+        } else {
+            index_count = ExpandQuads<u32>(
+                reinterpret_cast<const u32*>(address), count,
+                restart ? std::optional<u32>{regs.primitive_restart_index} : std::nullopt,
+                corners, reinterpret_cast<u32*>(data));
+        }
+        cmdbuf.bindIndexBuffer(buffer, offset,
+                               is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32);
+        return true;
+    }
+    if (!is_indexed) {
+        return true;
+    }
+    const VAddr address =
+        regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+    const auto found = GuestBuffer(address, u64(regs.num_indices) * index_size, false);
+    if (!found) {
+        return false;
+    }
+    cmdbuf.bindIndexBuffer(found->first, found->second,
+                           is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32);
+    return true;
+}
+
+bool NativeRenderer::NeedsBarrierFor(const DrawBindings& b) const {
+    const Stream& s = stream;
+    if (s.buffers_written) {
+        return true;
+    }
+    for (const auto* entry : b.sampled) {
+        if (std::ranges::find(s.written, entry) != s.written.end()) {
+            return true;
+        }
+    }
+    for (const auto* entry : b.stored) {
+        if (std::ranges::find(s.written, entry) != s.written.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void NativeRenderer::Written(const Native::ImageEntry* entry) {
+    if (entry) {
+        const_cast<Native::ImageEntry*>(entry)->write_version.store(++write_clock,
+                                                                    std::memory_order_relaxed);
+    }
+}
+
+void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
+    static thread_local std::vector<Native::ImageEntry*> sources;
+    {
+        std::scoped_lock lock{texture.sources_mutex};
+        if (texture.sources.empty()) {
+            return;
+        }
+        sources.assign(texture.sources.begin(), texture.sources.end());
+    }
+    // Per subresource of the texture, the newest picture drawn for it (several layouts take
+    // turns in the same memory), when newer than what the texture holds.
+    struct Pick {
+        Native::ImageEntry* source;
+        Native::SourcePlace place;
+        u64 version;
+    };
+    boost::container::small_vector<Pick, 16> picks;
+    auto& held = held_versions[&texture];
+    const u64 own = texture.write_version.load(std::memory_order_relaxed);
+    for (auto* source : sources) {
+        const u64 version = source->write_version.load(std::memory_order_relaxed);
+        if (version == 0 || !source->image) {
+            continue;
+        }
+        const auto place = Native::PlaceOf(source->info, texture.info);
+        if (place.mip < 0) {
+            continue;
+        }
+        const u32 key = (u32(place.mip) << 16) | u32(place.layer);
+        if (version <= std::max(held[key], own)) {
+            continue;
+        }
+        const auto same = std::ranges::find_if(picks, [&](const Pick& pick) {
+            return pick.place.mip == place.mip && pick.place.layer == place.layer;
+        });
+        if (same == picks.end()) {
+            picks.push_back({source, place, version});
+        } else if (version > same->version) {
+            *same = {source, place, version};
+        }
+    }
+    if (picks.empty()) {
+        return;
+    }
+    Stream& s = Begin();
+    PrepareImages();  // the texture's own upload goes first
+    GlobalBarrier();  // the sources' pictures are written
+    const vk::Image dst{Handle<VkImage_T>(texture.image->NativeHandle())};
+    for (const auto& pick : picks) {
+        const auto& place = pick.place;
+        const u32 width = std::min({place.width, std::max(texture.info.size.width >> place.mip, 1u),
+                                    pick.source->info.size.width});
+        const u32 height =
+            std::min({place.height, std::max(texture.info.size.height >> place.mip, 1u),
+                      pick.source->info.size.height});
+        const vk::ImageCopy region{
+            .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                            .mipLevel = 0,
+                            .baseArrayLayer = 0,
+                            .layerCount = 1},
+            .srcOffset = {0, 0, 0},
+            .dstSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                            .mipLevel = u32(place.mip),
+                            .baseArrayLayer = u32(place.layer),
+                            .layerCount = 1},
+            .dstOffset = {0, 0, 0},
+            .extent = {width, height, 1},
+        };
+        CmdBuf{s.cmd}.copyImage(vk::Image{Handle<VkImage_T>(pick.source->image->NativeHandle())},
+                                vk::ImageLayout::eGeneral, dst, vk::ImageLayout::eGeneral, region);
+        held[(u32(place.mip) << 16) | u32(place.layer)] = pick.version;
+    }
+    s.written.push_back(&texture); // read after the next barrier
+    stats.source_copies += picks.size();
+    ++s.commands;
+}
+
+void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
+    Stream& s = stream;
+    const auto note = [&](const Native::ImageEntry* entry) {
+        Written(entry);
+        if (entry && std::ranges::find(s.written, entry) == s.written.end()) {
+            s.written.push_back(entry);
+        }
+    };
+    if (targets) {
+        for (const auto* entry : targets->colors) {
+            note(entry);
+        }
+        note(targets->depth);
+    }
+    for (const auto* entry : b.stored) {
+        note(entry);
+    }
+    s.buffers_written |= b.writes_buffers;
+}
+
+void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
+    std::scoped_lock lock{mutex};
+    r.scheduler.PopPendingOperations();
+    const auto& regs = r.liverpool->DrawRegs();
+    switch (Classify(regs)) {
+    case Filter::EliminateFastClear: {
+        // Fast-cleared tiles get the clear colour now when nothing drew into the target since
+        // its CMASK was cleared (otherwise the pass that drew started with the clear).
+        const auto& col_buf = regs.color_buffers[0];
+        if (col_buf && col_buf.info.fast_clear && cleared_meta.erase(col_buf.CmaskAddress())) {
+            const VideoCore::TextureCache::ImageDesc desc{col_buf, r.liverpool->DrawCbExtent(0)};
+            if (Native::ImageEntry* entry = registry->Find(desc.info, true, frame)) {
+                Stream& s = Begin();
+                PrepareImages();
+                GlobalBarrier();
+                const vk::ImageSubresourceRange range{
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = desc.view_info.range.base.layer,
+                    .layerCount = desc.view_info.range.extent.layers,
+                };
+                CmdBuf{s.cmd}.clearColorImage(
+                    vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
+                    vk::ImageLayout::eGeneral, LiverpoolToVK::ColorBufferClearValue(col_buf).color,
+                    range);
+                Written(entry);
+                s.buffers_written = true; // the next work waits for the clear
+                ++s.commands;
+            }
+        }
+        ++stats.skipped;
+        return;
+    }
+    case Filter::FmaskDecompress:
+    case Filter::NoPrimitive:
+        ++stats.skipped;
+        return;
+    case Filter::Resolve:
+        ResolveDraw(regs);
+        return;
+    case Filter::Copy: {
+        static std::atomic<u32> logged{};
+        if (Sample(logged)) {
+            LOG_WARNING(Render_Vulkan, "NAT-102: depth/stencil copy draw skipped");
+        }
+        ++stats.skipped;
+        return;
+    }
+    case Filter::Draw:
+        break;
+    }
+
+    const bool quad_list = regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
+    bool quad_triangles = quad_list && Common::PerfFeatureEnabled(28) &&
+                          u64(regs.num_indices) / 4 * 6 * sizeof(u32) <= MaxQuadIndexBytes;
+    const GraphicsPipeline* pipeline = r.AcquireGraphicsPipeline(
+        {
+            .vertex_sgpr_offset = 0,
+            .instance_sgpr_offset = 0,
+            .tessellate_quads = quad_list && !quad_triangles,
+        },
+        !quad_list);
+    if (!pipeline) {
+        ++stats.no_pipeline;
+        return;
+    }
+    Stream& s = Begin();
+    Targets targets;
+    ResolveTargets(regs, *pipeline, targets);
+    DrawBindings& b = bindings;
+    b.Clear();
+    b.push = UserData(regs);
+    BindStages(pipeline->GetStages(), regs, false, b);
+    if (b.failed) {
+        ++stats.skipped;
+        return;
+    }
+    PrepareImages();
+    if (!s.rendering || !(s.render == targets.state) || NeedsBarrierFor(b)) {
+        GlobalBarrier();
+    }
+    BeginRendering(targets.state);
+
+    // The renderer's dynamic state code, filling this list's state.
+    {
+        DynamicState* const saved = Rasterizer::t_dynamic_state;
+        Rasterizer::t_dynamic_state = &s.dynamic;
+        r.ctx->attachment_feedback_loop = {};
+        r.UpdateViewportScissorState();
+        r.UpdateDepthStencilState();
+        r.UpdatePrimitiveState(is_indexed, quad_triangles);
+        r.UpdateRasterizationState();
+        r.UpdateColorBlendingState(pipeline);
+        s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
+        Rasterizer::t_dynamic_state = saved;
+    }
+    BindVertexBuffers(*pipeline, regs);
+    u32 index_count = regs.num_indices;
+    if (!BindIndices(regs, is_indexed, index_offset, quad_triangles, index_count)) {
+        ++stats.skipped;
+        return;
+    }
+    const CmdBuf cmdbuf{s.cmd};
+    if (s.pipeline != pipeline->Handle()) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+        s.pipeline = pipeline->Handle();
+    }
+    PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+    const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+    const auto [vertex_offset, instance_offset] =
+        DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
+    const u32 instances = regs.num_instances.NumInstances();
+    if (quad_triangles) {
+        if (index_count != 0) {
+            cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset), instance_offset);
+        }
+    } else if (is_indexed) {
+        cmdbuf.drawIndexed(regs.num_indices, instances, 0, s32(vertex_offset), instance_offset);
+    } else {
+        cmdbuf.draw(regs.num_indices, instances, vertex_offset, instance_offset);
+    }
+    NoteWrites(&targets, b);
+    ++stats.draws;
+    ++s.commands;
+    ChunkFlushCheck();
+    Report();
+}
+
+bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
+    // As IsComputeMetaClear: a shader writing a known CMASK/HTILE without tile address math
+    // (no XOR) and reading none clears it. The dispatch still runs (FIX-112: GT Sport reuses
+    // such memory for pictures).
+    for (const auto& desc : cs.buffers) {
+        if (!desc.IsSpecial() && !desc.is_written &&
+            known_meta.contains(desc.GetSharp(cs).base_address)) {
+            return false;
+        }
+    }
+    if (cs.has_bitwise_xor) {
+        return false;
+    }
+    bool cleared = false;
+    for (const auto& desc : cs.buffers) {
+        const VAddr address = desc.GetSharp(cs).base_address;
+        if (!desc.IsSpecial() && desc.is_written && known_meta.contains(address)) {
+            cleared_meta.insert(address);
+            cleared = true;
+        }
+    }
+    stats.meta_clears += cleared;
+    return cleared;
+}
+
+void NativeRenderer::DispatchDirect() {
+    std::scoped_lock lock{mutex};
+    r.scheduler.PopPendingOperations();
+    const auto& cs_program = r.liverpool->DrawCsRegs();
+    const ComputePipeline* pipeline = r.AcquireComputePipeline();
+    if (!pipeline) {
+        ++stats.no_pipeline;
+        return;
+    }
+    const auto& regs = r.liverpool->DrawRegs();
+    MetaClearDispatch(pipeline->GetStage(Shader::SwStage::Compute));
+    Stream& s = Begin();
+    DrawBindings& b = bindings;
+    b.Clear();
+    b.push = UserData(regs);
+    BindStages(pipeline->GetStages(), regs, true, b);
+    if (b.failed) {
+        ++stats.skipped;
+        return;
+    }
+    PrepareImages();
+    GlobalBarrier();
+    const CmdBuf cmdbuf{s.cmd};
+    if (s.pipeline != pipeline->Handle()) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+        s.pipeline = pipeline->Handle();
+    }
+    PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
+    cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    NoteWrites(nullptr, b);
+    s.buffers_written = true; // what the dispatch wrote is seen after the next barrier
+    ++stats.dispatches;
+    ++s.commands;
+    ChunkFlushCheck();
+    Report();
+}
+
+void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    std::scoped_lock lock{mutex};
+    r.scheduler.PopPendingOperations();
+    const ComputePipeline* pipeline = r.AcquireComputePipeline();
+    if (!pipeline) {
+        ++stats.no_pipeline;
+        return;
+    }
+    const auto& regs = r.liverpool->DrawRegs();
+    Stream& s = Begin();
+    const auto args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
+    if (!args) {
+        ++stats.skipped;
+        return;
+    }
+    DrawBindings& b = bindings;
+    b.Clear();
+    b.push = UserData(regs);
+    BindStages(pipeline->GetStages(), regs, true, b);
+    PrepareImages();
+    GlobalBarrier();
+    const CmdBuf cmdbuf{s.cmd};
+    if (s.pipeline != pipeline->Handle()) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+        s.pipeline = pipeline->Handle();
+    }
+    PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
+    cmdbuf.dispatchIndirect(args->first, args->second);
+    NoteWrites(nullptr, b);
+    s.buffers_written = true;
+    ++stats.dispatches;
+    ++s.commands;
+    ChunkFlushCheck();
+}
+
+void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
+    const VideoCore::TextureCache::ImageDesc src_desc{regs.color_buffers[0],
+                                                      r.liverpool->DrawCbExtent(0)};
+    const VideoCore::TextureCache::ImageDesc dst_desc{regs.color_buffers[1],
+                                                      r.liverpool->DrawCbExtent(1)};
+    Native::ImageEntry* src = registry->Find(src_desc.info, true, frame);
+    Native::ImageEntry* dst = registry->Find(dst_desc.info, true, frame);
+    if (!src || !dst) {
+        return;
+    }
+    Stream& s = Begin();
+    PrepareImages();
+    GlobalBarrier();
+    const auto layers = std::min(src_desc.view_info.range.extent.layers,
+                                 dst_desc.view_info.range.extent.layers);
+    const vk::ImageResolve region{
+        .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                        .mipLevel = 0,
+                        .baseArrayLayer = src_desc.view_info.range.base.layer,
+                        .layerCount = layers},
+        .dstSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                        .mipLevel = 0,
+                        .baseArrayLayer = dst_desc.view_info.range.base.layer,
+                        .layerCount = layers},
+        .extent{std::min(src->info.size.width, dst->info.size.width),
+                std::min(src->info.size.height, dst->info.size.height), 1},
+    };
+    const vk::Image src_image{Handle<VkImage_T>(src->image->NativeHandle())};
+    const vk::Image dst_image{Handle<VkImage_T>(dst->image->NativeHandle())};
+    if (src->image->Desc().samples > 1 && dst->image->Desc().samples == 1) {
+        CmdBuf{s.cmd}.resolveImage(src_image, vk::ImageLayout::eGeneral, dst_image,
+                                   vk::ImageLayout::eGeneral, region);
+    } else {
+        const vk::ImageCopy copy{
+            .srcSubresource = region.srcSubresource,
+            .dstSubresource = region.dstSubresource,
+            .extent = region.extent,
+        };
+        CmdBuf{s.cmd}.copyImage(src_image, vk::ImageLayout::eGeneral, dst_image,
+                                vk::ImageLayout::eGeneral, copy);
+    }
+    Written(dst);
+    s.buffers_written = true;
+    ++s.commands;
+}
+
+void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    if (num_bytes == 0) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    Stream& s = Begin();
+    if (is_gds) {
+        GlobalBarrier();
+        CmdBuf{s.cmd}.fillBuffer(vk::Buffer{Handle<VkBuffer_T>(gds->NativeHandle())}, address,
+                                 std::min<u64>(num_bytes, gds->Size() - address), value);
+        s.buffers_written = true;
+        ++s.commands;
+        return;
+    }
+    if (known_meta.contains(address)) {
+        cleared_meta.insert(address); // a CMASK/HTILE cleared by the CP
+        ++stats.meta_clears;
+    }
+    ++stats.fills;
+    if (const auto found = GuestBuffer(address, num_bytes, true)) {
+        GlobalBarrier();
+        CmdBuf{s.cmd}.fillBuffer(found->first, found->second, num_bytes, value);
+        s.buffers_written = true;
+        ++s.commands;
+    } else {
+        // Not GPU-visible as one range: written now (before the GPU runs what precedes it).
+        std::fill_n(reinterpret_cast<u32*>(address), num_bytes / 4, value);
+    }
+    registry->Invalidate(address, num_bytes);
+}
+
+void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (num_bytes == 0) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    Stream& s = Begin();
+    ++stats.copies;
+    const vk::Buffer gds_buffer{Handle<VkBuffer_T>(gds->NativeHandle())};
+    const auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
+                                : GuestBuffer(src, num_bytes, false);
+    const auto dest = dst_gds ? std::optional{std::pair{gds_buffer, u64(dst)}}
+                              : GuestBuffer(dst, num_bytes, true);
+    if (source && dest) {
+        GlobalBarrier();
+        CmdBuf{s.cmd}.copyBuffer(source->first, dest->first,
+                                 vk::BufferCopy{.srcOffset = source->second,
+                                                .dstOffset = dest->second,
+                                                .size = num_bytes});
+        s.buffers_written = true;
+        ++s.commands;
+    } else if (!dst_gds && !src_gds) {
+        std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), num_bytes);
+    } else {
+        static std::atomic<u32> logged{};
+        if (Sample(logged)) {
+            LOG_WARNING(Render_Vulkan, "NAT-101: GDS copy {:#x} <- {:#x} ({} bytes) dropped", dst,
+                        src, num_bytes);
+        }
+    }
+    if (!dst_gds) {
+        registry->Invalidate(dst, num_bytes);
+    }
+}
+
+bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
+    if (data.empty() || data.size() % 4 != 0 || data.size() > 65536 || address % 4 != 0) {
+        return false;
+    }
+    std::scoped_lock lock{mutex};
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    if (!direct || !direct->EnsureImported(address, data.size())) {
+        return false;
+    }
+    const auto found = direct->FindBuffer(address, data.size());
+    if (!found) {
+        return false;
+    }
+    Stream& s = Begin();
+    GlobalBarrier();
+    CmdBuf{s.cmd}.updateBuffer(found->first->Handle(), found->second, data.size(), data.data());
+    s.buffers_written = true;
+    ++s.commands;
+    ++stats.inline_writes;
+    return true;
+}
+
+void NativeRenderer::OnUnmap(VAddr address, u64 size) {
+    registry->Invalidate(address, size);
+}
+
+void NativeRenderer::WatchPages(VAddr address, u64 size) {
+    const VAddr begin = VideoCore::PageManager::GetPageAddr(address);
+    const VAddr end = VideoCore::PageManager::GetNextPageAddr(address + size - 1);
+    constexpr u64 PageSize = 4096;
+    std::scoped_lock lock{watch_mutex};
+    VAddr run = 0; // start of a run of pages not watched yet
+    for (VAddr page = begin; page < end; page += PageSize) {
+        const bool fresh = watched_pages.insert(page).second;
+        if (fresh && run == 0) {
+            run = page;
+        } else if (!fresh && run != 0) {
+            r.page_manager.UpdatePageWatchers(run, page - run, VideoCore::PageOp::Track);
+            run = 0;
+        }
+    }
+    if (run != 0) {
+        r.page_manager.UpdatePageWatchers(run, end - run, VideoCore::PageOp::Track);
+    }
+}
+
+void NativeRenderer::OnCpuWrite(VAddr address, u64 size) {
+    // The written pages stop being watched (so they open up and the write goes on), and the
+    // textures over them are uploaded again when next used (which watches them again).
+    const VAddr begin = VideoCore::PageManager::GetPageAddr(address);
+    const VAddr end = VideoCore::PageManager::GetNextPageAddr(address + std::max<u64>(size, 1) - 1);
+    constexpr u64 PageSize = 4096;
+    {
+        std::scoped_lock lock{watch_mutex};
+        VAddr run = 0;
+        for (VAddr page = begin; page < end; page += PageSize) {
+            const bool watched = watched_pages.erase(page) != 0;
+            if (watched && run == 0) {
+                run = page;
+            } else if (!watched && run != 0) {
+                r.page_manager.UpdatePageWatchers(run, page - run, VideoCore::PageOp::Untrack);
+                run = 0;
+            }
+        }
+        if (run != 0) {
+            r.page_manager.UpdatePageWatchers(run, end - run, VideoCore::PageOp::Untrack);
+        }
+    }
+    registry->Invalidate(begin, end - begin);
+    ++stats.cpu_writes;
+}
+
+u32 NativeRenderer::ReadGds(u32 gds_offset) {
+    u32 value = 0;
+    if (gds_offset + sizeof(u32) <= gds->Size()) {
+        std::memcpy(&value, gds->Mapped() + gds_offset, sizeof(value));
+    }
+    return value;
+}
+
+void NativeRenderer::Splice() {
+    std::scoped_lock lock{mutex};
+    Stream& s = stream;
+    if (!s.list) {
+        return;
+    }
+    EndRendering();
+    s.list->End();
+    r.scheduler.EndRendering();
+    const vk::CommandBuffer secondary = s.cmd;
+    r.scheduler.CommandBuffer().executeCommands(secondary);
+    const u64 tick = r.scheduler.CurrentTick();
+    device->MarkExecuted(s.list, {timeline.get(), tick});
+    {
+        std::scoped_lock chunk_lock{chunk_mutex};
+        for (auto& chunk : s.chunks) {
+            chunk.retire_tick = tick;
+            retiring_chunks.push_back(std::move(chunk));
+        }
+        for (const auto pool : s.pools) {
+            retiring_pools.emplace_back(tick, pool);
+        }
+    }
+    s.chunks.clear();
+    s.chunk_used = 0;
+    s.pools.clear();
+    s.list = nullptr;
+    s.cmd = vk::CommandBuffer{};
+    s.rendering = false;
+    ++stats.splices;
+}
+
+std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCore::ImageInfo& info,
+                                                                   vk::Format view_format) {
+    std::scoped_lock lock{mutex};
+    ++frame;
+    // The game's render target there (its layout from the CB registers may differ in details
+    // from the video out description), else an image of the display layout.
+    Native::ImageEntry* entry =
+        registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& candidate) {
+            return !candidate.from_cpu && !candidate.info.props.is_depth &&
+                   candidate.info.size.width == info.size.width &&
+                   candidate.info.size.height == info.size.height &&
+                   candidate.info.num_bits == info.num_bits;
+        });
+    if (!entry) {
+        static std::atomic<u32> logged{};
+        if (Sample(logged)) {
+            LOG_WARNING(Render_Vulkan,
+                        "NAT-103: nothing drew the display buffer {:#x} ({}x{}, {} bits) yet",
+                        info.guest_address, info.size.width, info.size.height, info.num_bits);
+        }
+        entry = registry->Find(info, true, frame);
+    }
+    if (!entry || !entry->image) {
+        return std::nullopt;
+    }
+    VideoCore::ImageViewInfo view_info{};
+    view_info.format = view_format;
+    view_info.mapping.a = AmdGpu::CompSwizzle::One; // as the presenter: no alpha blending
+    const vk::ImageView view = View(*entry, view_info, ViewUse::Sampled);
+    if (!view) {
+        return std::nullopt;
+    }
+    // A display buffer nothing drew into yet starts in the general layout too.
+    if (device->PendingImageInit()) {
+        Begin();
+        PrepareImages();
+    }
+    Splice();
+    return Display{vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, view,
+                   entry->info.size.width, entry->info.size.height};
+}
+
+void NativeRenderer::Report() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_report < std::chrono::seconds{10}) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - last_report).count();
+    last_report = now;
+    const auto& registry_stats = registry->GetStats();
+    LOG_INFO(Render_Vulkan,
+             "NAT-100 native (10 s): {} draws, {} dispatches, {} skipped, {} without pipeline; "
+             "{} passes, {} barriers, {} lists run; {} reads copied ({:.1f} MB), {} ranges bound "
+             "empty, {} images bound empty; {} fills, {} copies, {} meta clears, {} inline "
+             "writes, {} pictures copied from targets, {} CPU writes to textures; images so far: "
+             "{} lookups, {} textures and {} targets made, {} uploads ({:.1f} MB); {:.0f} draws/s",
+             stats.draws, stats.dispatches, stats.skipped, stats.no_pipeline, stats.passes,
+             stats.barriers, stats.splices, stats.copied_reads, stats.copied_bytes / 1048576.0,
+             stats.unbound, stats.null_images, stats.fills, stats.copies, stats.meta_clears,
+             stats.inline_writes, stats.source_copies, stats.cpu_writes.exchange(0),
+             registry_stats.lookups.load(),
+             registry_stats.created_textures.load(), registry_stats.created_targets.load(),
+             registry_stats.uploads.load(), registry_stats.upload_bytes.load() / 1048576.0,
+             stats.draws / seconds);
+    const u64 cpu_writes = stats.cpu_writes.load();
+    stats.draws = stats.dispatches = stats.skipped = stats.no_pipeline = stats.passes = 0;
+    stats.barriers = stats.splices = stats.copied_reads = stats.copied_bytes = stats.unbound = 0;
+    stats.null_images = stats.fills = stats.copies = stats.meta_clears = stats.inline_writes = 0;
+    stats.source_copies = 0;
+    (void)cpu_writes;
+}
+
+} // namespace Vulkan

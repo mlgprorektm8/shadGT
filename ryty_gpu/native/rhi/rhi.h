@@ -129,22 +129,30 @@ public:
     virtual u64 GpuAddress() const = 0;
     /// CPU pointer of Upload/Readback memory; nullptr for device-local memory.
     virtual u8* Mapped() const = 0;
+    /// The backend's own object (Vulkan: VkBuffer), for recording outside this interface.
+    virtual u64 NativeHandle() const = 0;
 };
 
 class Image {
 public:
     virtual ~Image() = default;
     virtual const ImageDesc& Desc() const = 0;
+    /// The backend's own object (Vulkan: VkImage).
+    virtual u64 NativeHandle() const = 0;
 };
 
 class ImageView {
 public:
     virtual ~ImageView() = default;
+    /// The backend's own object (Vulkan: VkImageView).
+    virtual u64 NativeHandle() const = 0;
 };
 
 class Sampler {
 public:
     virtual ~Sampler() = default;
+    /// The backend's own object (Vulkan: VkSampler).
+    virtual u64 NativeHandle() const = 0;
 };
 
 enum class ShaderStage : u8 { Vertex, Hull, Domain, Geometry, Pixel, Compute };
@@ -535,6 +543,8 @@ public:
     /// Records the first layout change of the images created since the last call (Queue::Submit
     /// does it on its own); for lists another renderer runs, before any list using the images.
     virtual void RecordPendingImageInit(CommandList& list) = 0;
+    /// Whether images were created since the last RecordPendingImageInit.
+    virtual bool PendingImageInit() = 0;
 };
 
 } // namespace Native::Rhi

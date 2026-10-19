@@ -12,10 +12,12 @@
 
 #include <array>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/types.h"
@@ -38,10 +40,29 @@ struct ImageViewKey {
     bool operator==(const ImageViewKey&) const = default;
 };
 
+/// NAT-100: what an image factory made: the image and the backend's usage and format features
+/// for it (Vulkan: VkImageUsageFlags, VkFormatFeatureFlags2), which views are made with.
+struct MadeImage {
+    std::unique_ptr<Rhi::Image> image;
+    u32 usage = 0;
+    u64 features = 0;
+};
+using ImageFactory =
+    std::function<MadeImage(const VideoCore::ImageInfo& info, bool render_target)>;
+
 class ImageEntry {
 public:
     VideoCore::ImageInfo info;
     std::unique_ptr<Rhi::Image> image;
+    u32 backend_usage = 0;    ///< from the image factory
+    u64 backend_features = 0; ///< from the image factory
+    /// NAT-104: when the renderer last wrote the picture (its own clock; 0: never).
+    std::atomic<u64> write_version{0};
+    /// NAT-104: render targets a texture's picture is made of: crops of a bigger target at
+    /// the same address (the frosted-glass blur), or its mips and layers drawn one by one
+    /// (environment cube maps). The renderer copies their newer pictures in before a read.
+    std::mutex sources_mutex;
+    std::vector<ImageEntry*> sources;
     bool from_cpu = false; ///< texture data the CPU wrote; render targets are GPU-only
     std::atomic<bool> needs_upload{false};
     std::atomic<u64> last_use{0};
@@ -59,10 +80,37 @@ public:
     explicit ImageRegistry(Rhi::Device& device);
     ~ImageRegistry();
 
+    /// NAT-100: images are made by `factory` instead of from the RHI description (native mode
+    /// makes them as the texture cache does: its formats and usage).
+    void SetImageFactory(ImageFactory factory) {
+        image_factory = std::move(factory);
+    }
+    /// NAT-100: how much of a guest range is mapped (uploads copy only that much).
+    void SetMemoryClamp(std::function<u64(VAddr, u64)> clamp) {
+        memory_clamp = std::move(clamp);
+    }
+    /// NAT-105: called for each texture right before its guest memory is read for an upload
+    /// (native mode starts watching CPU writes to it there).
+    void SetUploadHook(std::function<void(ImageEntry&)> hook) {
+        upload_hook = std::move(hook);
+    }
+    /// NAT-105: every image overlapping [begin, end).
+    void ForEachOverlapping(VAddr begin, VAddr end, const std::function<void(ImageEntry&)>& fn);
+
     /// The image for this layout: one already at the address with the same layout (whatever
     /// its colour format, if the texel size matches), or a new one. A texture found nowhere is
     /// queued for upload from guest memory; a render target is not. Thread-safe.
     ImageEntry* Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame);
+
+    /// NAT-100: whether uploads are queued (RecordUploads has work).
+    bool HasPendingUploads() {
+        std::scoped_lock lock{upload_mutex};
+        return !pending_uploads.empty();
+    }
+    /// NAT-100: whether any image starts at the address.
+    bool HasImageAt(VAddr address);
+    /// NAT-100: an image already at the address that `accept` takes (no new image is made).
+    ImageEntry* FindExisting(VAddr address, const std::function<bool(const ImageEntry&)>& accept);
 
     /// CPU writes to guest memory (file loads, the game writing texture data): textures over the
     /// range are uploaded again before their next use.
@@ -94,9 +142,14 @@ private:
     }
 
     const Rhi::Pipeline* TilingPipeline(const VideoCore::ImageInfo& info, bool tiler);
+    void LinkTexture(ImageEntry& texture);
+    void LinkTarget(ImageEntry& target);
     std::unique_ptr<Rhi::Buffer> TilingParamsBuffer(const VideoCore::ImageInfo& info);
 
     Rhi::Device& device;
+    ImageFactory image_factory;
+    std::function<u64(VAddr, u64)> memory_clamp;
+    std::function<void(ImageEntry&)> upload_hook;
     std::array<Shard, NumShards> shards;
     std::mutex upload_mutex;
     std::vector<ImageEntry*> pending_uploads;
@@ -104,6 +157,8 @@ private:
     std::mutex untile_mutex;
     std::unordered_map<u64, std::unique_ptr<Rhi::Pipeline>> untile_pipelines;
     Stats stats{};
+    std::mutex overlap_log_mutex;
+    std::unordered_set<u64> overlap_logged;
 };
 
 /// The buffer-to-image copies of every mip of an image in its guest (untiled) layout.
@@ -112,5 +167,15 @@ std::vector<Rhi::BufferImageCopy> MipCopies(const VideoCore::ImageInfo& info);
 /// Whether two layouts at the same address can share one image (the cached one's colour format
 /// may differ from the request's when the texel size is the same).
 bool SameLayout(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b);
+
+/// NAT-104: where a render target's picture goes in a texture made of it: the texture's mip and
+/// layer and the size copied (a crop copies the texture's size from the target's corner).
+struct SourcePlace {
+    s32 mip = -1;
+    s32 layer = -1;
+    u32 width = 0;
+    u32 height = 0;
+};
+SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageInfo& texture);
 
 } // namespace Native

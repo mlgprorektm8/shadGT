@@ -34,6 +34,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/native/shadow.h"
+#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #endif
 #include "video_core/amdgpu/draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -74,6 +75,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     scheduler.StartPerfMonitor();
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+#ifdef RYTY_GPU
+        if (native) {
+            native->Splice(); // NAT-100: native work recorded so far runs in this submission
+        }
+#endif
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
@@ -82,6 +88,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (Common::PerfFeatureEnabled(97)) {
         scheduler.EnableCommandThread();
     }
+#ifdef RYTY_GPU
+    if (NativeModeRequested()) {
+        native = std::make_unique<NativeRenderer>(*this); // NAT-100
+    }
+#endif
 }
 
 Rasterizer::~Rasterizer() = default;
@@ -1709,6 +1720,12 @@ static thread_local bool t_frosted_rt = false; // DIAG-139: the draw renders the
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
     ++Common::GetWorkCounters().draws;
+#ifdef RYTY_GPU
+    if (native) {
+        native->Draw(is_indexed, index_offset); // NAT-100
+        return;
+    }
+#endif
     // EXP-119 (SHADGT_CEIL_SKIPDRAW=1 after SHADGT_CEIL_AFTER seconds, measurement only, nothing
     // is drawn): the frame rate with draws costing nothing on the recorder.
     static const bool ceil_skip = [] {
@@ -2181,6 +2198,16 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
     ++Common::GetWorkCounters().draws;
+#ifdef RYTY_GPU
+    if (native) {
+        // NAT-100: GT Sport has no indirect draws (static analysis); not drawn in native mode.
+        static std::atomic<u32> logged{};
+        if (logged++ < 8) {
+            LOG_WARNING(Render_Vulkan, "NAT-102: indirect draw skipped in native mode");
+        }
+        return;
+    }
+#endif
 
     SubmitChunkIfNeeded();
     scheduler.PopPendingOperations();
@@ -2267,6 +2294,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
     ++Common::GetWorkCounters().dispatches;
+#ifdef RYTY_GPU
+    if (native) {
+        native->DispatchDirect(); // NAT-100
+        return;
+    }
+#endif
     Common::PhaseTimer total_timer{Common::Phase::DispatchTotal};
 
     SubmitChunkIfNeeded();
@@ -2311,6 +2344,12 @@ void Rasterizer::DispatchDirect() {
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
     ++Common::GetWorkCounters().dispatches;
+#ifdef RYTY_GPU
+    if (native) {
+        native->DispatchIndirect(address, offset, size); // NAT-100
+        return;
+    }
+#endif
 
     SubmitChunkIfNeeded();
     scheduler.PopPendingOperations();
@@ -2740,9 +2779,13 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     const bool kind_held = hold_kind == 0 || (hold_kind == 1) == flush;
     // FIX-127: no waits while the menu bar is on screen, even when a few in-place reads slipped
     // through (planned ahead before the bar was drawn): they kept the waits on all along.
-    const bool direct_hold = !no_hold && (!compute_queue || hold_compute) && kind_held &&
+    bool direct_hold = !no_hold && (!compute_queue || hold_compute) && kind_held &&
                              buffer_cache.GetDirectMemory() != nullptr &&
                              DirectReadsRecently() && !MenuBarShown(); // FIX-125, FIX-127
+#ifdef RYTY_GPU
+    // NAT-100: native mode reads all guest memory in place: graphics fences wait for the GPU.
+    direct_hold = direct_hold || (native && !compute_queue);
+#endif
     if (direct_hold && MenuBarShown()) {
         // DIAG-141: fences held while the menu bar is on screen.
         static const bool diag = [] {
@@ -2826,7 +2869,18 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     return true;
 }
 
+#ifdef RYTY_GPU
+bool Rasterizer::NativeInlineWrite(VAddr address, std::span<const u8> data) {
+    return native && native->InlineWrite(address, data);
+}
+#endif
+
 void Rasterizer::InlineDeferredWrite(VAddr address, std::span<const u8> data) {
+#ifdef RYTY_GPU
+    if (native) {
+        return; // NAT-100: native mode writes WRITE_DATA on the GPU in order (NativeInlineWrite)
+    }
+#endif
     // FIX-019: hardware performs WRITE_DATA in command order, so work after it reads the new
     // value. A deferred write reaches guest memory only after the GPU completes, through the
     // backing (no write fault, so nothing uploads it), and the GPU copy kept the old value for
@@ -5014,6 +5068,12 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     if (num_bytes == 0) {
         return;
     }
+#ifdef RYTY_GPU
+    if (native) {
+        native->FillBuffer(address, num_bytes, value, is_gds); // NAT-100
+        return;
+    }
+#endif
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
@@ -5054,6 +5114,12 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     if (num_bytes == 0) {
         return;
     }
+#ifdef RYTY_GPU
+    if (native) {
+        native->CopyBuffer(dst, src, num_bytes, dst_gds, src_gds); // NAT-100
+        return;
+    }
+#endif
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
         !buffer_cache.HasGpuImageAlias(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
@@ -5095,6 +5161,11 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
+#ifdef RYTY_GPU
+    if (native) {
+        return native->ReadGds(gds_offset); // NAT-100
+    }
+#endif
     auto* gds_buf = buffer_cache.GetGdsBuffer();
     u32 value;
     std::memcpy(&value, gds_buf->mapped_data.data() + gds_offset, sizeof(u32));
@@ -5106,6 +5177,12 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks, u64 e
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+#ifdef RYTY_GPU
+    if (native) {
+        native->OnCpuWrite(addr, size); // NAT-105: only native textures watch pages
+        return true;
+    }
+#endif
     buffer_cache.InvalidateMemory(addr, size, assume_locks, exact_write_size);
     texture_cache.InvalidateMemory(addr, size);
     return true;
@@ -5120,6 +5197,11 @@ void Rasterizer::WaitForGuard(VAddr page) {
 }
 
 bool Rasterizer::CanWriteThrough(VAddr addr, u64 size) {
+#ifdef RYTY_GPU
+    if (native) {
+        return false; // NAT-105: writes to watched pages always reach OnCpuWrite
+    }
+#endif
     const VAddr page = Common::AlignDown(addr, VAddr{4096});
     if (texture_cache.AnyImageInRegion(page, 4096)) {
         return false;
@@ -5195,6 +5277,11 @@ bool Rasterizer::IsMappedStart(VAddr address) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     tsharp_epoch.fetch_add(1, std::memory_order_release); // FIX-046
+#ifdef RYTY_GPU
+    if (native) {
+        native->OnUnmap(addr, size); // NAT-100
+    }
+#endif
     if (auto* direct = buffer_cache.GetDirectMemory()) {
         direct->OnUnmap(addr, size); // D1
     }
@@ -5223,7 +5310,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
 
-    auto& dynamic_state = scheduler.GetDynamicState();
+    auto& dynamic_state = DynState(); // NAT-101
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
 }
 
@@ -5373,14 +5460,14 @@ void Rasterizer::UpdateViewportScissorState() const {
         scissors.push_back(empty_scissor);
     }
 
-    auto& dynamic_state = scheduler.GetDynamicState();
+    auto& dynamic_state = DynState(); // NAT-101
     dynamic_state.SetViewports(viewports);
     dynamic_state.SetScissors(scissors);
 }
 
 void Rasterizer::UpdateDepthStencilState() const {
     const auto& regs = liverpool->DrawRegs();
-    auto& dynamic_state = scheduler.GetDynamicState();
+    auto& dynamic_state = DynState(); // NAT-101
 
     const auto depth_test_enabled =
         regs.depth_control.depth_enable && regs.depth_buffer.DepthValid();
@@ -5459,7 +5546,7 @@ void Rasterizer::UpdateDepthStencilState() const {
 
 void Rasterizer::UpdatePrimitiveState(const bool is_indexed, const bool quad_triangles) const {
     const auto& regs = liverpool->DrawRegs();
-    auto& dynamic_state = scheduler.GetDynamicState();
+    auto& dynamic_state = DynState(); // NAT-101
 
     const auto is_list_topology = [](const AmdGpu::PrimitiveType type) {
         const auto topology = LiverpoolToVK::PrimitiveType(type);
@@ -5497,13 +5584,13 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed, const bool quad_tri
 
 void Rasterizer::UpdateRasterizationState() const {
     const auto& regs = liverpool->DrawRegs();
-    auto& dynamic_state = scheduler.GetDynamicState();
+    auto& dynamic_state = DynState(); // NAT-101
     dynamic_state.SetLineWidth(regs.line_control.Width());
 }
 
 void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) const {
     const auto& regs = liverpool->DrawRegs();
-    auto& dynamic_state = scheduler.GetDynamicState();
+    auto& dynamic_state = DynState(); // NAT-101
     dynamic_state.SetBlendConstants(regs.blend_constants);
     dynamic_state.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
     dynamic_state.SetAttachmentFeedbackLoopEnabled(ctx->attachment_feedback_loop);

@@ -73,6 +73,14 @@ public:
         return is_compute;
     }
 
+    /// NAT-100: how the pipeline takes its descriptors (native mode binds them itself).
+    bool UsesPushDescriptors() const {
+        return uses_push_descriptors;
+    }
+    vk::DescriptorSetLayout DescriptorSetLayout() const {
+        return *desc_layout;
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
 

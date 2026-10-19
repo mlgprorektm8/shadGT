@@ -283,6 +283,11 @@ public:
         Call([=](vk::CommandBuffer cmd) { cmd.dispatch(x, y, z); });
     }
 
+    /// NAT-100: runs a recorded secondary command buffer here.
+    void executeCommands(vk::CommandBuffer secondary) const {
+        Call([=](vk::CommandBuffer cmd) { cmd.executeCommands(secondary); });
+    }
+
     void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
         Call([=](vk::CommandBuffer cmd) { cmd.dispatchIndirect(buffer, offset); });
     }

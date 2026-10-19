@@ -218,6 +218,9 @@ public:
     u8* Mapped() const override {
         return mapped;
     }
+    u64 NativeHandle() const override {
+        return reinterpret_cast<u64>(static_cast<VkBuffer>(buffer));
+    }
 
     VulkanDevice& device;
     vk::Buffer buffer;
@@ -239,6 +242,9 @@ public:
     const ImageDesc& Desc() const override {
         return desc;
     }
+    u64 NativeHandle() const override {
+        return reinterpret_cast<u64>(static_cast<VkImage>(image));
+    }
 
     VulkanDevice& device;
     ImageDesc desc;
@@ -250,6 +256,9 @@ class VulkanImageView final : public ImageView {
 public:
     VulkanImageView(VulkanDevice& device, vk::ImageView view) : device{device}, view{view} {}
     ~VulkanImageView() override;
+    u64 NativeHandle() const override {
+        return reinterpret_cast<u64>(static_cast<VkImageView>(view));
+    }
     VulkanDevice& device;
     vk::ImageView view;
 };
@@ -258,6 +267,9 @@ class VulkanSampler final : public Sampler {
 public:
     VulkanSampler(VulkanDevice& device, vk::Sampler sampler) : device{device}, sampler{sampler} {}
     ~VulkanSampler() override;
+    u64 NativeHandle() const override {
+        return reinterpret_cast<u64>(static_cast<VkSampler>(sampler));
+    }
     VulkanDevice& device;
     vk::Sampler sampler;
 };
@@ -446,6 +458,10 @@ public:
     void Collect() override;
     void UseExternalTimeline(Fence* fence, std::function<u64()> current) override;
     void RecordPendingImageInit(CommandList& list) override;
+    bool PendingImageInit() override {
+        std::scoped_lock lock{init_mutex};
+        return !pending_init.empty();
+    }
 
     /// Destroys GPU objects once the GPU has run the lists recorded so far. Those are submitted
     /// with the next submission at the latest (render jobs record during a frame and the frame is
@@ -465,6 +481,7 @@ public:
     }
     /// Queues the first layout change of a new image (UNDEFINED to GENERAL).
     void InitImageLayout(vk::Image image, vk::ImageAspectFlags aspect);
+    std::unique_ptr<Image> CreateImageFrom(const VkImageCreateInfo& image_ci, const ImageDesc& desc);
     void RecordImageInit(vk::CommandBuffer cmd, std::vector<std::pair<vk::Image, vk::ImageAspectFlags>>& images);
 
     VulkanContext ctx;
@@ -760,13 +777,28 @@ std::unique_ptr<Image> VulkanDevice::CreateImage(const ImageDesc& desc) {
         .usage = usage,
         .initialLayout = vk::ImageLayout::eUndefined,
     });
+    // An image the device can't make with this format and usage is refused here, so the caller
+    // can ask again with less usage (the driver may not reject it itself).
+    VkImageFormatProperties limits{};
+    if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceImageFormatProperties(
+            ctx.physical_device, image_ci.format, image_ci.imageType, image_ci.tiling,
+            image_ci.usage, image_ci.flags, &limits) != VK_SUCCESS ||
+        limits.maxMipLevels < desc.mips || limits.maxArrayLayers < image_ci.arrayLayers ||
+        !(limits.sampleCounts & image_ci.samples)) {
+        return nullptr;
+    }
+    return CreateImageFrom(image_ci, desc);
+}
+
+std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& image_ci,
+                                                    const ImageDesc& desc) {
     const VmaAllocationCreateInfo alloc_ci{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     VkImage image{};
     VmaAllocation allocation{};
     if (vmaCreateImage(allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr) != VK_SUCCESS) {
         return nullptr;
     }
-    InitImageLayout(image, AspectOf(format));
+    InitImageLayout(image, AspectOf(static_cast<vk::Format>(image_ci.format)));
     return std::make_unique<VulkanImage>(*this, desc, image, allocation);
 }
 
@@ -1686,6 +1718,11 @@ void VulkanCommandList::EndMarker() {
 }
 
 } // namespace
+
+std::unique_ptr<Image> CreateVulkanImage(Device& device, const VkImageCreateInfo& image_ci,
+                                         const ImageDesc& desc) {
+    return static_cast<VulkanDevice&>(device).CreateImageFrom(image_ci, desc);
+}
 
 std::unique_ptr<Device> CreateVulkanDevice(const Vulkan::Instance& instance) {
     VulkanContext context{

@@ -2458,6 +2458,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     RecordLabelWrite(
                         reinterpret_cast<VAddr>(address), std::move(label),
                         [this, address, data = std::move(data)]() mutable {
+#ifdef RYTY_GPU
+                            // NAT-100: native mode writes it on the GPU in command order.
+                            if (rasterizer && rasterizer->NativeInlineWrite(
+                                                  reinterpret_cast<VAddr>(address), data)) {
+                                return;
+                            }
+#endif
                             const u32 data_size = static_cast<u32>(data.size());
                             const std::vector<u8> value = data;
                             const bool deferred =
@@ -3214,6 +3221,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 RecordLabelWrite(
                     write_data->Address<VAddr>(), std::move(label),
                     [this, address = write_data->Address<VAddr>(), data = std::move(data)] {
+#ifdef RYTY_GPU
+                        // NAT-100: native mode writes it on the GPU in command order.
+                        if (rasterizer && rasterizer->NativeInlineWrite(address, data)) {
+                            return;
+                        }
+#endif
                         // DIAG-130 (SHADGT_DIRECT_HOLD_COMPUTE=1): with the direct renderer the
                         // label waits for the GPU like graphics labels do.
                         static const bool hold = [] {
