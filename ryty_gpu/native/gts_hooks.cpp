@@ -18,10 +18,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+#include <intrin.h>
 #include <windows.h>
 #include <fmt/format.h>
 
@@ -141,20 +143,96 @@ JobFn g_job_begin = nullptr;
 JobFn g_job_end = nullptr;
 std::atomic<u64> g_jobs{0};
 
+// Ryty's converted code reaches guest TLS through stubs in .gtcode that compute the thread
+// pointer: mov ecx, [rip + index]; mov rax, gs:[0x58]; mov rax, [rax + rcx*8];
+// lea rax, [rax + block size]. PGL keeps the current context just below it.
+struct GuestTls {
+    const u32* index = nullptr;
+    u32 block_size = 0;
+};
+GuestTls g_tls{};
+std::atomic<bool> g_tls_ok{false};
+
+GuestTls FindGuestTls(u8* exe_base) {
+    static constexpr u8 kStub[] = {0x65, 0x48, 0x8b, 0x04, 0x25, 0x58, 0x00, 0x00,
+                                   0x00, 0x48, 0x8b, 0x04, 0xc8, 0x48, 0x8d, 0x80};
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe_base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(exe_base + dos->e_lfanew);
+    const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    for (u32 i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (std::memcmp(sections[i].Name, ".gtcode", 8) != 0) {
+            continue;
+        }
+        const u8* begin = exe_base + sections[i].VirtualAddress;
+        const u8* end = begin + sections[i].Misc.VirtualSize;
+        for (const u8* p = begin + 6; p + sizeof(kStub) + 4 <= end; ++p) {
+            if (p[-6] == 0x8b && p[-5] == 0x0d && std::memcmp(p, kStub, sizeof(kStub)) == 0) {
+                s32 rel;
+                std::memcpy(&rel, p - 4, sizeof(rel));
+                GuestTls tls;
+                tls.index = reinterpret_cast<const u32*>(p + rel);
+                std::memcpy(&tls.block_size, p + sizeof(kStub), sizeof(tls.block_size));
+                return tls;
+            }
+        }
+    }
+    return {};
+}
+
+u8* CurrentPglContext() {
+    auto* const* blocks = reinterpret_cast<u8* const*>(__readgsqword(0x58));
+    u8* const tp = blocks[*g_tls.index] + g_tls.block_size;
+    return *reinterpret_cast<u8**>(tp - 8);
+}
+
+// PGL creates a job by forking the current context (returns the child context): the parent's
+// commands stop at a 16-byte link slot that will lead into the child's commands and go on after
+// it, linked after the child's last chunk (NAT-006).
+constexpr u64 kPglFork = 0x1c56770;
+JobFn g_fork = nullptr;
+u64 g_exe_base = 0;
+std::atomic<u64> g_tls_mismatches{0};
+
 u64 PS4_SYSV_ABI JobBeginHook(u64 context, u64 b, u64 c, u64 d, u64 e, u64 f) {
     const u64 result = g_job_begin(context, b, c, d, e, f);
     g_jobs.fetch_add(1, std::memory_order_relaxed);
     if (ShadowEnabled()) {
+        // Job begin makes the context current: a check of the guest TLS lookup.
+        if (g_tls_ok.load(std::memory_order_relaxed) &&
+            CurrentPglContext() != reinterpret_cast<u8*>(context) &&
+            g_tls_mismatches.fetch_add(1) == 0) {
+            g_tls_ok = false;
+            LOG_ERROR(Lib_GnmDriver, "NAT-006: guest TLS lookup gives {} at job begin, not {}; "
+                                     "forks are not followed",
+                      fmt::ptr(CurrentPglContext()), fmt::ptr(reinterpret_cast<u8*>(context)));
+        }
         ShadowJobBegin(reinterpret_cast<const u8*>(context) + kPglContextDcb);
     }
     return result;
+}
+
+u64 PS4_SYSV_ABI ForkHook(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
+    if (!ShadowEnabled() || !g_tls_ok.load(std::memory_order_relaxed)) {
+        return g_fork(a, b, c, d, e, f);
+    }
+    const u8* parent = CurrentPglContext();
+    // The parent's command buffer pointers: begin, end, write pointer (the fork's link slot).
+    const auto* dcb = parent ? reinterpret_cast<const u32* const*>(parent + kPglContextDcb)
+                             : nullptr;
+    const u32* run_begin = dcb ? dcb[0] : nullptr;
+    const u32* run_limit = dcb ? dcb[1] : nullptr;
+    const u32* slot = dcb ? dcb[2] : nullptr;
+    const u64 caller = reinterpret_cast<u64>(__builtin_return_address(0)) - g_exe_base - 0x10000;
+    const u64 child = g_fork(a, b, c, d, e, f);
+    ShadowFork(parent, slot, run_begin, run_limit, reinterpret_cast<const u8*>(child), caller);
+    return child;
 }
 
 u64 PS4_SYSV_ABI JobEndHook(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
     if (!ShadowEnabled()) {
         return g_job_end(a, b, c, d, e, f);
     }
-    ShadowJobEnd();
+    ShadowJobEnd(g_tls_ok.load(std::memory_order_relaxed) ? CurrentPglContext() : nullptr);
     const u64 result = g_job_end(a, b, c, d, e, f);
     ShadowJobDecode();
     return result;
@@ -271,8 +349,22 @@ void InstallGtsHooks(u8* exe_base) {
                                                   reinterpret_cast<void*>(&JobEndHook),
                                                   "PGL job end"));
     installed += (g_job_begin != nullptr) + (g_job_end != nullptr);
-    std::fprintf(stderr, "[native] NAT-002: %d of %d hooks installed%s\n", installed,
-                 static_cast<int>(kDrawKinds) + static_cast<int>(kCountKinds) + 2,
+    int expected = static_cast<int>(kDrawKinds) + static_cast<int>(kCountKinds) + 2;
+    if (ShadowEnabled()) {
+        g_exe_base = reinterpret_cast<u64>(exe_base);
+        g_tls = FindGuestTls(exe_base);
+        if (g_tls.index != nullptr) {
+            g_fork = reinterpret_cast<JobFn>(HookEntry(code, exe_base, kPglFork, kPushR15,
+                                                       reinterpret_cast<void*>(&ForkHook),
+                                                       "PGL fork (job creation)"));
+            g_tls_ok = g_fork != nullptr;
+            installed += g_fork != nullptr;
+        }
+        ++expected;
+        std::fprintf(stderr, "[native] NAT-006: guest TLS index at %p, block size %#x\n",
+                     static_cast<const void*>(g_tls.index), g_tls.block_size);
+    }
+    std::fprintf(stderr, "[native] NAT-002: %d of %d hooks installed%s\n", installed, expected,
                  ShadowEnabled() ? " (NAT-003 shadow mode)" : "");
 }
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <memory>
 #include <span>
 #include <windows.h>
 
@@ -51,31 +52,102 @@ void NoteExtentHints(u32 reg_addr, u32 count_field, const u32* payload, JobExten
 } // namespace
 
 bool Readable(const void* address, size_t size) {
-    MEMORY_BASIC_INFORMATION info{};
-    if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_COMMIT ||
-        (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-        return false;
+    // The range may span several regions (separate mappings, or pages protected differently).
+    const u8* p = static_cast<const u8*>(address);
+    const u8* const end = p + size;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(p, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+            return false;
+        }
+        p = static_cast<const u8*>(info.BaseAddress) + info.RegionSize;
     }
-    return static_cast<const u8*>(address) + size <=
-           static_cast<const u8*>(info.BaseAddress) + info.RegionSize;
+    return true;
 }
 
-void WalkJob(const JobRange& job, Regs& regs, JobExtents& extents, JobVisitor& visitor,
-             WalkStats& stats) {
-    constexpr u32 kComputeFirst = 0x200;
-    constexpr u32 kComputeLast = kComputeFirst + sizeof(AmdGpu::ComputeProgram) / sizeof(u32);
-    const u32* p = job.begin;
-    // The walk stays inside the chunk it is in (16 bytes beyond the command space hold the link).
-    const u32* limit = job.first_limit + 4;
-    if (job.begin == nullptr || limit <= job.begin ||
-        !Readable(job.begin, (limit - job.begin) * sizeof(u32))) {
-        stats.bad_packet = true;
+namespace {
+
+// CLEAR_STATE: the command processor resets every register to its default
+// (AmdGpu::Regs::SetDefaults); the walk resets the graphics ones it keeps.
+void ClearState(Regs& regs) {
+    static const std::unique_ptr<Regs> defaults = [] {
+        auto r = std::make_unique<Regs>();
+        r->SetDefaults();
+        return r;
+    }();
+    constexpr std::array<std::pair<u32, u32>, 3> kRanges = {{
+        {Regs::ShRegWordOffset, 0x200},       // graphics stages (compute from 0x2E00 is apart)
+        {Regs::ContextRegWordOffset, 0x400},  // context
+        {Regs::UconfigRegWordOffset, 0x1000}, // primitive type, index type, instances...
+    }};
+    for (const auto& [first, count] : kRanges) {
+        std::memcpy(&regs.reg_array[first], &defaults->reg_array[first], count * sizeof(u32));
+    }
+}
+
+void NoteChunk(WalkStats& stats, const u32* begin, const u32* limit) {
+    if (stats.num_chunks < stats.chunks.size()) {
+        stats.chunks[stats.num_chunks] = {begin, limit};
+    }
+    ++stats.num_chunks;
+}
+
+} // namespace
+
+bool JobCursor::Fail(bool overrun, const char* reason, WalkStats& stats) {
+    (overrun ? stats.overrun : stats.bad_packet) = true;
+    stats.stop = p;
+    stats.reason = reason;
+    stats.stop_header = p != nullptr && p < limit ? *p : 0;
+    ok = false;
+    return false;
+}
+
+bool JobCursor::Start(const u32* begin, const u32* first_limit, WalkStats& stats) {
+    p = begin;
+    // 16 bytes beyond the command space hold the link to the next chunk.
+    limit = first_limit + 4;
+    ok = true;
+    if (begin == nullptr || limit <= begin || !Readable(begin, (limit - begin) * sizeof(u32))) {
+        return Fail(false, "first chunk not readable", stats);
+    }
+    NoteChunk(stats, begin, limit);
+    return true;
+}
+
+void JobCursor::SkipFork(const u32* next, const u32* next_limit, WalkStats& stats) {
+    if (!ok) {
         return;
     }
-    while (p != job.end) {
-        if (p >= limit || ++stats.packets > (1u << 22)) {
-            stats.overrun = true;
-            return;
+    ++stats.forks;
+    // Usually the job goes on right after the link slot, in the chunk the walk is in.
+    const bool in_chunk = next == p + 4 && next_limit + 4 <= limit;
+    p = next;
+    limit = next_limit + 4;
+    if (in_chunk) {
+        return;
+    }
+    if (next == nullptr || limit <= next || !Readable(next, (limit - next) * sizeof(u32))) {
+        Fail(false, "chunk after a fork not readable", stats);
+        return;
+    }
+    NoteChunk(stats, next, limit);
+}
+
+bool JobCursor::WalkTo(const u32* until, Regs& regs, JobExtents& extents, JobVisitor& visitor,
+                       WalkStats& stats) {
+    constexpr u32 kComputeFirst = 0x200;
+    constexpr u32 kComputeLast = kComputeFirst + sizeof(AmdGpu::ComputeProgram) / sizeof(u32);
+    if (!ok) {
+        return false;
+    }
+    while (p != until) {
+        if (p >= limit) {
+            return Fail(true, "walked past the chunk without reaching the end", stats);
+        }
+        if (++stats.packets > (1u << 22)) {
+            return Fail(true, "too many packets", stats);
         }
         const u32 header = *p;
         const u32 type = header >> 30;
@@ -87,8 +159,7 @@ void WalkJob(const JobRange& job, Regs& regs, JobExtents& extents, JobVisitor& v
             const u32 first = header & 0xffff;
             const u32 count = ((header >> 16) & 0x3fff) + 1;
             if (p + 1 + count > limit) {
-                stats.bad_packet = true;
-                return;
+                return Fail(false, "type-0 packet crosses the chunk end", stats);
             }
             if (first + count <= Regs::NumRegs) {
                 std::memcpy(&regs.reg_array[first], p + 1, count * sizeof(u32));
@@ -97,13 +168,12 @@ void WalkJob(const JobRange& job, Regs& regs, JobExtents& extents, JobVisitor& v
             continue;
         }
         if (type != 3) {
-            stats.bad_packet = true;
-            return;
+            return Fail(false, "type-1 packet", stats);
         }
         const u32 count = ((header >> 16) & 0x3fff) + 1; // dwords after the header
         if (p + 1 + count > limit) {
-            stats.bad_packet = true; // packets never cross a chunk's end
-            return;
+            // packets never cross a chunk's end
+            return Fail(false, "packet crosses the chunk end", stats);
         }
         const auto opcode = static_cast<PM4ItOpcode>((header >> 8) & 0xff);
         const u32* body = p + 1;
@@ -150,6 +220,10 @@ void WalkJob(const JobRange& job, Regs& regs, JobExtents& extents, JobVisitor& v
             break;
         case PM4ItOpcode::ContextControl:
             break;
+        case PM4ItOpcode::ClearState:
+            ClearState(regs);
+            ++stats.clear_states;
+            break;
         case PM4ItOpcode::DrawIndex2:
             regs.max_index_size = body[0];
             regs.index_base_address.base_addr_lo = body[1];
@@ -178,12 +252,12 @@ void WalkJob(const JobRange& job, Regs& regs, JobExtents& extents, JobVisitor& v
                 // PGL links its command chunks: the walk continues in the next one.
                 const u32* next = ib->Address<const u32>();
                 if (!Readable(next, ib->ib_size * sizeof(u32))) {
-                    stats.bad_packet = true;
-                    return;
+                    return Fail(false, "chained chunk not readable", stats);
                 }
                 ++stats.chain_links;
                 p = next;
                 limit = next + ib->ib_size;
+                NoteChunk(stats, next, limit);
                 continue;
             }
             ++stats.call_links; // not used by GT Sport's jobs; its commands are not followed
@@ -195,6 +269,15 @@ void WalkJob(const JobRange& job, Regs& regs, JobExtents& extents, JobVisitor& v
             break;
         }
         p += count + 1;
+    }
+    return true;
+}
+
+void WalkJob(const JobRange& job, Regs& regs, JobExtents& extents, JobVisitor& visitor,
+             WalkStats& stats) {
+    JobCursor cursor;
+    if (cursor.Start(job.begin, job.first_limit, stats)) {
+        cursor.WalkTo(job.end, regs, extents, visitor, stats);
     }
 }
 

@@ -51,6 +51,47 @@ struct WalkStats {
     u64 call_links = 0;
     bool bad_packet = false;
     bool overrun = false;
+    // NAT-005: where a failed walk stopped, and the chunks it went through.
+    const u32* stop = nullptr;
+    u32 stop_header = 0;
+    const char* reason = nullptr;
+    std::array<std::pair<const u32*, const u32*>, 16> chunks{}; // (begin, limit)
+    u32 num_chunks = 0;
+    u32 forks = 0;        // NAT-006: children skipped
+    u32 clear_states = 0; // CLEAR_STATE packets (registers back to their defaults)
+};
+
+/// A walk through one job's commands that stops and goes on (NAT-006). A job hands work to a child
+/// job by forking: PGL ends the job's command run with a 16-byte link slot that will lead into the
+/// child's commands, and the job's own commands go on after it (or in a fresh chunk), linked after
+/// the child's last chunk. The GPU runs the child in between, but the child is recorded on another
+/// thread and may not be finished, so the walk skips it and goes on with the job's own commands.
+class JobCursor {
+public:
+    /// Starts at the job's first chunk; false (with `stats` saying why) if it can't be read.
+    bool Start(const u32* begin, const u32* first_limit, WalkStats& stats);
+    /// Reads the job's commands up to `until` (the write pointer at a fork or at the job's end).
+    bool WalkTo(const u32* until, AmdGpu::Regs& regs, JobExtents& extents, JobVisitor& visitor,
+                WalkStats& stats);
+    /// The job forked at the point the walk reached; its commands go on at `next`, in command
+    /// space ending at `next_limit` (the command buffer's end pointer after the fork).
+    void SkipFork(const u32* next, const u32* next_limit, WalkStats& stats);
+    bool Ok() const {
+        return ok;
+    }
+    const u32* Position() const {
+        return p;
+    }
+    const u32* Limit() const {
+        return limit;
+    }
+
+private:
+    bool Fail(bool overrun, const char* reason, WalkStats& stats);
+
+    const u32* p = nullptr;
+    const u32* limit = nullptr; // the walk stays inside the chunk it is in
+    bool ok = false;
 };
 
 /// Walks the job's commands; `regs` holds the state at the start and the state at the end after.

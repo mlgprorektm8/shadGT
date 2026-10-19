@@ -23,9 +23,15 @@ bool ShadowEnabled();
 
 /// A render job began on this thread; `dcb` is its Gnm DrawCommandBuffer (fresh command chunk).
 void ShadowJobBegin(const u8* dcb);
+/// NAT-006: the PGL context current on this thread forked a child job (call after the fork):
+/// the parent's commands stopped at the link slot `slot` (its write pointer before the fork).
+/// `run_begin` and `run_limit` are the parent's command buffer begin and end pointers before
+/// the fork; `caller` is the eboot address the fork was called from (for diagnostics).
+void ShadowFork(const u8* parent_context, const u32* slot, const u32* run_begin,
+                const u32* run_limit, const u8* child_context, u64 caller);
 /// The job current on this thread is ending: call before PGL links its last chunk (its commands
 /// end at the command buffer's write pointer), and ShadowJobDecode after.
-void ShadowJobEnd();
+void ShadowJobEnd(const u8* current_context);
 void ShadowJobDecode();
 
 /// Command processor: the registers at the start of a graphics submission (the base state jobs
