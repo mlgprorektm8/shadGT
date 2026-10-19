@@ -27,8 +27,9 @@ public:
     using Clock = std::chrono::steady_clock;
     enum class Kind { Urgent, Normal, Background };
 
-    explicit BuildQueue(u32 max_background_, u32 max_boost_ = 0)
-        : max_background{max_background_}, max_boost{std::max(max_background_, max_boost_)} {}
+    explicit BuildQueue(u32 max_foreground_, u32 max_background_, u32 max_boost_ = 0)
+        : max_foreground{max_foreground_}, max_background{max_background_},
+          max_boost{std::max(max_background_, max_boost_)} {}
 
     /// PERF-098: while the splash screen shows, background jobs run on every worker and are
     /// never paused (no game draw waits for a pipeline yet).
@@ -68,7 +69,7 @@ public:
             if (stop.stop_requested()) {
                 return false;
             }
-            if (!jobs.empty()) {
+            if (!jobs.empty() && running_foreground < max_foreground) {
                 job = std::move(jobs.front());
                 jobs.pop_front();
                 is_background = false;
@@ -88,21 +89,26 @@ public:
             }
             if (!background.empty() && paused) {
                 cv.wait_until(lk, stop, pause_until, [&] {
-                    return !jobs.empty() || Clock::now() >= pause_until;
+                    return (!jobs.empty() && running_foreground < max_foreground) ||
+                           Clock::now() >= pause_until;
                 });
             } else {
                 cv.wait(lk, stop, [&] {
                     const u32 limit = boost.load(std::memory_order_relaxed) ? max_boost
                                                                             : max_background;
-                    return !jobs.empty() || (!background.empty() && running_background < limit);
+                    return (!jobs.empty() && running_foreground < max_foreground) ||
+                           (!background.empty() && running_background < limit);
                 });
             }
         }
     }
 
     void FinishedForeground() {
-        std::scoped_lock lk{mutex};
-        --running_foreground;
+        {
+            std::scoped_lock lk{mutex};
+            --running_foreground;
+        }
+        cv.notify_one();
     }
 
     /// PERF-101: no draw or read-ahead build is queued or running.
@@ -136,6 +142,7 @@ public:
     }
 
 private:
+    const u32 max_foreground;
     const u32 max_background;
     const u32 max_boost;
     std::atomic<bool> boost{false};

@@ -229,9 +229,11 @@ PrecompileProgress GetPrecompileProgress() {
 // PERF-038: stored pipelines are built in the background on a few of them, at low priority.
 class PipelineCache::PipelineBuildWorkers {
 public:
-    PipelineBuildWorkers() : queue{std::max(1u, NumWorkers() / 4), AllCores()} {
-        // PERF-102: a worker for every core, the ones past NumWorkers() only for the precompile
-        // on the splash screen (the queue's boost).
+    PipelineBuildWorkers()
+        : queue{CompileConcurrency(), std::max(1u, NumWorkers() / 4), CompileConcurrency()} {
+        // PERF-102: extra workers precompile on the splash screen (the queue's boost), but keep
+        // concurrent driver pipeline compilations bounded. Large bursts can overwhelm the driver
+        // while the game and its pipeline linker are already using the GPU.
         for (u32 i = 0; i < AllCores(); ++i) {
             threads.emplace_back([this](std::stop_token stop) { Work(stop); });
         }
@@ -271,6 +273,13 @@ private:
         const u32 cores = std::max(std::thread::hardware_concurrency(), 4u);
         // PERF-021: all but two cores (the command thread and the game's own main thread).
         return std::clamp(cores - 2, 2u, 14u);
+    }
+
+    static u32 CompileConcurrency() {
+        // Keep driver pipeline creation to a small burst even on large CPUs. Four concurrent
+        // builds still use the parallel compiler without sending a dozen expensive requests to
+        // the graphics driver at once.
+        return std::clamp(AllCores() / 3, 2u, 4u);
     }
 
     void Work(std::stop_token stop) {
