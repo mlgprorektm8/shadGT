@@ -205,6 +205,9 @@ void GameController::SetTouchpadState(int touch_index, bool touch_down, float x,
 void GameController::ConnectController(SDL_Gamepad* pad) {
     std::lock_guard lock{m_state_mutex};
     m_sdl_gamepad = pad;
+    m_trigger_initialized = false;
+    m_trigger_failed = false;
+    m_trigger_sent = 0;
     if (override_colour) {
         SetLightBarRGB({});
     }
@@ -222,8 +225,19 @@ void GameController::ConnectController(SDL_Gamepad* pad) {
 
 void GameController::DisconnectController() {
     std::lock_guard lock{m_state_mutex};
+    if (m_sdl_gamepad) {
+        if (SDL_GetGamepadType(m_sdl_gamepad) == SDL_GAMEPAD_TYPE_PS5) {
+            const auto stop = TriggerFeedback::DualSensePacket(TriggerFeedback::Vibration(0),
+                                                               TriggerFeedback::Vibration(0));
+            SDL_SendGamepadEffect(m_sdl_gamepad, stop.data(), static_cast<int>(stop.size()));
+        } else if (SDL_GetBooleanProperty(SDL_GetGamepadProperties(m_sdl_gamepad),
+                       SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false)) {
+            SDL_RumbleGamepadTriggers(m_sdl_gamepad, 0, 0, 0);
+        }
+    }
     m_states_queue.Clear();
     m_sdl_gamepad = nullptr;
+    m_trigger_initialized = false;
 
     const u8 connected_count = m_state.connected_count;
     m_state = {};
@@ -317,6 +331,38 @@ bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
     return true;
 }
 
+void GameController::SetTriggerFeedback(const TriggerFeedback::Effect& left,
+                                       const TriggerFeedback::Effect& right,
+                                       u8 leftRumble, u8 rightRumble) {
+    std::lock_guard lock{m_state_mutex};
+    if (!m_sdl_gamepad) return;
+    const bool dualsense = SDL_GetGamepadType(m_sdl_gamepad) == SDL_GAMEPAD_TYPE_PS5;
+    if (!dualsense && !SDL_GetBooleanProperty(SDL_GetGamepadProperties(m_sdl_gamepad),
+                           SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false)) return;
+    const auto packet = TriggerFeedback::DualSensePacket(left, right);
+    const u16 low = u16{leftRumble} * 257, high = u16{rightRumble} * 257;
+    const u64 now = SDL_GetTicks();
+    const bool stopping = TriggerFeedback::stopping.load();
+    // Failed output retries once per second, never once per 4 ms input tick.
+    if (!stopping && m_trigger_failed && now - m_trigger_sent < 1000) return;
+    const bool changed = !m_trigger_initialized || (dualsense ? packet != m_trigger_packet
+                                        : low != m_trigger_left || high != m_trigger_right);
+    const bool refresh = !dualsense && (low || high) && now - m_trigger_sent >= 250;
+    if (!changed && !refresh) return;
+    const bool sent = dualsense
+        ? SDL_SendGamepadEffect(m_sdl_gamepad, packet.data(), static_cast<int>(packet.size()))
+        : SDL_RumbleGamepadTriggers(m_sdl_gamepad, low, high, 500);
+    m_trigger_sent = now;
+    if (!sent && !m_trigger_failed) LOG_DEBUG(Input, "Trigger feedback unavailable: {}", SDL_GetError());
+    m_trigger_failed = !sent;
+    if (sent) {
+        m_trigger_packet = packet;
+        m_trigger_left = low;
+        m_trigger_right = high;
+        m_trigger_initialized = true;
+    }
+}
+
 static bool is_first_check = true;
 
 int (*g_preferred_controller_slot)(u16 vendor, u16 product, int nth) = nullptr;
@@ -344,8 +390,8 @@ void GameControllers::TryOpenSDLControllers() {
                 }
             }
             if (!still_connected) {
-                SDL_CloseGamepad(pad);
                 controllers[i]->DisconnectController();
+                SDL_CloseGamepad(pad);
                 controllers[i]->user_id = -1;
                 slot_taken[i] = false;
             }

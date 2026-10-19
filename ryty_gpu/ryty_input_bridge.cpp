@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <thread>
+#include <nlohmann/json.hpp>
 
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -186,6 +187,25 @@ std::uint8_t ClampAxis(s32 value) {
     return static_cast<std::uint8_t>(value < 0 ? 0 : (value > 255 ? 255 : value));
 }
 
+unsigned TriggerStrength() {
+    // The launcher writes per-game Input settings. Read at most once per second,
+    // so the slider can be adjusted while driving without restarting the game.
+    static auto next = std::chrono::steady_clock::time_point{};
+    static unsigned percent = 100;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) return percent;
+    next = now + std::chrono::seconds(1);
+    const auto config = nlohmann::json::parse(ReadGameConfig(), nullptr, false);
+    if (config.is_discarded() || !config.is_object()) return percent;
+    const auto input = config.find("Input");
+    if (input == config.end() || !input->is_object()) return percent = 100;
+    const auto value = input->find("trigger_strength");
+    if (value == input->end() || !value->is_number_integer()) return percent = 100;
+    // Clamp using a wide type before conversion, including hand-edited JSON.
+    if (value->is_number_unsigned()) return percent = static_cast<unsigned>(std::min(value->get<std::uint64_t>(), std::uint64_t{200}));
+    return percent = static_cast<unsigned>(std::clamp(value->get<std::int64_t>(), std::int64_t{0}, std::int64_t{200}));
+}
+
 void ForwardInput() {
     HMODULE pad = GetModuleHandleA("libScePad.prx");
     const auto publish = pad ? reinterpret_cast<PublishFn>(GetProcAddress(pad, "MCBKDgnIVB8")) : nullptr;
@@ -266,6 +286,31 @@ void ForwardInput() {
                 }
                 previous = output;
             }
+            // Telemetry describes the locally driven car (player 1 only). Explicit
+            // game trigger commands take priority, including an explicit release.
+            const unsigned strength = TriggerStrength();
+            const auto feedback = slot == 0 ? Input::TriggerFeedback::CurrentOutput(strength)
+                                           : Input::TriggerFeedback::Output{};
+            u8 left_rumble = feedback.left_rumble, right_rumble = feedback.right_rumble;
+            auto left = feedback.left, right = feedback.right;
+            const auto& saved = last_output[slot];
+            if (saved.triggerTouched) {
+                std::copy_n(saved.trigger[0].effect, 11, left.begin());
+                std::copy_n(saved.trigger[1].effect, 11, right.begin());
+                // An untouched side is a release rather than an all-zero vendor command.
+                if (!saved.trigger[0].valid) left = Input::TriggerFeedback::Vibration(0);
+                if (!saved.trigger[1].valid) right = Input::TriggerFeedback::Vibration(0);
+                left = Input::TriggerFeedback::ScaleEffect(left, strength);
+                right = Input::TriggerFeedback::ScaleEffect(right, strength);
+                left_rumble = Input::TriggerFeedback::Scale(saved.trigger[0].fallback, strength);
+                right_rumble = Input::TriggerFeedback::Scale(saved.trigger[1].fallback, strength);
+            }
+            const char* triggers = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
+            if ((triggers && triggers[0] == '0') || Input::TriggerFeedback::stopping) {
+                left = right = Input::TriggerFeedback::Vibration(0);
+                left_rumble = right_rumble = 0;
+            }
+            controller.SetTriggerFeedback(left, right, left_rumble, right_rumble);
             const auto state = controller.ReadState();
             RytyPadInputState input{};
             input.buttons = static_cast<std::uint32_t>(state.buttonsState);

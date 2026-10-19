@@ -14,6 +14,7 @@
 #include "common/ring_buffer_queue.h"
 #include "core/libraries/pad/pad.h"
 #include "core/libraries/system/userservice.h"
+#include "input/trigger_feedback.h"
 
 namespace Input {
 
@@ -104,6 +105,8 @@ public:
     Colour GetLightBarRGB();
     void PollLightColour();
     bool SetVibration(u8 smallMotor, u8 largeMotor);
+    void SetTriggerFeedback(const TriggerFeedback::Effect& left,
+                            const TriggerFeedback::Effect& right, u8 leftRumble, u8 rightRumble);
     void SetTouchpadState(int touchIndex, bool touchDown, float x, float y);
     // IPC-injected pad state, merged into what the game reads for hold_frames presented frames:
     // buttons are OR'd with real input, a stick axis away from centre or a trigger above the real
@@ -137,6 +140,11 @@ private:
     } m_injection;
 
     std::mutex m_state_mutex;
+    std::array<u8, 47> m_trigger_packet{};
+    u16 m_trigger_left{}, m_trigger_right{};
+    u64 m_trigger_sent{};
+    bool m_trigger_initialized{};
+    bool m_trigger_failed{};
     RingBufferQueue<State> m_states_queue;
 };
 

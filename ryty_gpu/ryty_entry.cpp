@@ -80,6 +80,13 @@ void RunWindowThread() {
         window.WaitEvent();
     }
     // The window was closed: end the game without DLL teardown (see Emulator::Shutdown).
+    // Stop trigger effects before the deliberate TerminateProcess skips SDL cleanup.
+    Input::TriggerFeedback::stopping = true;
+    const auto released = Input::TriggerFeedback::Vibration(0);
+    for (int slot = 0; slot < 4; ++slot) {
+        (*controllers)[slot]->SetTriggerFeedback(released, released, 0, 0);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Flush queued HID releases.
     TerminateProcess(GetCurrentProcess(), 0);
 }
 

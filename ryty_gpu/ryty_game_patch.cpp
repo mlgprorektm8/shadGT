@@ -28,6 +28,7 @@
 #include "common/perf_monitor.h"
 #include "common/types.h"
 #include "core/debug_state.h"
+#include "input/trigger_feedback.h"
 
 namespace Vulkan {
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
@@ -993,7 +994,33 @@ void InstallMirrorHalfRate(u8* base) {
                       {std::begin(call), std::end(call)}, "GTS-008 rear-view mirror at half rate"});
 }
 
+namespace {
+using TelemetryUpdateFn = void(PS4_SYSV_ABI*)(void*, void*);
+TelemetryUpdateFn g_telemetry_update{};
+void PS4_SYSV_ABI TelemetryUpdateHook(void* service, void* context) {
+    g_telemetry_update(service, context);
+    Input::TriggerFeedback::Publish(static_cast<const u8*>(service) + 0x1dc);
+}
+void InstallTriggerTelemetry(u8* base) {
+    // CUSA03220 v1.69: SimulatorInterface::update virtual slot, converter RVA.
+    // Validate both the slot and packet-builder magic before touching the table.
+    auto* slot = reinterpret_cast<TelemetryUpdateFn*>(base + 0x2858390);
+    auto original = reinterpret_cast<TelemetryUpdateFn>(base + 0x68cf20);
+    const u8 magic[] = {0xc7, 0x87, 0xdc, 0x01, 0, 0, 0x30, 0x53, 0x37, 0x47};
+    if (*slot != original || std::memcmp(base + 0x68cf53, magic, sizeof(magic)) != 0) return;
+    const char* enabled = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
+    if (enabled && enabled[0] == '0') return;
+    DWORD protection;
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) return;
+    g_telemetry_update = original;
+    *slot = &TelemetryUpdateHook;
+    DWORD ignored;
+    VirtualProtect(slot, sizeof(*slot), protection, &ignored);
+}
+} // namespace
+
 void RytyApplyGamePatches() {
+    InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops
