@@ -15,6 +15,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -526,6 +527,14 @@ public:
 
     /// Recycles command lists and frees objects the GPU has finished with.
     virtual void Collect() = 0;
+
+    /// For lists another renderer submits (secondary lists run in its command buffers): GPU
+    /// progress is read from `fence`, and `current` gives the value the work recorded now will
+    /// signal. Deferred destruction then follows that timeline instead of Queue::Submit's.
+    virtual void UseExternalTimeline(Fence* fence, std::function<u64()> current) = 0;
+    /// Records the first layout change of the images created since the last call (Queue::Submit
+    /// does it on its own); for lists another renderer runs, before any list using the images.
+    virtual void RecordPendingImageInit(CommandList& list) = 0;
 };
 
 } // namespace Native::Rhi

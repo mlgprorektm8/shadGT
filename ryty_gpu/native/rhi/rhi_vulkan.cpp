@@ -444,20 +444,28 @@ public:
         return queue;
     }
     void Collect() override;
+    void UseExternalTimeline(Fence* fence, std::function<u64()> current) override;
+    void RecordPendingImageInit(CommandList& list) override;
 
     /// Destroys GPU objects once the GPU has run the lists recorded so far. Those are submitted
     /// with the next submission at the latest (render jobs record during a frame and the frame is
     /// submitted once), so one more submission is a safe margin.
     void Retire(std::function<void()>&& destroy) {
+        const u64 now = external_current ? external_current()
+                                         : submitted.load(std::memory_order_relaxed);
         std::scoped_lock lock{retire_mutex};
-        retired.push_back({submitted.load(std::memory_order_relaxed) + 2, std::move(destroy)});
+        retired.push_back({now + 2, std::move(destroy)});
     }
     u64 CompletedTick() const {
+        if (external_fence) {
+            return external_fence->Completed();
+        }
         const auto [result, value] = device.getSemaphoreCounterValue(timeline);
         return result == vk::Result::eSuccess ? value : 0;
     }
-    /// Records the first layout change of new images; runs before the next submission.
+    /// Queues the first layout change of a new image (UNDEFINED to GENERAL).
     void InitImageLayout(vk::Image image, vk::ImageAspectFlags aspect);
+    void RecordImageInit(vk::CommandBuffer cmd, std::vector<std::pair<vk::Image, vk::ImageAspectFlags>>& images);
 
     VulkanContext ctx;
     vk::Device device;
@@ -475,7 +483,9 @@ public:
     std::mutex init_mutex;
     vk::CommandPool init_pool;
     std::deque<std::pair<u64, vk::CommandBuffer>> init_used; // (tick, buffer)
-    vk::CommandBuffer init_cmd;
+    std::vector<std::pair<vk::Image, vk::ImageAspectFlags>> pending_init;
+    Fence* external_fence = nullptr;
+    std::function<u64()> external_current;
 };
 
 VulkanBuffer::~VulkanBuffer() {
@@ -672,46 +682,53 @@ std::unique_ptr<Buffer> VulkanDevice::ImportHostMemory(void* memory, u64 size, u
 
 void VulkanDevice::InitImageLayout(vk::Image image, vk::ImageAspectFlags aspect) {
     std::scoped_lock lock{init_mutex};
-    if (!init_cmd) {
-        const u64 completed = CompletedTick();
-        if (!init_used.empty() && init_used.front().first <= completed) {
-            init_cmd = init_used.front().second;
-            init_used.pop_front();
-            std::ignore = init_cmd.reset();
-        } else {
-            const auto [result, buffers] = device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{
-                .commandPool = init_pool,
-                .level = vk::CommandBufferLevel::ePrimary,
-                .commandBufferCount = 1,
-            });
-            ASSERT(result == vk::Result::eSuccess);
-            init_cmd = buffers[0];
-        }
-        std::ignore = init_cmd.begin(vk::CommandBufferBeginInfo{
-            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    pending_init.emplace_back(image, aspect);
+}
+
+void VulkanDevice::RecordImageInit(vk::CommandBuffer cmd,
+                                   std::vector<std::pair<vk::Image, vk::ImageAspectFlags>>& images) {
+    std::vector<vk::ImageMemoryBarrier2> barriers;
+    barriers.reserve(images.size());
+    for (const auto& [image, aspect] : images) {
+        barriers.push_back({
+            .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange{
+                .aspectMask = aspect,
+                .baseMipLevel = 0,
+                .levelCount = VK_REMAINING_MIP_LEVELS,
+                .baseArrayLayer = 0,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            },
         });
     }
-    const vk::ImageMemoryBarrier2 barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .oldLayout = vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eGeneral,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = image,
-        .subresourceRange{
-            .aspectMask = aspect,
-            .baseMipLevel = 0,
-            .levelCount = VK_REMAINING_MIP_LEVELS,
-            .baseArrayLayer = 0,
-            .layerCount = VK_REMAINING_ARRAY_LAYERS,
-        },
-    };
-    init_cmd.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &barrier,
-    });
+    if (!barriers.empty()) {
+        cmd.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+            .pImageMemoryBarriers = barriers.data(),
+        });
+    }
+    images.clear();
+}
+
+void VulkanDevice::RecordPendingImageInit(CommandList& list) {
+    std::vector<std::pair<vk::Image, vk::ImageAspectFlags>> images;
+    {
+        std::scoped_lock lock{init_mutex};
+        images.swap(pending_init);
+    }
+    RecordImageInit(static_cast<VulkanCommandList&>(list).cmd, images);
+}
+
+void VulkanDevice::UseExternalTimeline(Fence* fence, std::function<u64()> current) {
+    external_fence = fence;
+    external_current = std::move(current);
 }
 
 std::unique_ptr<Image> VulkanDevice::CreateImage(const ImageDesc& desc) {
@@ -1202,8 +1219,27 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
     std::vector<vk::CommandBuffer> buffers;
     buffers.reserve(lists.size() + 1);
     std::unique_lock init_lock{device.init_mutex};
-    vk::CommandBuffer init_cmd = std::exchange(device.init_cmd, vk::CommandBuffer{});
-    if (init_cmd) {
+    vk::CommandBuffer init_cmd{};
+    if (!device.pending_init.empty()) {
+        const u64 completed = device.CompletedTick();
+        if (!device.init_used.empty() && device.init_used.front().first <= completed) {
+            init_cmd = device.init_used.front().second;
+            device.init_used.pop_front();
+            std::ignore = init_cmd.reset();
+        } else {
+            const auto [result, allocated] =
+                device.device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{
+                    .commandPool = device.init_pool,
+                    .level = vk::CommandBufferLevel::ePrimary,
+                    .commandBufferCount = 1,
+                });
+            ASSERT(result == vk::Result::eSuccess);
+            init_cmd = allocated[0];
+        }
+        std::ignore = init_cmd.begin(vk::CommandBufferBeginInfo{
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        });
+        device.RecordImageInit(init_cmd, device.pending_init);
         std::ignore = init_cmd.end();
         buffers.push_back(init_cmd);
     }

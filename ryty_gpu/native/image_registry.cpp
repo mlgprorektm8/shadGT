@@ -57,11 +57,9 @@ Rhi::ImageDesc DescOf(const VideoCore::ImageInfo& info, bool render_target, bool
     desc.mips = std::max<u32>(info.resources.levels, 1);
     desc.layers = std::max<u32>(info.resources.layers, 1);
     desc.samples = std::max(info.num_samples, 1u);
+    // As in shadGT's texture cache, 1D images are 2D and cube maps are 2D arrays: the shader
+    // translator declares them that way.
     switch (info.type) {
-    case AmdGpu::ImageType::Color1D:
-    case AmdGpu::ImageType::Color1DArray:
-        desc.dim = Rhi::ImageDim::D1;
-        break;
     case AmdGpu::ImageType::Color3D:
         desc.dim = Rhi::ImageDim::D3;
         desc.depth = std::max(info.size.depth, 1u);
