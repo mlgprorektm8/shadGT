@@ -296,7 +296,8 @@ void WindowSDL::WaitEvent() {
         }
         break;
     case SDL_EVENT_CHANGE_CONTROLLER:
-        UNREACHABLE_MSG("todo");
+        // ryGT: the player ports changed in the in-game Controllers window.
+        controllers.ReassignAll();
         break;
     case SDL_EVENT_TOGGLE_SIMPLE_FPS:
         Overlay::ToggleSimpleFps();
@@ -424,6 +425,13 @@ void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
 }
 
 void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
+#ifdef RYTY_GPU
+    // ryGT: a gamepad without a player port (more than 2 connected, opened only by the overlay's
+    // navigation) plays no part (its port index would be out of range).
+    if (controllers.GetGamepadIndexFromJoystickId(event->gbutton.which) >= 5) {
+        return;
+    }
+#endif
     bool input_down = event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION ||
                       event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
     Input::InputEvent input_event = Input::InputBinding::GetInputEventFromSDLEvent(*event);

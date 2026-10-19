@@ -167,6 +167,7 @@ public:
         return controllers[i];
     }
     void TryOpenSDLControllers();
+    void ReassignAll();
     u8 GetGamepadIndexFromJoystickId(SDL_JoystickID id);
     static std::optional<u8> GetControllerIndexFromUserID(s32 user_id);
     static std::optional<u8> GetControllerIndexFromControllerID(s32 controller_id);

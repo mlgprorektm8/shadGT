@@ -375,6 +375,13 @@ void GameControllers::TryOpenSDLControllers() {
 
     std::unordered_set<SDL_JoystickID> assigned_ids;
     std::array<bool, 4> slot_taken{false, false, false, false};
+#ifdef RYTY_GPU
+    // ryGT: GT Sport's Split Screen is for 2 players, so only 2 controller ports; more controllers
+    // stay unassigned until a port is free.
+    constexpr int slots = 2;
+#else
+    constexpr int slots = 4;
+#endif
 
     for (int i = 0; i < 4; i++) {
         SDL_Gamepad* pad = controllers[i]->m_sdl_gamepad;
@@ -430,8 +437,9 @@ void GameControllers::TryOpenSDLControllers() {
             continue;
         }
 
-        const int first = preferred[j] >= 0 && preferred[j] < 4 ? preferred[j] : 0;
-        for (int k = 0; k < 5; k++) {
+        const int first = preferred[j] >= 0 && preferred[j] < slots ? preferred[j] : 0;
+        bool assigned = false;
+        for (int k = 0; k < slots + 1; k++) {
             const int i = k == 0 ? first : k - 1;
             if (!slot_taken[i]) {
                 auto u = UserManagement.GetUserByPlayerIndex(i + 1);
@@ -465,8 +473,13 @@ void GameControllers::TryOpenSDLControllers() {
                                   c->user_id);
                     }
                 }
+                assigned = true;
                 break;
             }
+        }
+        if (!assigned) {
+            // No free port (ryGT has 2): closed again, so it can take a port that frees up.
+            SDL_CloseGamepad(pad);
         }
     }
     if (is_first_check) [[unlikely]] {
@@ -480,6 +493,26 @@ void GameControllers::TryOpenSDLControllers() {
     }
     SDL_free(new_joysticks);
 }
+// ryGT: the player ports changed (the in-game Controllers window): every gamepad leaves its port
+// and the ports are filled again with the new choices. A port left without a gamepad keeps the
+// keyboard (player 1).
+void GameControllers::ReassignAll() {
+    for (int i = 0; i < 4; i++) {
+        if (SDL_Gamepad* pad = controllers[i]->m_sdl_gamepad) {
+            controllers[i]->DisconnectController();
+            SDL_CloseGamepad(pad);
+            controllers[i]->user_id = -1;
+        }
+    }
+    TryOpenSDLControllers();
+    if (controllers[0]->m_sdl_gamepad == nullptr) {
+        if (auto* u = UserManagement.GetUserByPlayerIndex(1)) {
+            controllers[0]->user_id = u->user_id;
+            controllers[0]->ConnectController(nullptr);
+        }
+    }
+}
+
 u8 GameControllers::GetGamepadIndexFromJoystickId(SDL_JoystickID id) {
     auto g = SDL_GetGamepadFromID(id);
     ASSERT(g != nullptr);

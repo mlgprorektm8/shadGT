@@ -39,6 +39,7 @@
 #include "imgui/invitation_prompt_layer.h"
 #include "imgui/notifications_layer.h"
 #include "imgui/shadnet_notifications_layer.h"
+#include "ryty_gpu/ryty_input_bridge.h"
 #include "ryty_gpu/ryty_library.h"
 
 namespace Ryty {
@@ -234,7 +235,10 @@ void Unregister() {}
 } // namespace ImGui::ShadNetNotify
 
 namespace ImGuiEmuSettings {
-void OpenInGameSettingsDialog() {}
+// ryGT: the settings hotkey (F3) opens the in-game Controllers window.
+void OpenInGameSettingsDialog() {
+    Ryty::ToggleControllerOverlay();
+}
 } // namespace ImGuiEmuSettings
 
 namespace shadNotifications {

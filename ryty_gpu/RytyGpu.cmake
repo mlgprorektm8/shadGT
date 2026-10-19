@@ -100,6 +100,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
         src/core/debug_state.cpp
         ryty_gpu/ryty_entry.cpp
         ryty_gpu/ryty_input_bridge.cpp
+        ryty_gpu/ryty_controller_overlay.cpp
         ryty_gpu/ryty_write_watch.cpp
         # Stutter diagnostics (RYGT_DIAG=1), ryty_diag.h.
         ryty_gpu/ryty_diag.cpp

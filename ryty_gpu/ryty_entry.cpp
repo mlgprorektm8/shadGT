@@ -228,6 +228,7 @@ void DrawCompileNotice() {
 }
 
 void DrawFpsCounter() {
+    Ryty::DrawControllerOverlay();
     DrawPrecompileProgress();
     if (!Vulkan::GetPrecompileProgress().active) {
         DrawCompileNotice();

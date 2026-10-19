@@ -14,12 +14,19 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <map>
+#include <mutex>
 #include <thread>
+#include <vector>
 #include <nlohmann/json.hpp>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_gamepad.h>
 
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "input/controller.h"
+#include "input/input_handler.h"
 #include "video_core/renderdoc.h"
 #include "ryty_gpu/ryty_input_bridge.h"
 
@@ -137,14 +144,20 @@ void RunTestScript(std::string script) {
 using PublishFn = void (*)(const RytyPadInputState&);
 // libScePad.prx: PadFetchOutput (Microsoft ABI, exported by NID); true when the output changed.
 using FetchOutputFn = bool (*)(std::uint32_t*, RytyPadOutputState*);
-// Per player (slot 0-3) versions: PadPublishInputSlot, PadFetchOutputSlot, and PadSetConnectedSlots
-// (bit N: player N+1 has a controller). libSceUserService.prx: UserServiceSetPlayers logs players
-// 2-4 in and out with the same mask.
+// Per player (slot 0-1) versions: PadPublishInputSlot, PadFetchOutputSlot, and PadSetConnectedSlots
+// (bit N: player N+1 has a controller). libSceUserService.prx: UserServiceSetPlayers logs player 2
+// in and out with the same mask.
 using PublishSlotFn = void (*)(int, const RytyPadInputState&);
 using FetchOutputSlotFn = bool (*)(int, std::uint32_t*, RytyPadOutputState*);
 using SetMaskFn = void (*)(std::uint32_t);
 
-constexpr int MaxPlayers = 4;
+// GT Sport's Split Screen is for 2 players: 2 controller ports (libScePad and libSceUserService of
+// RyGT take 2 as well).
+constexpr int MaxPlayers = 2;
+
+// The in-game Controllers window (ryty_controller_overlay.cpp) is open: the game gets released
+// controls meanwhile.
+std::atomic<bool> g_overlay_open{false};
 
 // The GT Sport config next to GTSport.exe (user/custom_configs/CUSA03220.json) as text.
 std::string ReadGameConfig() {
@@ -177,7 +190,7 @@ int KeyboardPlayer() {
         return 1;
     }
     const size_t value = text.find_first_not_of(" \t\r\n:", key + 17);
-    if (value == std::string::npos || text[value] < '1' || text[value] > '4') {
+    if (value == std::string::npos || text[value] < '1' || text[value] > '0' + MaxPlayers) {
         return 1;
     }
     return text[value] - '0';
@@ -229,7 +242,8 @@ void ForwardInput() {
              set_players ? "" : " (no player logins: libSceUserService.prx is older)");
     auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
     std::array<RytyPadInputState, MaxPlayers> last{};
-    std::array<bool, MaxPlayers> first{true, true, true, true};
+    std::array<bool, MaxPlayers> first{};
+    first.fill(true);
     std::array<std::uint32_t, MaxPlayers> output_seen{};
     std::array<RytyPadOutputState, MaxPlayers> last_output{};
     std::uint32_t last_mask = ~0u;
@@ -237,9 +251,13 @@ void ForwardInput() {
     if (keyboard_player > 1) {
         LOG_INFO(Input, "Ryty: the keyboard controls player {}", keyboard_player);
     }
+    // Holding Share/View and Options/Menu together on a controller for 0.6 s opens or closes the
+    // in-game Controllers window (as F3 does).
+    std::chrono::steady_clock::time_point combo_since{};
+    bool combo_latched = false;
     while (true) {
-        // Player 1 always plays (keyboard and first gamepad); players 2-4 while shadGT has a
-        // gamepad in their slot (the user folder's users.json lists who players 2-4 are).
+        // Player 1 always plays (keyboard and first gamepad); player 2 while shadGT has a gamepad
+        // in their slot (the user folder's users.json lists who player 2 is).
         std::uint32_t mask = 1u | (1u << (keyboard_player - 1));
         for (int slot = 1; slot < players; ++slot) {
             if ((*controllers)[slot]->m_sdl_gamepad != nullptr) {
@@ -254,6 +272,24 @@ void ForwardInput() {
             }
             last_mask = mask;
         }
+        bool combo = false;
+        for (int slot = 0; slot < MaxPlayers; ++slot) {
+            if (SDL_Gamepad* pad = (*controllers)[slot]->m_sdl_gamepad) {
+                combo |= SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK) &&
+                         SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_START);
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!combo) {
+            combo_since = {};
+            combo_latched = false;
+        } else if (combo_since == std::chrono::steady_clock::time_point{}) {
+            combo_since = now;
+        } else if (!combo_latched && now - combo_since >= std::chrono::milliseconds{600}) {
+            combo_latched = true;
+            Ryty::ToggleControllerOverlay();
+        }
+        const bool released = g_overlay_open.load(std::memory_order_relaxed);
         for (int slot = 0; slot < players; ++slot) {
             if (slot > 0 && (mask >> slot & 1u) == 0) {
                 continue;
@@ -329,6 +365,9 @@ void ForwardInput() {
                     input.analogButtonsR2 = 255;
                 }
             }
+            if (released) {
+                input = RytyPadInputState{}; // the Controllers window is open: nothing pressed
+            }
             auto& previous = last[slot];
             if (first[slot] || input.buttons != previous.buttons ||
                 input.sticks != previous.sticks ||
@@ -356,8 +395,29 @@ struct PortChoice {
     int nth = 0;
 };
 std::array<PortChoice, MaxPlayers> g_ports{};
+// The ports change from the in-game Controllers window while the window thread assigns gamepads.
+std::mutex g_ports_mutex;
+
+std::string PortKey(const PortChoice& port) {
+    if (port.vendor < 0) {
+        return {};
+    }
+    char key[32];
+    std::snprintf(key, sizeof(key), "%04x:%04x#%d", port.vendor, port.product, port.nth);
+    return key;
+}
+
+PortChoice ParsePortKey(const std::string& entry) {
+    unsigned vendor = 0, product = 0;
+    int nth = 0;
+    if (std::sscanf(entry.c_str(), "%x:%x#%d", &vendor, &product, &nth) >= 2) {
+        return {static_cast<int>(vendor), static_cast<int>(product), nth};
+    }
+    return {};
+}
 
 int PreferredSlot(u16 vendor, u16 product, int nth) {
+    std::scoped_lock lock{g_ports_mutex};
     for (int slot = 0; slot < MaxPlayers; ++slot) {
         const auto& port = g_ports[slot];
         if (port.vendor == vendor && port.product == product && port.nth == nth) {
@@ -384,23 +444,119 @@ void InstallControllerPorts() {
     }
     const std::string list = text.substr(open + 1, close - open - 1);
     size_t position = 0;
-    bool any = false;
     for (int slot = 0; slot < MaxPlayers && position <= list.size(); ++slot) {
         const size_t end = std::min(list.find(',', position), list.size());
-        const std::string entry = list.substr(position, end - position);
+        const PortChoice port = ParsePortKey(list.substr(position, end - position));
         position = end + 1;
-        unsigned vendor = 0, product = 0;
-        int nth = 0;
-        if (std::sscanf(entry.c_str(), "%x:%x#%d", &vendor, &product, &nth) >= 2) {
-            g_ports[slot] = {static_cast<int>(vendor), static_cast<int>(product), nth};
-            LOG_INFO(Input, "Ryty: player {} is controller {:04x}:{:04x} #{}", slot + 1, vendor,
-                     product, nth);
-            any = true;
+        if (port.vendor >= 0) {
+            std::scoped_lock lock{g_ports_mutex};
+            g_ports[slot] = port;
+            LOG_INFO(Input, "Ryty: player {} is controller {:04x}:{:04x} #{}", slot + 1,
+                     port.vendor, port.product, port.nth);
         }
     }
-    if (any) {
-        Input::g_preferred_controller_slot = PreferredSlot;
+    // Always: the in-game Controllers window can give ports later.
+    Input::g_preferred_controller_slot = PreferredSlot;
+}
+
+bool ControllerOverlayOpen() {
+    return g_overlay_open.load(std::memory_order_relaxed);
+}
+
+void ToggleControllerOverlay() {
+    g_overlay_open = !g_overlay_open.load();
+}
+
+std::vector<ConnectedController> ListControllers() {
+    std::vector<ConnectedController> list;
+    auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    if (!ids) {
+        return list;
     }
+    std::map<std::uint32_t, int> seen;
+    for (int i = 0; i < count; ++i) {
+        const u16 vendor = SDL_GetGamepadVendorForID(ids[i]);
+        const u16 product = SDL_GetGamepadProductForID(ids[i]);
+        const int nth = seen[(std::uint32_t{vendor} << 16) | product]++;
+        ConnectedController entry;
+        entry.key = PortKey({vendor, product, nth});
+        const char* name = SDL_GetGamepadNameForID(ids[i]);
+        entry.name = name && *name ? name : "Controller";
+        for (int slot = 0; slot < MaxPlayers; ++slot) {
+            SDL_Gamepad* pad = (*controllers)[slot]->m_sdl_gamepad;
+            if (pad && SDL_GetGamepadID(pad) == ids[i]) {
+                entry.port = slot;
+            }
+        }
+        list.push_back(std::move(entry));
+    }
+    SDL_free(ids);
+    // Same names get a number, as in the launcher.
+    std::map<std::string, int> names;
+    for (const auto& entry : list) {
+        ++names[entry.name];
+    }
+    std::map<std::string, int> numbered;
+    for (auto& entry : list) {
+        if (names[entry.name] > 1) {
+            entry.name += " (" + std::to_string(++numbered[entry.name]) + ")";
+        }
+    }
+    return list;
+}
+
+std::array<std::string, 2> ControllerPortChoices() {
+    std::scoped_lock lock{g_ports_mutex};
+    return {PortKey(g_ports[0]), PortKey(g_ports[1])};
+}
+
+int KeyboardPlayerSetting() {
+    return KeyboardPlayer();
+}
+
+void SetControllerPortChoice(int player, const std::string& key) {
+    if (player < 0 || player >= MaxPlayers) {
+        return;
+    }
+    std::string joined;
+    {
+        std::scoped_lock lock{g_ports_mutex};
+        const PortChoice choice = ParsePortKey(key);
+        // A controller plays as one player: choosing it here frees it elsewhere.
+        for (int slot = 0; slot < MaxPlayers; ++slot) {
+            if (slot != player && choice.vendor >= 0 && PortKey(g_ports[slot]) == key) {
+                g_ports[slot] = {};
+            }
+        }
+        g_ports[player] = choice;
+        for (int slot = 0; slot < MaxPlayers; ++slot) {
+            joined += (slot ? "," : "") + PortKey(g_ports[slot]);
+        }
+    }
+    LOG_INFO(Input, "Ryty: controller ports changed in game: {}", joined);
+    // Kept for the next start and the launcher (Input.controller_ports).
+    char path[MAX_PATH];
+    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (length != 0 && length < MAX_PATH) {
+        std::string file{path, length};
+        file = file.substr(0, file.find_last_of("/\\") + 1) + "user/custom_configs/CUSA03220.json";
+        auto config = nlohmann::json::parse(ReadGameConfig(), nullptr, false);
+        if (config.is_discarded() || !config.is_object()) {
+            config = nlohmann::json::object();
+        }
+        if (!config["Input"].is_object()) {
+            config["Input"] = nlohmann::json::object();
+        }
+        config["Input"]["controller_ports"] = joined;
+        std::ofstream out{file, std::ios::binary | std::ios::trunc};
+        out << config.dump();
+    }
+    // The window thread puts every gamepad in its new port.
+    SDL_Event event{};
+    event.type = SDL_EVENT_CHANGE_CONTROLLER;
+    SDL_PushEvent(&event);
 }
 
 void StartInputBridge() {
