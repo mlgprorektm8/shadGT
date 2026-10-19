@@ -68,6 +68,10 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
     if (!logger) {
         return;
     }
+#ifdef RYTY_GPU
+    // RyGT exposes a single Error level for error and critical diagnostics.
+    if (level == Level::Critical) level = Level::Error;
+#endif
     fmt::memory_buffer msg;
     fmt::vformat_to(fmt::appender(msg), format, args);
     const std::string_view fn = std::string_view(func) == "operator()" ? "lambda" : func;

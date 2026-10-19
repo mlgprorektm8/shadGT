@@ -9,7 +9,7 @@
 namespace Common::Log::StdoutLevel {
 inline constexpr unsigned Warning = 3;
 inline constexpr unsigned Default = 4;
-inline constexpr std::array<std::string_view, 6> Names{"Trace", "Debug", "Info", "Warning", "Error", "Critical"};
+inline constexpr std::array<std::string_view, 5> Names{"Trace", "Debug", "Info", "Warning", "Error"};
 
 inline std::string_view Trim(std::string_view text) {
     const auto first = text.find_first_not_of(" \t\r\n");
