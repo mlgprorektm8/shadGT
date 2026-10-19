@@ -78,11 +78,29 @@ game thread (render job)                     submit (PGL 0x1c56610 / sceGnmSubmi
 
 ## Milestones
 
-1. **N1 Hook check** (built): race run with RYGT_NATIVE_HOOKS=1, game draws = renderer draws.
-2. **N2 Backend interface + Vulkan device** in the renderer library, off by default.
-3. **N3 Shadow mode**: JobRecorders run for every job but render nothing; each draw's state is
-   compared with what the PM4 decoder sees at the same packet address. This builds the whole
-   front end against a correctness oracle with zero risk to the picture.
-4. **N4 Native mode**: the executor replaces the command processor (boot screen, menus, race).
-5. **N5 Speed**: parallel recording tuned, pipelines built ahead from the shader pack.
-6. **N6 DX12 backend.**
+1. **N1 Hook check** (built, not run yet): race run with RYGT_NATIVE_HOOKS=1, game draws =
+   renderer draws.
+2. **N2 Backend interface + Vulkan** (done, NAT-010..012): rhi.h, rhi_vulkan.cpp. Self test
+   outside the game (RytyNativeRhiSelfTest, loaded from Python): pictures, four threads
+   recording at once, secondary lists with dynamic state, 40 bindings through a descriptor set,
+   compute with specialization constants. Recording costs about 0.24 us per draw.
+3. **Image registry** (done, NAT-020/021): image_registry.cpp. Textures and render targets by
+   guest address and layout, shared by all job threads; uploads untiled on the GPU with
+   shadGT's tiling shaders; downloads re-tiled. Self test (RytyNativeImageSelfTest): exact round
+   trips for Thin1DThin, Thin2DThin and Display2DThin with mips.
+4. **N3 Shadow mode** (built, not run yet, NAT-003/004): job_walker.cpp walks each job's own
+   commands at job end; shadow.cpp compares the state at every draw with the command
+   processor's. This decides whether jobs can start from a base state (are self-contained).
+5. **N4 Native mode, hybrid first.** Job threads record each job's draws into secondary command
+   lists, split at the job's flushes, events, waits and writes. The command processor keeps
+   walking packets and handling those (fences, labels, flips, compute rings, as today), and at
+   the first draw of a recorded segment runs its list instead of decoding the draws. Vulkan v1
+   reuses shadGT's pipeline cache from the job threads (Liverpool::SetThreadDrawState gives it
+   the job's registers; selection is under its lookup lock) and binds resources natively: images
+   from the registry, buffers in place through DirectMemory's imported guest memory. Open
+   points: memory the command processor still writes through the old caches (DMA, fills) must
+   land in guest memory for in-place reads; the presenter must show native display images.
+6. **N5 Speed**: lock-free pipeline lookups for repeated draws, pipelines built ahead from the
+   shader pack.
+7. **N6 DX12**: the backend interface on D3D12, SPIR-V to DXIL, and pipelines built natively
+   (the reused Vulkan pipeline cache does not carry over).

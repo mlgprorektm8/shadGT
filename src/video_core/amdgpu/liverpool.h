@@ -102,6 +102,19 @@ public:
         submit_cv.wait(lk, [this] { return num_submits == 0; });
     }
 
+    /// PERF-031: the registers the draw pipe's recorder thread works with.
+    struct RecorderState {
+        Regs regs{};
+        ComputeProgram cs{};
+        std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
+        CbDbExtent db_extent{};
+    };
+    /// NAT-030: the calling thread's own draw registers (a native render job's, read from the
+    /// job's commands), or nullptr for the live ones. DrawRegs() and the extents follow it.
+    static void SetThreadDrawState(RecorderState* state) {
+        recorder_state = state;
+    }
+
     /// PERF-031: the registers of the draw or dispatch being recorded. On the recorder thread
     /// of the draw pipe these are its copy, up to date with that draw; otherwise the live ones.
     const Regs& DrawRegs() const {
@@ -387,12 +400,6 @@ private:
     // PERF-031: the draw pipe. The command thread decodes and keeps `regs`; draws, dispatches
     // and everything that touches the caches or writes guest memory run on the recorder thread
     // in submission order, with the registers brought up to date from regs_dirty.
-    struct RecorderState {
-        Regs regs{};
-        ComputeProgram cs{};
-        std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
-        CbDbExtent db_extent{};
-    };
     static inline thread_local RecorderState* recorder_state = nullptr;
     std::unique_ptr<RecorderState> recorder;
     std::unique_ptr<DrawPipe> draw_pipe;
