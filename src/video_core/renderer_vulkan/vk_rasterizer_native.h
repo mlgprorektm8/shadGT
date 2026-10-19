@@ -194,6 +194,10 @@ private:
     void NoteWrites(const Targets* targets, const DrawBindings& b);
     /// NAT-105: CPU writes to the pages of a range fault (once) from now on.
     void WatchPages(VAddr address, u64 size);
+    /// NAT-112: small render targets drawn into are written back to guest memory (GT Sport's
+    /// CPU reads its brightness chain there for auto exposure).
+    void FlushWritebacks();
+    std::vector<Native::ImageEntry*> writebacks;
     /// NAT-104: the picture was written now (in GPU order).
     void Written(const Native::ImageEntry* entry);
     /// NAT-104: copies the newer pictures of the render targets a texture is made of into it.
@@ -254,7 +258,7 @@ private:
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
             fills = 0, copies = 0, meta_clears = 0, inline_writes = 0, source_copies = 0,
-            draw_ns = 0, dispatch_ns = 0, gathers = 0, gathered_bytes = 0;
+            draw_ns = 0, dispatch_ns = 0, gathers = 0, gathered_bytes = 0, writebacks = 0;
         /// Images bound empty: no address or format, not mapped for the GPU, format the
         /// device lacks, bad geometry, outside guest memory, FIX-081, no image made.
         std::array<u64, 7> null_reasons{};

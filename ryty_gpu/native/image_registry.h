@@ -181,7 +181,8 @@ public:
 
     /// Records copying an image back into a buffer in its guest layout (tiled again), for
     /// guest memory the CPU reads after the GPU wrote it.
-    bool RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out);
+    bool RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
+                        u64 out_offset = 0);
 
     struct Stats {
         std::atomic<u64> lookups, hits, created_textures, created_targets, uploads, upload_bytes;

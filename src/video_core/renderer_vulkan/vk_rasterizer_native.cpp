@@ -624,6 +624,47 @@ void NativeRenderer::GlobalBarrier() {
     s.written.clear();
     s.buffers_written = false;
     ++stats.barriers;
+    FlushWritebacks();
+}
+
+void NativeRenderer::FlushWritebacks() {
+    if (writebacks.empty() || !stream.list) {
+        return;
+    }
+    Stream& s = stream;
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    const u64 alignment = r.instance.StorageMinAlignment();
+    for (auto* entry : writebacks) {
+        const VAddr address = entry->info.guest_address;
+        const u64 size = entry->info.guest_size;
+        if (!direct || !direct->EnsureImported(address, size)) {
+            continue;
+        }
+        const auto found = direct->FindBuffer(address, size);
+        if (!found || found->second % alignment != 0) {
+            continue;
+        }
+        auto out = device->WrapBuffer(
+            reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
+            found->first->SizeBytes());
+        if (registry->RecordDownload(*s.list, *entry, *out, found->second)) {
+            ++stats.writebacks;
+        }
+        s.keep.push_back(std::move(out));
+    }
+    writebacks.clear();
+    s.pipeline = vk::Pipeline{}; // the re-tiling binds its own pipeline
+    // What reads guest memory next (shaders, the CPU after the GPU) sees the pictures.
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
 }
 
 void NativeRenderer::PrepareImages() {
@@ -1474,11 +1515,23 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     if (targets) {
         for (const auto* entry : targets->colors) {
             note(entry);
+            // NAT-112: small pictures go back to guest memory.
+            constexpr u64 WritebackSize = 64_KB;
+            if (entry && entry->info.guest_size <= WritebackSize && entry->info.num_samples == 1 &&
+                std::ranges::find(writebacks, entry) == writebacks.end()) {
+                writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+            }
         }
         note(targets->depth);
     }
     for (const auto* entry : b.stored) {
         note(entry);
+        constexpr u64 WritebackSize = 64_KB; // NAT-112, as for render targets
+        if (entry->info.guest_size <= WritebackSize && entry->info.num_samples == 1 &&
+            !entry->info.props.is_depth &&
+            std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+        }
     }
     s.buffers_written |= b.writes_buffers;
 }
@@ -1914,6 +1967,7 @@ void NativeRenderer::EvictImages() {
         }
         held_versions.erase(&entry);
         std::erase(stream.written, &entry);
+        std::erase(writebacks, &entry);
     });
 }
 
@@ -1978,6 +2032,9 @@ void NativeRenderer::Splice() {
         return;
     }
     EndRendering();
+    if (!writebacks.empty()) {
+        GlobalBarrier(); // NAT-112: written back in this submission
+    }
     s.list->End();
     r.scheduler.EndRendering();
     const vk::CommandBuffer secondary = s.cmd;
@@ -2098,7 +2155,8 @@ void NativeRenderer::Report() {
              "NAT-100 native (10 s): {} draws, {} dispatches, {} skipped, {} without pipeline; "
              "{} passes, {} barriers, {} lists run; {} reads copied ({:.1f} MB), {} ranges bound "
              "empty, {} images bound empty; {} fills, {} copies, {} meta clears, {} inline "
-             "writes, {} pictures copied from targets, {} CPU writes to textures, {} ranges gathered "
+             "writes, {} pictures copied from targets, {} written back, {} CPU writes to textures, "
+             "{} ranges gathered "
              "on the GPU ({:.1f} MB), uploads from guest memory on the GPU/CPU {}/{}; images so far: "
              "{} lookups, {} textures and {} targets made, {} uploads ({:.1f} MB); {:.0f} draws/s, "
              "{:.2f} us a draw, {:.2f} us a dispatch on the recorder; images bound empty by "
@@ -2107,7 +2165,8 @@ void NativeRenderer::Report() {
              stats.draws, stats.dispatches, stats.skipped, stats.no_pipeline, stats.passes,
              stats.barriers, stats.splices, stats.copied_reads, stats.copied_bytes / 1048576.0,
              stats.unbound, stats.null_images, stats.fills, stats.copies, stats.meta_clears,
-             stats.inline_writes, stats.source_copies, stats.cpu_writes.exchange(0),
+             stats.inline_writes, stats.source_copies, stats.writebacks,
+             stats.cpu_writes.exchange(0),
              stats.gathers, stats.gathered_bytes / 1048576.0,
              registry->GetUploadStats().gpu.load(), registry->GetUploadStats().cpu.load(),
              registry_stats.lookups.load(),
@@ -2129,7 +2188,7 @@ void NativeRenderer::Report() {
     stats.barriers = stats.splices = stats.copied_reads = stats.copied_bytes = stats.unbound = 0;
     stats.null_images = stats.fills = stats.copies = stats.meta_clears = stats.inline_writes = 0;
     stats.source_copies = stats.draw_ns = stats.dispatch_ns = 0;
-    stats.gathers = stats.gathered_bytes = 0;
+    stats.gathers = stats.gathered_bytes = stats.writebacks = 0;
     stats.null_reasons = {};
     stats.phase_ns = {};
     (void)cpu_writes;

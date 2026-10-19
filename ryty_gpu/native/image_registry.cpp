@@ -741,14 +741,19 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
     return uploaded;
 }
 
-bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out) {
+bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
+                                   u64 out_offset) {
     const VideoCore::ImageInfo& info = entry.info;
     const u64 size = info.guest_size;
-    if (size == 0 || out.Size() < size) {
+    if (size == 0 || out.Size() < out_offset + size) {
         return false;
     }
     if (!info.props.is_tiled) {
-        list.CopyImageToBuffer(entry.image.get(), &out, MipCopies(info));
+        auto copies = MipCopies(info);
+        for (auto& copy : copies) {
+            copy.buffer_offset += out_offset;
+        }
+        list.CopyImageToBuffer(entry.image.get(), &out, copies);
         return true;
     }
     const Rhi::Pipeline* tile = TilingPipeline(info, true);
@@ -764,7 +769,8 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
     list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
     list.BindPipeline(tile);
     const std::array<Rhi::Binding, 3> bindings{{
-        {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = &out, .size = size},
+        {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = &out, .offset = out_offset,
+         .size = size},
         {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = linear.get(), .size = size},
         {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = params_buffer.get(),
          .size = sizeof(TilingParams)},
