@@ -21,6 +21,7 @@
 #include <xxhash.h>
 
 #include "common/logging/log.h"
+#include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/shadow.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/regs.h"
@@ -156,16 +157,6 @@ const u32* DcbCmdPtr(const u8* dcb) {
     return *reinterpret_cast<const u32* const*>(dcb + 0x10); // m_cmdptr
 }
 
-bool Readable(const void* address, size_t size) {
-    MEMORY_BASIC_INFORMATION info{};
-    if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_COMMIT ||
-        (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-        return false;
-    }
-    return static_cast<const u8*>(address) + size <=
-           static_cast<const u8*>(info.BaseAddress) + info.RegionSize;
-}
-
 void Snapshot(const u32* packet, const Regs& regs, u32 epoch) {
     Entry entry;
     HashRegs(regs.reg_array.data(), entry.hashes);
@@ -185,9 +176,20 @@ void Snapshot(const u32* packet, const Regs& regs, u32 epoch) {
     shard.map.insert_or_assign(key, std::move(entry));
 }
 
-// Reads one job's commands like the command processor does, keeping only the GPU state, and
-// records a snapshot at each draw. Chained chunks are followed; the walk ends where the job's
-// commands end.
+// Records a snapshot of the state at each draw of a job.
+class SnapshotVisitor final : public JobVisitor {
+public:
+    explicit SnapshotVisitor(u32 epoch) : epoch{epoch} {}
+    void OnDraw(const u32* packet, PM4ItOpcode, const Regs& regs, const JobExtents&) override {
+        Snapshot(packet, regs, epoch);
+    }
+
+private:
+    u32 epoch;
+};
+
+// Reads one job's commands like the command processor does (NAT-004), starting from the state
+// at the start of the latest submission, and records a snapshot at each draw.
 void Decode(const Job& job) {
     const auto start = std::chrono::steady_clock::now();
     if (!t_regs) {
@@ -207,136 +209,16 @@ void Decode(const Job& job) {
             regs.reg_array[field] = g_base->reg_array[field];
         }
     }
-    const u32 epoch = g_epoch.load(std::memory_order_relaxed);
-    constexpr u32 kComputeFirst = 0x200;
-    constexpr u32 kComputeLast = kComputeFirst + sizeof(AmdGpu::ComputeProgram) / sizeof(u32);
-    const u32* p = job.begin;
-    // The walk stays inside the chunk it is in (16 bytes beyond the command space hold the link).
-    const u32* limit = job.first_limit + 4;
-    if (job.begin == nullptr || limit <= job.begin ||
-        !Readable(job.begin, (limit - job.begin) * sizeof(u32))) {
-        ++g_stats.bad_packets;
-        return;
-    }
-    u64 packets = 0, draws = 0;
-    while (p != job.end) {
-        if (p >= limit || ++packets > (1u << 22)) {
-            ++g_stats.overruns;
-            break;
-        }
-        const u32 header = *p;
-        const u32 type = header >> 30;
-        if (type == 2) {
-            ++p;
-            continue;
-        }
-        if (type == 0) {
-            const u32 first = header & 0xffff;
-            const u32 count = ((header >> 16) & 0x3fff) + 1;
-            if (p + 1 + count > limit) {
-                ++g_stats.bad_packets;
-                break;
-            }
-            if (first + count <= Regs::NumRegs) {
-                std::memcpy(&regs.reg_array[first], p + 1, count * sizeof(u32));
-            }
-            p += count + 1;
-            continue;
-        }
-        if (type != 3) {
-            ++g_stats.bad_packets;
-            break;
-        }
-        const u32 count = ((header >> 16) & 0x3fff) + 1; // dwords after the header
-        if (p + 1 + count > limit) {
-            ++g_stats.bad_packets; // packets never cross a chunk's end
-            break;
-        }
-        const auto opcode = static_cast<PM4ItOpcode>((header >> 8) & 0xff);
-        const u32* body = p + 1;
-        const auto set_regs = [&](u32 base) {
-            const u32 offset = body[0] & 0xffff;
-            if (count > 1 && base + offset + count - 1 <= Regs::NumRegs) {
-                std::memcpy(&regs.reg_array[base + offset], body + 1, (count - 1) * sizeof(u32));
-            }
-        };
-        switch (opcode) {
-        case PM4ItOpcode::SetContextReg:
-            set_regs(Regs::ContextRegWordOffset);
-            break;
-        case PM4ItOpcode::SetShReg: {
-            const u32 offset = body[0] & 0xffff;
-            if (offset < kComputeFirst || offset > kComputeLast) {
-                set_regs(Regs::ShRegWordOffset);
-            }
-            break;
-        }
-        case PM4ItOpcode::SetUconfigReg:
-            set_regs(Regs::UconfigRegWordOffset);
-            break;
-        case PM4ItOpcode::SetConfigReg:
-            set_regs(Regs::ConfigRegWordOffset);
-            break;
-        case PM4ItOpcode::IndexType:
-            regs.index_buffer_type.raw = body[0];
-            break;
-        case PM4ItOpcode::NumInstances:
-            regs.num_instances.num_instances = body[0];
-            break;
-        case PM4ItOpcode::IndexBase:
-            regs.index_base_address.base_addr_lo = body[0];
-            regs.index_base_address.base_addr_hi = body[1];
-            break;
-        case PM4ItOpcode::IndexBufferSize:
-            regs.num_indices = body[0];
-            break;
-        case PM4ItOpcode::DrawIndex2:
-            regs.max_index_size = body[0];
-            regs.index_base_address.base_addr_lo = body[1];
-            regs.index_base_address.base_addr_hi = body[2];
-            regs.num_indices = body[3];
-            regs.draw_initiator = body[4];
-            Snapshot(p, regs, epoch);
-            ++draws;
-            break;
-        case PM4ItOpcode::DrawIndexOffset2:
-            regs.max_index_size = body[0];
-            regs.num_indices = body[2];
-            regs.draw_initiator = body[3];
-            Snapshot(p, regs, epoch);
-            ++draws;
-            break;
-        case PM4ItOpcode::DrawIndexAuto:
-            regs.num_indices = body[0];
-            regs.draw_initiator = body[1];
-            Snapshot(p, regs, epoch);
-            ++draws;
-            break;
-        case PM4ItOpcode::IndirectBuffer: {
-            const auto* ib = reinterpret_cast<const AmdGpu::PM4CmdIndirectBuffer*>(p);
-            if (ib->chain) {
-                // PGL links its command chunks: the walk continues in the next one.
-                const u32* next = ib->Address<const u32>();
-                if (!Readable(next, ib->ib_size * sizeof(u32))) {
-                    ++g_stats.bad_packets;
-                    p = job.end;
-                    continue;
-                }
-                ++g_stats.chain_links;
-                p = next;
-                limit = next + ib->ib_size;
-                continue;
-            }
-            ++g_stats.call_links; // not used by GT Sport's jobs; its commands are not followed
-            break;
-        }
-        default:
-            break;
-        }
-        p += count + 1;
-    }
-    g_stats.packets += packets;
-    g_stats.draws += draws;
+    SnapshotVisitor visitor{g_epoch.load(std::memory_order_relaxed)};
+    JobExtents extents{};
+    WalkStats walk{};
+    WalkJob({job.begin, job.first_limit, job.end}, regs, extents, visitor, walk);
+    g_stats.packets += walk.packets;
+    g_stats.draws += walk.draws;
+    g_stats.chain_links += walk.chain_links;
+    g_stats.call_links += walk.call_links;
+    g_stats.bad_packets += walk.bad_packet;
+    g_stats.overruns += walk.overrun;
     ++g_stats.jobs_decoded;
     g_stats.decode_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                              std::chrono::steady_clock::now() - start)
