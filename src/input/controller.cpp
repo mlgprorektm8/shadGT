@@ -456,19 +456,24 @@ void GameControllers::TryOpenSDLControllers() {
                 UserManagement.LoginUser(u, i + 1);
                 c->ConnectController(pad);
                 if (EmulatorSettings.IsMotionControlsEnabled()) {
-                    if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
+                    // Motion sensors are optional; only report failures for sensors the pad has.
+                    const bool has_gyro = SDL_GamepadHasSensor(c->m_sdl_gamepad, SDL_SENSOR_GYRO);
+                    if (has_gyro &&
+                        SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
                         const float poll_rate =
                             SDL_GetGamepadSensorDataRate(c->m_sdl_gamepad, SDL_SENSOR_GYRO);
                         LOG_INFO(Input, "Gyro initialized, poll rate: {}", poll_rate);
-                    } else {
+                    } else if (has_gyro) {
                         LOG_ERROR(Input, "Failed to initialize gyro controls for gamepad {}",
                                   c->user_id);
                     }
-                    if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_ACCEL, true)) {
+                    const bool has_accel = SDL_GamepadHasSensor(c->m_sdl_gamepad, SDL_SENSOR_ACCEL);
+                    if (has_accel &&
+                        SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_ACCEL, true)) {
                         const float poll_rate =
                             SDL_GetGamepadSensorDataRate(c->m_sdl_gamepad, SDL_SENSOR_ACCEL);
                         LOG_INFO(Input, "Accel initialized, poll rate: {}", poll_rate);
-                    } else {
+                    } else if (has_accel) {
                         LOG_ERROR(Input, "Failed to initialize accel controls for gamepad {}",
                                   c->user_id);
                     }
