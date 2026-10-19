@@ -203,12 +203,49 @@ private:
     Region* RegionOver(VAddr address, u64 size);
     Region* MakeRegion(VAddr address, u64 size);
     void RefreshRegion(Region& region);
+    /// NAT-150: copies in video memory of guest memory the GPU reads as vertices and indices
+    /// and the CPU leaves alone (meshes), instead of reading it over PCIe at every draw. A range
+    /// bound in a second frame is copied at the start of the next list; CPU writes to its pages
+    /// are copied in before its next use; 64 KiB granules the CPU writes in two frames (rings of
+    /// per-frame data) are read in place again for a while. Mirrors never overlap regions or
+    /// each other. RYGT_NATIVE_MIRRORS=0 turns them off; RYGT_NATIVE_MIRROR_MB is the budget.
+    struct Mirror {
+        VAddr begin = 0;
+        VAddr end = 0;
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        std::vector<VAddr> dirty_pages; ///< written by the CPU (or written back) since copied
+        u64 used_frame = 0;
+    };
+    struct MirrorCandidate {
+        VAddr end = 0;
+        u64 frame = 0; ///< when last considered
+    };
+    std::map<VAddr, Mirror> mirrors; ///< by begin; guarded by mutex
+    u64 mirror_bytes = 0;
+    std::unordered_map<VAddr, MirrorCandidate> mirror_candidates; ///< by page of the range start
+    std::vector<std::pair<VAddr, VAddr>> pending_mirrors;          ///< made at a list's start
+    std::unordered_map<u64, u64> mirror_writes;    ///< granule -> frame the CPU wrote a mirror there
+    std::unordered_map<u64, u64> dynamic_granules; ///< granule -> frame it was found CPU-written
+    /// The first mirror that may overlap memory from `begin` on.
+    std::map<VAddr, Mirror>::iterator FirstMirror(VAddr begin);
+    /// The mirror holding all of the range, if any.
+    Mirror* MirrorHolding(VAddr address, u64 size);
+    bool IsDynamic(VAddr begin, VAddr end);
+    std::optional<std::pair<vk::Buffer, u64>> MirrorBuffer(VAddr address, u64 size);
+    void RefreshMirror(Mirror& mirror);
+    void MakePendingMirrors();
+    void DropMirrors(VAddr address, u64 size);
+    /// NAT-150: what the last GuestBuffer bound (for the NAT-142 counters).
+    enum class Bound : u8 { InPlace, Region, Mirror };
+    Bound last_bound = Bound::InPlace;
     /// NAT-107: a guest range gathered on the GPU from the imported views holding it, into a
     /// buffer of the list (none when part of it is not imported).
     std::optional<std::pair<vk::Buffer, u64>> GatherOnGpu(VAddr address, u64 size);
     /// A guest range as a buffer the GPU can bind: imported guest memory read and written in
     /// place, else (reads only) a copy in upload memory.
-    std::optional<std::pair<vk::Buffer, u64>> GuestBuffer(VAddr address, u64 size, bool write);
+    /// `mirror`: read-only data worth a copy in video memory (NAT-150: vertices, indices).
+    std::optional<std::pair<vk::Buffer, u64>> GuestBuffer(VAddr address, u64 size, bool write,
+                                                          bool mirror = false);
 
     bool ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
     void BindStages(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
@@ -276,10 +313,11 @@ private:
     u64 frame = 0;
     /// NAT-142: guest memory the GPU reads or writes in place (64 KB pages, every 8th frame):
     /// vertex buffers, indices, read-only storage through the page table, other storage
-    /// buffers read, storage buffers written.
+    /// buffers read, storage buffers written; NAT-150: then what is bound from video memory
+    /// instead (mirrors, regions).
     struct InPlace {
-        std::array<std::unordered_set<u64>, 5> pages;
-        std::array<u64, 5> total{};
+        std::array<std::unordered_set<u64>, 7> pages;
+        std::array<u64, 7> total{};
         u64 frames = 0;
         void Note(u32 kind, VAddr address, u64 size) {
             if (size == 0) {
@@ -292,6 +330,10 @@ private:
     } in_place;
     bool InPlaceSampled() const {
         return (frame & 7) == 0;
+    }
+    /// NAT-150: the counter for a binding of that kind, by what GuestBuffer bound.
+    u32 BoundKind(u32 kind) const {
+        return last_bound == Bound::Mirror ? 5 : (last_bound == Bound::Region ? 6 : kind);
     }
 
     std::mutex chunk_mutex;
@@ -336,6 +378,8 @@ private:
         u64 region_refresh_pages = 0, region_refresh_ns = 0; ///< NAT-145
         u64 guest_buffer_calls = 0, guest_buffer_ns = 0;     ///< NAT-145
         u64 rewrite_fills = 0;   ///< NAT-132
+        u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,
+            mirrors_evicted = 0, mirror_over_budget = 0, mirror_refresh_pages = 0; ///< NAT-150
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
             fills = 0, copies = 0, meta_clears = 0, inline_writes = 0, source_copies = 0,

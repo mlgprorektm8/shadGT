@@ -566,6 +566,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     s.commands = 0;
     // What was recorded before this list (earlier lists, the presenter) is finished first.
     GlobalBarrier();
+    MakePendingMirrors(); // NAT-150: behind the barrier the list starts with anyway
     return s;
 }
 
@@ -696,6 +697,15 @@ void NativeRenderer::FlushWritebacks() {
                 for (VAddr page = Common::AlignDown(std::max<VAddr>(address, region->begin), 4096);
                      page < std::min<VAddr>(address + size, region->end); page += 4096) {
                     region->dirty_pages.push_back(page);
+                }
+            }
+            // NAT-150: so do mirrors.
+            for (auto it = FirstMirror(address);
+                 it != mirrors.end() && it->second.begin < address + size; ++it) {
+                Mirror& mirror = it->second;
+                for (VAddr page = Common::AlignDown(std::max<VAddr>(address, mirror.begin), 4096);
+                     page < std::min<VAddr>(address + size, mirror.end); page += 4096) {
+                    mirror.dirty_pages.push_back(page);
                 }
             }
         }
@@ -889,6 +899,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     s.buffers_written = true;
     // CPU writes to it from now on are copied in before its next use.
     WatchPages(begin, end - begin);
+    DropMirrors(begin, end - begin); // NAT-150: reads there use the region from now on
     ++stats.regions_made;
     LOG_INFO(Render_Vulkan, "NAT-114: region {:#x}+{:#x} on the GPU ({} taken in)", begin,
              end - begin, merged.size());
@@ -914,6 +925,257 @@ void NativeRenderer::SortRegionWrites() {
                 }
             }
         }
+        // NAT-150: mirrors copy the pages in before their next use, unless the CPU wrote that
+        // granule in another recent frame too: then the mirror goes and the granule is read in
+        // place for a while.
+        for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;) {
+            Mirror& mirror = it->second;
+            const VAddr from = std::max(begin, mirror.begin);
+            const VAddr to = std::min(end, mirror.end);
+            bool dynamic = false;
+            for (u64 granule = from >> 16; granule <= (to - 1) >> 16; ++granule) {
+                const auto [written, first] = mirror_writes.try_emplace(granule, frame);
+                if (!first && written->second != frame && frame - written->second < 600) {
+                    dynamic = true;
+                    dynamic_granules[granule] = frame;
+                }
+                written->second = frame;
+            }
+            if (dynamic) {
+                mirror_bytes -= mirror.end - mirror.begin;
+                ++stats.mirrors_dropped;
+                it = mirrors.erase(it); // freed once the GPU is done with it
+                continue;
+            }
+            for (VAddr page = from; page < to; page += 4096) {
+                mirror.dirty_pages.push_back(page);
+            }
+            ++it;
+        }
+    }
+    if (mirror_writes.size() > 1'000'000) {
+        mirror_writes.clear();
+    }
+}
+
+std::map<VAddr, NativeRenderer::Mirror>::iterator NativeRenderer::FirstMirror(VAddr begin) {
+    auto it = mirrors.upper_bound(begin);
+    if (it != mirrors.begin() && std::prev(it)->second.end > begin) {
+        --it;
+    }
+    return it;
+}
+
+NativeRenderer::Mirror* NativeRenderer::MirrorHolding(VAddr address, u64 size) {
+    auto it = mirrors.upper_bound(address);
+    if (it == mirrors.begin()) {
+        return nullptr;
+    }
+    Mirror& mirror = std::prev(it)->second;
+    return address >= mirror.begin && address + size <= mirror.end ? &mirror : nullptr;
+}
+
+bool NativeRenderer::IsDynamic(VAddr begin, VAddr end) {
+    constexpr u64 DynamicFrames = 600; // then the granule may be mirrored again
+    if (dynamic_granules.empty()) {
+        return false;
+    }
+    for (u64 granule = begin >> 16; granule <= (end - 1) >> 16; ++granule) {
+        const auto it = dynamic_granules.find(granule);
+        if (it == dynamic_granules.end()) {
+            continue;
+        }
+        if (frame - it->second < DynamicFrames) {
+            return true;
+        }
+        dynamic_granules.erase(it);
+    }
+    return false;
+}
+
+std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr address, u64 size) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_MIRRORS");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || size == 0 || size > 64_MB) {
+        return std::nullopt;
+    }
+    SortRegionWrites();
+    Mirror* mirror = MirrorHolding(address, size);
+    if (mirror && !mirror->dirty_pages.empty() && !stream.list) {
+        Begin(); // a new list makes the pending mirrors first (they can take this one in)
+        mirror = MirrorHolding(address, size);
+    }
+    if (mirror) {
+        RefreshMirror(*mirror);
+        mirror->used_frame = frame;
+        ++stats.mirror_binds;
+        return std::pair{vk::Buffer{Handle<VkBuffer_T>(mirror->buffer->NativeHandle())},
+                         u64{address - mirror->begin}};
+    }
+    // Not mirrored: a range bound in an earlier frame too gets a mirror at the start of the next
+    // list (read in place until then).
+    const VAddr begin = Common::AlignDown(address, 4096);
+    const VAddr end = Common::AlignUp(address + size, 4096);
+    if (mirror_candidates.size() > 65536) {
+        mirror_candidates.clear(); // per-frame data at ever-new addresses
+    }
+    const auto [it, inserted] = mirror_candidates.try_emplace(begin, MirrorCandidate{end, frame});
+    MirrorCandidate& candidate = it->second;
+    if (inserted) {
+        return std::nullopt;
+    }
+    candidate.end = std::max(candidate.end, end);
+    if (candidate.frame == frame) {
+        return std::nullopt;
+    }
+    candidate.frame = frame; // looked at again next frame at the earliest
+    if (IsDynamic(begin, candidate.end)) {
+        return std::nullopt;
+    }
+    pending_mirrors.emplace_back(begin, candidate.end);
+    mirror_candidates.erase(it);
+    return std::nullopt;
+}
+
+void NativeRenderer::RefreshMirror(Mirror& mirror) {
+    if (mirror.dirty_pages.empty()) {
+        return;
+    }
+    std::vector<VAddr> pages;
+    pages.swap(mirror.dirty_pages);
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    if (!direct) {
+        return;
+    }
+    Stream& s = Begin();
+    GlobalBarrier();
+    const vk::Buffer dst{Handle<VkBuffer_T>(mirror.buffer->NativeHandle())};
+    std::ranges::sort(pages);
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    for (const VAddr page : pages) {
+        if (page < mirror.begin || page >= mirror.end) {
+            continue;
+        }
+        direct->ForEachPart(page, std::min<u64>(4096, mirror.end - page),
+                            [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
+                                u64 bytes) {
+                                s.cmd.copyBuffer(view.Handle(), dst,
+                                                 vk::BufferCopy{.srcOffset = view_offset,
+                                                                .dstOffset = page - mirror.begin +
+                                                                             offset,
+                                                                .size = bytes});
+                            });
+        WatchPages(page, std::min<u64>(4096, mirror.end - page));
+    }
+    s.buffers_written = true;
+    stats.mirror_refresh_pages += pages.size();
+}
+
+void NativeRenderer::MakePendingMirrors() {
+    if (pending_mirrors.empty() || !stream.list) {
+        return;
+    }
+    std::vector<std::pair<VAddr, VAddr>> pending;
+    pending.swap(pending_mirrors);
+    std::ranges::sort(pending);
+    std::vector<std::pair<VAddr, VAddr>> ranges; // overlapping or touching ranges joined
+    for (const auto& [begin, end] : pending) {
+        if (!ranges.empty() && begin <= ranges.back().second) {
+            ranges.back().second = std::max(ranges.back().second, end);
+        } else {
+            ranges.emplace_back(begin, end);
+        }
+    }
+    static const u64 budget = [] {
+        const char* env = std::getenv("RYGT_NATIVE_MIRROR_MB");
+        return (env ? std::strtoull(env, nullptr, 10) : 1024) * 1_MB;
+    }();
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    Stream& s = stream;
+    bool copied = false;
+    bool evicted = false;
+    for (auto [begin, end] : ranges) {
+        if (!direct || RegionOver(begin, end - begin) || IsDynamic(begin, end)) {
+            continue; // shaders write there (the region holds it), or the CPU does
+        }
+        // The new mirror takes in the mirrors it overlaps.
+        u64 taken = 0;
+        for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end; ++it) {
+            begin = std::min(begin, it->second.begin);
+            end = std::max(end, it->second.end);
+            taken += it->second.end - it->second.begin;
+        }
+        if (end - begin > 256_MB) {
+            continue;
+        }
+        if (mirror_bytes - taken + (end - begin) > budget && !evicted) {
+            // Mirrors unused for two seconds go first.
+            evicted = true;
+            for (auto it = mirrors.begin(); it != mirrors.end();) {
+                if (it->second.used_frame + 120 < frame &&
+                    !(it->second.begin < end && it->second.end > begin)) {
+                    mirror_bytes -= it->second.end - it->second.begin;
+                    ++stats.mirrors_evicted;
+                    it = mirrors.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        if (mirror_bytes - taken + (end - begin) > budget) {
+            ++stats.mirror_over_budget;
+            continue;
+        }
+        if (!direct->EnsureImported(begin, end - begin)) {
+            continue;
+        }
+        auto buffer = device->CreateBuffer({.size = end - begin,
+                                            .usage = Native::Rhi::BufferUsageStorage |
+                                                     Native::Rhi::BufferUsageVertex |
+                                                     Native::Rhi::BufferUsageIndex |
+                                                     Native::Rhi::BufferUsageTransferSrc |
+                                                     Native::Rhi::BufferUsageTransferDst,
+                                            .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                                            .name = "native mirror"});
+        if (!buffer) {
+            continue;
+        }
+        for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;) {
+            mirror_bytes -= it->second.end - it->second.begin;
+            it = mirrors.erase(it); // freed once the GPU is done with it
+        }
+        const vk::Buffer dst{Handle<VkBuffer_T>(buffer->NativeHandle())};
+        direct->ForEachPart(begin, end - begin,
+                            [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
+                                u64 bytes) {
+                                s.cmd.copyBuffer(view.Handle(), dst,
+                                                 vk::BufferCopy{.srcOffset = view_offset,
+                                                                .dstOffset = offset,
+                                                                .size = bytes});
+                            });
+        // CPU writes to it from now on are copied in before its next use.
+        WatchPages(begin, end - begin);
+        mirror_bytes += end - begin;
+        ++stats.mirrors_made;
+        stats.mirror_made_bytes += end - begin;
+        mirrors.emplace(begin, Mirror{.begin = begin,
+                                      .end = end,
+                                      .buffer = std::move(buffer),
+                                      .dirty_pages = {},
+                                      .used_frame = frame});
+        copied = true;
+    }
+    if (copied) {
+        s.buffers_written = true; // the next draw waits for the copies
+    }
+}
+
+void NativeRenderer::DropMirrors(VAddr address, u64 size) {
+    for (auto it = FirstMirror(address); it != mirrors.end() && it->second.begin < address + size;) {
+        mirror_bytes -= it->second.end - it->second.begin;
+        it = mirrors.erase(it); // freed once the GPU is done with it
     }
 }
 
@@ -970,12 +1232,13 @@ void NativeRenderer::RefreshRegion(Region& region) {
 }
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr address, u64 size,
-                                                                      bool write) {
+                                                                      bool write, bool mirror) {
     if (size == 0) {
         return std::nullopt;
     }
     PhaseClock guest_clock{stats.guest_buffer_ns}; // NAT-145
     ++stats.guest_buffer_calls;
+    last_bound = Bound::Region;
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
         if (address < region->begin || address + size > region->end) {
@@ -1003,6 +1266,16 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
+    }
+    if (mirror && !write) {
+        if (const auto mirrored = MirrorBuffer(address, size)) {
+            last_bound = Bound::Mirror; // NAT-150
+            return mirrored;
+        }
+    }
+    last_bound = Bound::InPlace;
+    if (write) {
+        DropMirrors(address, size); // NAT-150: the GPU writes guest memory there
     }
     if (auto* direct = r.buffer_cache.GetDirectMemory();
         direct && direct->EnsureImported(address, size)) {
@@ -1346,7 +1619,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     info = {found->first, aligned, size + adjust};
                     b.writes_buffers |= desc.is_written;
                     if (InPlaceSampled()) {
-                        in_place.Note(desc.is_written ? 4 : 3, base, size); // NAT-142
+                        in_place.Note(BoundKind(desc.is_written ? 4 : 3), base, size); // NAT-142
                     }
                     if (desc.is_written) {
                         b.gpu_writes.emplace_back(base, size); // NAT-119
@@ -1565,9 +1838,9 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
         if (guest.base_address != 0 && guest.GetSize() > 0 &&
             r.memory->MappedAreaEnd(guest.base_address, guest.base_address + 1) != 0) {
             size = r.memory->ClampRangeSize(guest.base_address, guest.GetSize());
-            found = GuestBuffer(guest.base_address, size, false);
+            found = GuestBuffer(guest.base_address, size, false, true);
             if (InPlaceSampled()) {
-                in_place.Note(0, guest.base_address, size); // NAT-142
+                in_place.Note(BoundKind(0), guest.base_address, size); // NAT-142
             }
         }
         v.buffers.push_back(found ? found->first : vk::Buffer{});
@@ -1635,12 +1908,12 @@ bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u
     }
     const VAddr address =
         regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
-    const auto found = GuestBuffer(address, u64(regs.num_indices) * index_size, false);
+    const auto found = GuestBuffer(address, u64(regs.num_indices) * index_size, false, true);
     if (!found) {
         return false;
     }
     if (InPlaceSampled()) {
-        in_place.Note(1, address, u64(regs.num_indices) * index_size); // NAT-142
+        in_place.Note(BoundKind(1), address, u64(regs.num_indices) * index_size); // NAT-142
     }
     v.index_buffer = found->first;
     v.index_offset = found->second;
@@ -2588,6 +2861,16 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
                                        data.data() + (begin - address));
         }
     }
+    // NAT-150: and mirrors.
+    for (auto it = FirstMirror(address);
+         it != mirrors.end() && it->second.begin < address + data.size(); ++it) {
+        const Mirror& mirror = it->second;
+        const VAddr begin = std::max<VAddr>(address, mirror.begin);
+        const VAddr end = std::min<VAddr>(address + data.size(), mirror.end);
+        CmdBuf{s.cmd}.updateBuffer(vk::Buffer{Handle<VkBuffer_T>(mirror.buffer->NativeHandle())},
+                                   begin - mirror.begin, end - begin,
+                                   data.data() + (begin - address));
+    }
     s.buffers_written = true;
     ++s.commands;
     ++stats.inline_writes;
@@ -2607,6 +2890,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
             ++it;
         }
     }
+    DropMirrors(address, size); // NAT-150
 }
 
 void NativeRenderer::EvictImages() {
@@ -2948,6 +3232,9 @@ void NativeRenderer::Report() {
              "writes, {} pictures copied from targets, {} written back, {} CPU writes to textures, "
              "{} ranges gathered, region binds/made/refreshes {}/{}/{} (NAT-114; {} regions, "
              "{:.1f} MB, {} pages refreshed in {:.1f} ms; {} guest buffers in {:.1f} ms), "
+             "mirrors {} ({:.1f} MB; NAT-150: {} binds, {} made ({:.1f} MB), {} dropped as "
+             "CPU-written, {} evicted, {} over budget, {} pages refreshed, {} granules read in "
+             "place), "
              "fill shaders {}, targets rewritten by clears/uploads/partial clears/fills "
              "{}/{}/{}/{} (NAT-120/124/132), "
              "on the GPU ({:.1f} MB), uploads from guest memory on the GPU/CPU {}/{}; images so far: "
@@ -2971,7 +3258,10 @@ void NativeRenderer::Report() {
                  return bytes / 1048576.0;
              }(),
              stats.region_refresh_pages, stats.region_refresh_ns / 1e6, stats.guest_buffer_calls,
-             stats.guest_buffer_ns / 1e6,
+             stats.guest_buffer_ns / 1e6, mirrors.size(), mirror_bytes / 1048576.0,
+             stats.mirror_binds, stats.mirrors_made, stats.mirror_made_bytes / 1048576.0,
+             stats.mirrors_dropped, stats.mirrors_evicted, stats.mirror_over_budget,
+             stats.mirror_refresh_pages, dynamic_granules.size(),
              stats.fill_shaders, stats.rewrite_clears, stats.rewrite_uploads,
              stats.rewrite_partial, stats.rewrite_fills,
              stats.gathered_bytes / 1048576.0,
@@ -2995,8 +3285,9 @@ void NativeRenderer::Report() {
         LOG_INFO(Render_Vulkan,
                  "NAT-142: guest memory used in place per frame (64 KB pages, MB): vertices "
                  "{:.1f}, indices {:.1f}, read-only storage {:.1f}, storage read {:.1f}, storage "
-                 "written {:.1f} ({} frames sampled)",
-                 mb(0), mb(1), mb(2), mb(3), mb(4), in_place.frames);
+                 "written {:.1f}; from video memory instead: mirrors {:.1f}, regions {:.1f} "
+                 "(NAT-150; {} frames sampled)",
+                 mb(0), mb(1), mb(2), mb(3), mb(4), mb(5), mb(6), in_place.frames);
         in_place.total = {};
         in_place.frames = 0;
     }
@@ -3012,6 +3303,8 @@ void NativeRenderer::Report() {
     stats.pass_barriers = stats.passes_unblocked = 0;
     stats.region_refresh_pages = stats.region_refresh_ns = 0;
     stats.guest_buffer_calls = stats.guest_buffer_ns = 0;
+    stats.mirror_binds = stats.mirrors_made = stats.mirror_made_bytes = stats.mirrors_dropped = 0;
+    stats.mirrors_evicted = stats.mirror_over_budget = stats.mirror_refresh_pages = 0;
     stats.null_reasons = {};
     stats.phase_ns = {};
     (void)cpu_writes;
