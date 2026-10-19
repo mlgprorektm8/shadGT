@@ -150,7 +150,10 @@ void Setup(std::string_view shadps4_filename) {
 #ifdef RYTY_GPU
     const auto root = std::filesystem::current_path();
     g_stdout_logger = std::make_unique<spdlog::logger>("stdout", g_console_sink);
-    g_stdout_logger->set_level(static_cast<spdlog::level>(StdoutLevel::Read(root / "RyGT.ini")));
+    // ShadGT output is diagnostic data: opt in with Trace or Debug.
+    const auto stdout_level = StdoutLevel::Read(root / "RyGT.ini");
+    g_stdout_logger->set_level(stdout_level <= static_cast<unsigned>(Level::Debug)
+        ? static_cast<spdlog::level>(stdout_level) : spdlog::level::off);
     g_stdout_logger->flush_on(spdlog::level::trace);
 #endif
 
