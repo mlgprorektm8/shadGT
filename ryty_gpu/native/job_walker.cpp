@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -50,6 +51,21 @@ void NoteExtentHints(u32 reg_addr, u32 count_field, const u32* payload, JobExten
 }
 
 } // namespace
+
+u64 ReadablePrefix(const void* address, u64 size) {
+    const u8* const start = static_cast<const u8*>(address);
+    const u8* p = start;
+    const u8* const end = start + size;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(p, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+            break;
+        }
+        p = static_cast<const u8*>(info.BaseAddress) + info.RegionSize;
+    }
+    return static_cast<u64>(std::min(p, end) - start);
+}
 
 bool Readable(const void* address, size_t size) {
     // The range may span several regions (separate mappings, or pages protected differently).

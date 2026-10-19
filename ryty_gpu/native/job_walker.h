@@ -100,5 +100,7 @@ void WalkJob(const JobRange& job, AmdGpu::Regs& regs, JobExtents& extents, JobVi
 
 /// Whether CPU code may read the range (guards the walk against bad links).
 bool Readable(const void* address, size_t size);
+/// NAT-106: how many bytes from the start of the range the CPU can read.
+u64 ReadablePrefix(const void* address, u64 size);
 
 } // namespace Native

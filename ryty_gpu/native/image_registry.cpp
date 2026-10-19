@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "common/logging/log.h"
+#include <xxhash.h>
 #include "ryty_gpu/native/image_registry.h"
 #include "video_core/amdgpu/tiling.h"
 
@@ -207,6 +208,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         result = entry.get();
         shard.images.emplace(info.guest_address, std::move(entry));
     }
+    IndexEntry(*result);
     if (render_target) {
         ++stats.created_targets;
         LinkTarget(*result);
@@ -275,22 +277,52 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
     return {mip, layer, target.size.width, target.size.height};
 }
 
+void ImageRegistry::IndexEntry(ImageEntry& entry) {
+    const VAddr base = entry.info.guest_address;
+    const u64 span = std::clamp<u64>(entry.info.guest_size, 1, MaxIndexedSize);
+    std::unique_lock lock{granule_mutex};
+    for (u64 g = base >> GranuleBits; g <= (base + span - 1) >> GranuleBits; ++g) {
+        granules[g].push_back(&entry);
+    }
+}
+
+void ImageRegistry::UnindexEntry(ImageEntry& entry) {
+    const VAddr base = entry.info.guest_address;
+    const u64 span = std::clamp<u64>(entry.info.guest_size, 1, MaxIndexedSize);
+    for (u64 g = base >> GranuleBits; g <= (base + span - 1) >> GranuleBits; ++g) {
+        const auto it = granules.find(g);
+        if (it == granules.end()) {
+            continue;
+        }
+        auto& list = it->second;
+        if (const auto at = std::ranges::find(list, &entry); at != list.end()) {
+            *at = list.back();
+            list.pop_back();
+        }
+        if (list.empty()) {
+            granules.erase(it);
+        }
+    }
+}
+
 void ImageRegistry::LinkTarget(ImageEntry& target) {
     // NAT-104: textures made before this target over its memory may be made of it.
     const VAddr begin = target.info.guest_address;
     const VAddr end = begin + std::max<u64>(target.info.guest_size, 1);
-    for (Shard& other : shards) {
-        std::shared_lock lock{other.mutex};
-        for (const auto& [base, entry] : other.images) {
-            if (!entry->from_cpu || base >= end || base + entry->info.guest_size <= begin) {
-                continue;
-            }
-            if (PlaceOf(target.info, entry->info).mip >= 0) {
-                std::scoped_lock sources_lock{entry->sources_mutex};
-                entry->sources.push_back(&target);
-            }
+    ForEachOverlapping(begin, end, [&](ImageEntry& entry) {
+        if (!entry.from_cpu) {
+            return;
         }
-    }
+        if (const auto place = PlaceOf(target.info, entry.info); place.mip >= 0) {
+            {
+                std::scoped_lock sources_lock{entry.sources_mutex};
+                entry.sources.push_back({&target, place});
+            }
+            entry.sources_dirty.store(true, std::memory_order_relaxed);
+            std::scoped_lock target_lock{target.sources_mutex};
+            target.dependents.push_back(&entry);
+        }
+    });
 }
 
 void ImageRegistry::LinkTexture(ImageEntry& texture) {
@@ -299,16 +331,21 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
     // (a few times per layout pair) to learn which of these GT Sport has.
     const VAddr begin = texture.info.guest_address;
     const VAddr end = begin + std::max<u64>(texture.info.guest_size, 1);
-    for (Shard& other : shards) {
-        std::shared_lock lock{other.mutex};
-        for (const auto& [base, entry] : other.images) {
-            if (entry->from_cpu || base >= end || base + entry->info.guest_size <= begin) {
-                continue;
+    ForEachOverlapping(begin, end, [&](ImageEntry& other) {
+        const ImageEntry* entry = &other;
+        {
+            if (entry->from_cpu) {
+                return;
             }
-            if (PlaceOf(entry->info, texture.info).mip >= 0) {
-                std::scoped_lock sources_lock{texture.sources_mutex};
-                texture.sources.push_back(entry.get());
-                continue;
+            if (const auto place = PlaceOf(entry->info, texture.info); place.mip >= 0) {
+                {
+                    std::scoped_lock sources_lock{texture.sources_mutex};
+                    texture.sources.push_back({&other, place});
+                }
+                texture.sources_dirty.store(true, std::memory_order_relaxed);
+                std::scoped_lock target_lock{other.sources_mutex};
+                other.dependents.push_back(&texture);
+                return;
             }
             const auto& a = texture.info;
             const auto& b = entry->info;
@@ -328,35 +365,163 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
                             b.props.is_depth ? " (depth)" : "");
             }
         }
-    }
+    });
 }
 
 void ImageRegistry::ForEachOverlapping(VAddr begin, VAddr end,
                                        const std::function<void(ImageEntry&)>& fn) {
-    for (Shard& shard : shards) {
-        std::shared_lock lock{shard.mutex};
-        for (auto& [base, entry] : shard.images) {
-            if (base < end && base + std::max<u64>(entry->info.guest_size, 1) > begin) {
+    if (end <= begin) {
+        return;
+    }
+    // Each image once: in the first granule of the range it covers.
+    const u64 first = begin >> GranuleBits;
+    const u64 last = (end - 1) >> GranuleBits;
+    const auto visit = [&](u64 g, const std::vector<ImageEntry*>& list) {
+        for (ImageEntry* entry : list) {
+            const VAddr base = entry->info.guest_address;
+            const u64 span = std::clamp<u64>(entry->info.guest_size, 1, MaxIndexedSize);
+            if (g == std::max(first, base >> GranuleBits) && base < end && base + span > begin) {
                 fn(*entry);
             }
+        }
+    };
+    std::shared_lock lock{granule_mutex};
+    if (last - first >= granules.size()) {
+        for (const auto& [g, list] : granules) {
+            if (g >= first && g <= last) {
+                visit(g, list);
+            }
+        }
+        return;
+    }
+    for (u64 g = first; g <= last; ++g) {
+        if (const auto it = granules.find(g); it != granules.end()) {
+            visit(g, it->second);
         }
     }
 }
 
-void ImageRegistry::Invalidate(VAddr address, u64 size) {
-    const VAddr end = address + size;
+std::vector<std::pair<VAddr, u32>> ImageRegistry::Crowded(u32 count) {
+    std::unordered_map<VAddr, u32> per_address;
     for (Shard& shard : shards) {
         std::shared_lock lock{shard.mutex};
-        for (auto& [base, entry] : shard.images) {
-            if (!entry->from_cpu || base >= end || base + entry->info.guest_size <= address) {
-                continue;
-            }
-            if (!entry->needs_upload.exchange(true)) {
-                std::scoped_lock upload_lock{upload_mutex};
-                pending_uploads.push_back(entry.get());
+        for (const auto& [base, entry] : shard.images) {
+            ++per_address[base];
+        }
+    }
+    std::vector<std::pair<VAddr, u32>> list(per_address.begin(), per_address.end());
+    std::ranges::sort(list, std::greater{}, [](const auto& item) { return item.second; });
+    list.resize(std::min<size_t>(list.size(), count));
+    return list;
+}
+
+u64 ImageRegistry::Count() {
+    u64 count = 0;
+    for (Shard& shard : shards) {
+        std::shared_lock lock{shard.mutex};
+        count += shard.images.size();
+    }
+    return count;
+}
+
+u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_evict) {
+    std::unordered_set<const ImageEntry*> gone;
+    for (Shard& shard : shards) {
+        std::shared_lock lock{shard.mutex};
+        for (const auto& [base, entry] : shard.images) {
+            if (entry->last_use.load(std::memory_order_relaxed) < before) {
+                gone.insert(entry.get());
             }
         }
     }
+    if (gone.empty()) {
+        return 0;
+    }
+    // Out of the shards first: from then on nothing finds them (a CPU write fault on another
+    // thread queues the textures it finds for upload while holding a shard's lock).
+    std::vector<std::unique_ptr<ImageEntry>> taken;
+    for (Shard& shard : shards) {
+        std::unique_lock lock{shard.mutex};
+        for (auto it = shard.images.begin(); it != shard.images.end();) {
+            if (gone.contains(it->second.get())) {
+                taken.push_back(std::move(it->second));
+                it = shard.images.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    {
+        std::unique_lock lock{granule_mutex};
+        for (const auto& entry : taken) {
+            UnindexEntry(*entry);
+        }
+    }
+    {
+        std::scoped_lock lock{upload_mutex};
+        std::erase_if(pending_uploads, [&](ImageEntry* entry) { return gone.contains(entry); });
+    }
+    // The links between textures and targets that went (NAT-111: both directions).
+    for (const auto& entry : taken) {
+        std::vector<ImageEntry*> others;
+        {
+            std::scoped_lock lock{entry->sources_mutex};
+            for (const auto& link : entry->sources) {
+                others.push_back(link.source);
+            }
+            others.insert(others.end(), entry->dependents.begin(), entry->dependents.end());
+        }
+        for (ImageEntry* other : others) {
+            if (gone.contains(other)) {
+                continue;
+            }
+            std::scoped_lock lock{other->sources_mutex};
+            std::erase_if(other->sources,
+                          [&](const SourceLink& link) { return link.source == entry.get(); });
+            std::erase(other->dependents, entry.get());
+        }
+    }
+    for (const auto& entry : taken) {
+        on_evict(*entry);
+    }
+    stats.evicted += taken.size();
+    return static_cast<u32>(taken.size());
+}
+
+void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
+    ++stats.stale[static_cast<u32>(why)];
+    if (why != Stale::CpuWrite) {
+        entry.force_upload.store(true, std::memory_order_relaxed);
+    }
+    if (!entry.needs_upload.exchange(true)) {
+        std::scoped_lock upload_lock{upload_mutex};
+        pending_uploads.push_back(&entry);
+    }
+}
+
+void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
+    ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
+        if (entry.from_cpu) {
+            MarkStale(entry, why);
+        }
+    });
+}
+
+void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
+    constexpr u64 HashedSize = 4ull << 20;
+    const VAddr written_end = address + (exact != 0 ? exact : size);
+    ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
+        if (!entry.from_cpu) {
+            return;
+        }
+        const VAddr base = entry.info.guest_address;
+        const bool hit = base < written_end && base + entry.info.guest_size > address;
+        // A small texture is checked by hash at its next use (its page is no longer watched,
+        // so later writes there go unseen); a large one is uploaded again only when written.
+        if (hit || entry.info.guest_size <= HashedSize) {
+            MarkStale(entry, Stale::CpuWrite);
+        }
+    });
 }
 
 std::vector<Rhi::BufferImageCopy> MipCopies(const VideoCore::ImageInfo& info) {
@@ -465,35 +630,70 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
         if (size == 0) {
             continue;
         }
-        auto source = device.CreateBuffer({.size = size,
-                                           .usage = Rhi::BufferUsageStorage |
-                                                    Rhi::BufferUsageTransferSrc,
-                                           .memory = Rhi::MemoryKind::Upload});
-        if (!source || !source->Mapped()) {
-            continue;
-        }
         if (upload_hook) {
             upload_hook(*entry); // NAT-105: CPU writes from here on are seen
         }
-        // Only what is mapped is read (a T# can reach past the end of a mapping); the rest of
-        // the picture is zeros.
-        const u64 readable = memory_clamp ? memory_clamp(info.guest_address, size) : size;
-        if (readable < size) {
-            std::memset(source->Mapped() + readable, 0, size - readable);
-            static std::atomic<u32> logged{};
-            if (logged++ < 16) {
-                LOG_WARNING(Render_Vulkan,
-                            "NAT-042: texture {:#x}+{:#x} ({}x{}, {} mips) is mapped for {:#x} "
-                            "bytes only; the rest uploads as zeros",
-                            info.guest_address, size, info.size.width, info.size.height,
-                            info.resources.levels, readable);
+        // NAT-109: a small texture whose bytes did not change (a write elsewhere on its page)
+        // is not uploaded again; GPU writes to its memory always upload.
+        constexpr u64 HashedSize = 4ull << 20;
+        const bool forced = entry->force_upload.exchange(false);
+        if (size <= HashedSize && memory_clamp && memory_clamp(info.guest_address, size) == size) {
+            const u64 hash =
+                XXH3_64bits(reinterpret_cast<const void*>(info.guest_address), size) | 1;
+            if (!forced && hash == entry->content_hash) {
+                ++upload_stats.unchanged;
+                continue;
             }
+            entry->content_hash = hash;
+        } else {
+            entry->content_hash = 0;
         }
-        if (readable != 0) {
-            std::memcpy(source->Mapped(), reinterpret_cast<const void*>(info.guest_address),
-                        readable);
+        // NAT-107: the bytes as the GPU sees guest memory, in GPU order (textures the game's
+        // GPU work filled, in memory the CPU may not even read), else a copy the CPU makes now.
+        UploadSource gpu_source;
+        if (upload_source) {
+            gpu_source = upload_source(*entry, list);
         }
-        const Rhi::Buffer* linear = source.get();
+        std::unique_ptr<Rhi::Buffer> source;
+        const Rhi::Buffer* bytes = gpu_source.buffer;
+        u64 bytes_offset = gpu_source.offset;
+        for (auto& keep : gpu_source.keep) {
+            staging.push_back(std::move(keep));
+        }
+        if (bytes) {
+            ++upload_stats.gpu;
+        } else {
+            ++upload_stats.cpu;
+            source = device.CreateBuffer({.size = size,
+                                          .usage = Rhi::BufferUsageStorage |
+                                                   Rhi::BufferUsageTransferSrc,
+                                          .memory = Rhi::MemoryKind::Upload});
+            if (!source || !source->Mapped()) {
+                continue;
+            }
+            // Only what is mapped is read (a T# can reach past the end of a mapping); the rest of
+            // the picture is zeros.
+            const u64 readable = memory_clamp ? memory_clamp(info.guest_address, size) : size;
+            if (readable < size) {
+                std::memset(source->Mapped() + readable, 0, size - readable);
+                static std::atomic<u32> logged{};
+                if (logged++ < 16) {
+                    LOG_WARNING(Render_Vulkan,
+                                "NAT-042: texture {:#x}+{:#x} ({}x{}, {} mips) is mapped for {:#x} "
+                                "bytes only; the rest uploads as zeros",
+                                info.guest_address, size, info.size.width, info.size.height,
+                                info.resources.levels, readable);
+                }
+            }
+            if (readable != 0) {
+                std::memcpy(source->Mapped(), reinterpret_cast<const void*>(info.guest_address),
+                            readable);
+            }
+            bytes = source.get();
+            bytes_offset = 0;
+        }
+        const Rhi::Buffer* linear = bytes;
+        u64 linear_offset = bytes_offset;
         if (info.props.is_tiled) {
             const Rhi::Pipeline* untile = TilingPipeline(info, false);
             auto params_buffer = TilingParamsBuffer(info);
@@ -506,7 +706,8 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
             }
             list.BindPipeline(untile);
             const std::array<Rhi::Binding, 3> bindings{{
-                {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = source.get(), .size = size},
+                {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = bytes,
+                 .offset = bytes_offset, .size = size},
                 {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = out.get(), .size = size},
                 {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = params_buffer.get(),
                  .size = sizeof(TilingParams)},
@@ -515,12 +716,20 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
             list.Dispatch(static_cast<u32>((size / (info.num_bits / 8)) / 64), 1, 1);
             list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
             linear = out.get();
+            linear_offset = 0;
             staging.push_back(std::move(params_buffer));
             staging.push_back(std::move(out));
         }
-        list.CopyBufferToImage(linear, entry->image.get(), MipCopies(info));
-        staging.push_back(std::move(source));
+        auto copies = MipCopies(info);
+        for (auto& copy : copies) {
+            copy.buffer_offset += linear_offset;
+        }
+        list.CopyBufferToImage(linear, entry->image.get(), copies);
+        if (source) {
+            staging.push_back(std::move(source));
+        }
         stats.upload_bytes += size;
+        ++entry->upload_count;
         ++uploaded;
     }
     if (uploaded) {

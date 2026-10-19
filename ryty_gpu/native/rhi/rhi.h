@@ -509,6 +509,9 @@ public:
     virtual std::unique_ptr<Buffer> CreateBuffer(const BufferDesc& desc) = 0;
     /// Wraps existing CPU memory (page aligned, `Caps().host_import_alignment`) as a buffer the
     /// GPU reads and writes in place; nullptr when unsupported.
+    /// NAT-107: a buffer made elsewhere (Vulkan: a VkBuffer), not owned: bound and copied
+    /// like the others, never destroyed by this object.
+    virtual std::unique_ptr<Buffer> WrapBuffer(u64 native_handle, u64 size) = 0;
     virtual std::unique_ptr<Buffer> ImportHostMemory(void* memory, u64 size, u32 usage,
                                                      std::string_view name) = 0;
     virtual std::unique_ptr<Image> CreateImage(const ImageDesc& desc) = 0;

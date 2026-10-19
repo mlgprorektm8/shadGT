@@ -226,6 +226,7 @@ public:
     vk::Buffer buffer;
     VmaAllocation allocation;
     vk::DeviceMemory memory; // imported memory, when not from VMA
+    bool owned = true;       // NAT-107: false for WrapBuffer
     u64 size;
     u64 address;
     u8* mapped;
@@ -438,6 +439,13 @@ public:
         return caps;
     }
     std::unique_ptr<Buffer> CreateBuffer(const BufferDesc& desc) override;
+    std::unique_ptr<Buffer> WrapBuffer(u64 native_handle, u64 size) override {
+        auto buffer = std::make_unique<VulkanBuffer>(
+            *this, vk::Buffer{reinterpret_cast<VkBuffer>(native_handle)}, VmaAllocation{},
+            vk::DeviceMemory{}, size, 0, nullptr);
+        buffer->owned = false;
+        return buffer;
+    }
     std::unique_ptr<Buffer> ImportHostMemory(void* memory, u64 size, u32 usage,
                                              std::string_view name) override;
     std::unique_ptr<Image> CreateImage(const ImageDesc& desc) override;
@@ -506,6 +514,9 @@ public:
 };
 
 VulkanBuffer::~VulkanBuffer() {
+    if (!owned) {
+        return; // NAT-107: wrapped
+    }
     device.Retire([dev = device.device, alloc = device.allocator, buffer = buffer,
                    allocation = allocation, memory = memory] {
         if (allocation) {

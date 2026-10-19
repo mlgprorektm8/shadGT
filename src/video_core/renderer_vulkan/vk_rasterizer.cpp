@@ -5179,7 +5179,7 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks, u64 e
     }
 #ifdef RYTY_GPU
     if (native) {
-        native->OnCpuWrite(addr, size); // NAT-105: only native textures watch pages
+        native->OnCpuWrite(addr, size, exact_write_size); // NAT-105, NAT-109
         return true;
     }
 #endif
