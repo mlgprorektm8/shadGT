@@ -29,6 +29,7 @@
 #include "common/perf_monitor.h"
 #include "ryty_gpu/native/entry_hook.h"
 #include "ryty_gpu/native/gts_hooks.h"
+#include "ryty_gpu/native/shadow.h"
 
 namespace Native {
 namespace {
@@ -113,8 +114,6 @@ enum CountKind : int {
     GnmDispatchB,
     GnmDispatchC,
     PglSubmit,
-    PglJobBegin,
-    PglJobEnd,
     kCountKinds
 };
 CountEntryInfo g_counts[kCountKinds] = {
@@ -125,14 +124,40 @@ CountEntryInfo g_counts[kCountKinds] = {
     {0x1cafa0, kPushRbx, "Gnm dispatch (b)"},
     {0x1db650, kPushRbx, "Gnm dispatch (c)"},
     {0x1c56610, kPushR14, "PGL submit"},
-    // A render job takes a PGL context from a pool, makes it current on its thread with a fresh
-    // command chunk and state from a template, and links its chunk after the previous job's.
-    {0x1c572c0, kPushR15, "PGL job begin"},
-    {0x1c57860, kPushR15, "PGL job end"},
 };
 
 u64 Count(CountKind kind) {
     return g_counts[kind].counter ? g_counts[kind].counter->load(std::memory_order_relaxed) : 0;
+}
+
+// A render job takes a PGL context from a pool and makes it current on its thread with a fresh
+// command chunk and state from a template (job begin, context in the first argument); job end
+// links the job's chunks after the previous job's and restores the previous context.
+constexpr u64 kPglJobBegin = 0x1c572c0;
+constexpr u64 kPglJobEnd = 0x1c57860;
+constexpr u32 kPglContextDcb = 0x780; // the context's Gnm DrawCommandBuffer
+using JobFn = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
+JobFn g_job_begin = nullptr;
+JobFn g_job_end = nullptr;
+std::atomic<u64> g_jobs{0};
+
+u64 PS4_SYSV_ABI JobBeginHook(u64 context, u64 b, u64 c, u64 d, u64 e, u64 f) {
+    const u64 result = g_job_begin(context, b, c, d, e, f);
+    g_jobs.fetch_add(1, std::memory_order_relaxed);
+    if (ShadowEnabled()) {
+        ShadowJobBegin(reinterpret_cast<const u8*>(context) + kPglContextDcb);
+    }
+    return result;
+}
+
+u64 PS4_SYSV_ABI JobEndHook(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
+    if (!ShadowEnabled()) {
+        return g_job_end(a, b, c, d, e, f);
+    }
+    ShadowJobEnd();
+    const u64 result = g_job_end(a, b, c, d, e, f);
+    ShadowJobDecode();
+    return result;
 }
 
 void ReporterLoop() {
@@ -174,7 +199,7 @@ void ReporterLoop() {
         const u64 dispatch = Count(GnmDispatchGfx) + Count(GnmDispatchAsync) + Count(GnmDispatchB) +
                              Count(GnmDispatchC);
         const u64 submits = Count(PglSubmit);
-        const u64 jobs = Count(PglJobBegin);
+        const u64 jobs = g_jobs.load(std::memory_order_relaxed);
         const u64 renderer_draws = work.draws.load(std::memory_order_relaxed);
         const u64 renderer_dispatches = work.dispatches.load(std::memory_order_relaxed);
         // Totals since the hooks' first report window: the renderer gets a frame's draws after
@@ -218,7 +243,7 @@ void StartReporter() {
 
 void InstallGtsHooks(u8* exe_base) {
     const char* env = std::getenv("RYGT_NATIVE_HOOKS");
-    if (!env || env[0] != '1') {
+    if ((!env || env[0] != '1') && !ShadowEnabled()) {
         return;
     }
     static NearCode code{exe_base};
@@ -239,8 +264,16 @@ void InstallGtsHooks(u8* exe_base) {
         entry.counter = CountEntry(code, exe_base, entry.eboot_va, entry.prologue, entry.name);
         installed += entry.counter != nullptr;
     }
-    std::fprintf(stderr, "[native] NAT-002: %d of %d hooks installed\n", installed,
-                 static_cast<int>(kDrawKinds) + static_cast<int>(kCountKinds));
+    g_job_begin = reinterpret_cast<JobFn>(HookEntry(code, exe_base, kPglJobBegin, kPushR15,
+                                                    reinterpret_cast<void*>(&JobBeginHook),
+                                                    "PGL job begin"));
+    g_job_end = reinterpret_cast<JobFn>(HookEntry(code, exe_base, kPglJobEnd, kPushR15,
+                                                  reinterpret_cast<void*>(&JobEndHook),
+                                                  "PGL job end"));
+    installed += (g_job_begin != nullptr) + (g_job_end != nullptr);
+    std::fprintf(stderr, "[native] NAT-002: %d of %d hooks installed%s\n", installed,
+                 static_cast<int>(kDrawKinds) + static_cast<int>(kCountKinds) + 2,
+                 ShadowEnabled() ? " (NAT-003 shadow mode)" : "");
 }
 
 } // namespace Native

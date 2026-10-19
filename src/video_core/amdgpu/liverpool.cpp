@@ -42,6 +42,9 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "core/libraries/system/systemservice.h"
 #include "ryty_gpu/ryty_diag.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/native/shadow.h"
+#endif
 
 namespace AmdGpu {
 
@@ -1563,6 +1566,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     if (!original_dcb.empty()) {
         RecordCmdBuffer(original_dcb.data(), original_dcb.size_bytes(), false);
         decoding_submit.fetch_add(1, std::memory_order_relaxed); // DIAG-061
+#ifdef RYTY_GPU
+        if (Native::ShadowEnabled()) {
+            Native::ShadowSubmitBase(regs); // NAT-003: the state render jobs start from
+        }
+#endif
     }
     if (early_fences_pending && std::chrono::steady_clock::now() >= early_fences_at) {
         early_fences_mode = std::exchange(early_fences_pending, 0); // EXP-120
@@ -1875,6 +1883,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+#ifdef RYTY_GPU
+                if (Native::ShadowEnabled()) {
+                    Native::ShadowCheckDraw(header, regs); // NAT-003
+                }
+#endif
                 if (!rasterizer) {
                     break;
                 }
@@ -1901,6 +1914,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+#ifdef RYTY_GPU
+                if (Native::ShadowEnabled()) {
+                    Native::ShadowCheckDraw(header, regs); // NAT-003
+                }
+#endif
                 if (!rasterizer) {
                     break;
                 }
@@ -1925,6 +1943,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+#ifdef RYTY_GPU
+                if (Native::ShadowEnabled()) {
+                    Native::ShadowCheckDraw(header, regs); // NAT-003
+                }
+#endif
                 if (!rasterizer) {
                     break;
                 }

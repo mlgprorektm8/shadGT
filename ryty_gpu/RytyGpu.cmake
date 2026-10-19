@@ -118,6 +118,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
         # NAT-001/002: hook points in GT Sport's code for the native renderer (experimental).
         ryty_gpu/native/entry_hook.cpp
         ryty_gpu/native/gts_hooks.cpp
+        ryty_gpu/native/shadow.cpp
         src/core/cpu_patches.cpp
         src/core/loader/dwarf.cpp
 )
