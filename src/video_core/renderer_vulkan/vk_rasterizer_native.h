@@ -148,6 +148,10 @@ private:
         vk::Pipeline pipeline{};
         std::vector<const Native::ImageEntry*> written; ///< since the last barrier
         bool buffers_written = false;                   ///< by shaders since the last barrier
+        /// NAT-140: attachments drawn since the last pass or global barrier, and pictures
+        /// sampled since the last global barrier: what a new pass has to wait for.
+        std::vector<const Native::ImageEntry*> attach_dirty;
+        std::vector<const Native::ImageEntry*> read;
         std::vector<Chunk> chunks;
         u64 chunk_used = 0;
         std::vector<vk::DescriptorPool> pools; ///< for pipelines without push descriptors
@@ -171,6 +175,9 @@ private:
     void EndRendering();
     void BeginRendering(const RenderState& state);
     void GlobalBarrier();
+    /// NAT-140: attachment writes before it finish before attachment access after it (a pass
+    /// drawing into what an earlier pass drew), without waiting for anything else.
+    void PassBarrier();
     void PrepareImages();
     void ChunkFlushCheck();
 
@@ -266,6 +273,25 @@ private:
     Stream stream;
     DrawBindings bindings;
     u64 frame = 0;
+    /// NAT-142: guest memory the GPU reads or writes in place (64 KB pages, every 8th frame):
+    /// vertex buffers, indices, read-only storage through the page table, other storage
+    /// buffers read, storage buffers written.
+    struct InPlace {
+        std::array<std::unordered_set<u64>, 5> pages;
+        std::array<u64, 5> total{};
+        u64 frames = 0;
+        void Note(u32 kind, VAddr address, u64 size) {
+            if (size == 0) {
+                return;
+            }
+            for (u64 page = address >> 16; page <= (address + size - 1) >> 16; ++page) {
+                pages[kind].insert(page);
+            }
+        }
+    } in_place;
+    bool InPlaceSampled() const {
+        return (frame & 7) == 0;
+    }
 
     std::mutex chunk_mutex;
     std::vector<Chunk> free_chunks;
@@ -305,6 +331,7 @@ private:
     struct Stats {
         u64 rewrite_clears = 0, rewrite_uploads = 0, fill_shaders = 0; ///< NAT-120
         u64 rewrite_partial = 0; ///< NAT-124
+        u64 pass_barriers = 0, passes_unblocked = 0; ///< NAT-140
         u64 rewrite_fills = 0;   ///< NAT-132
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,

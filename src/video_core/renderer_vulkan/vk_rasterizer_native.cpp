@@ -627,8 +627,34 @@ void NativeRenderer::GlobalBarrier() {
     });
     s.written.clear();
     s.buffers_written = false;
+    s.attach_dirty.clear();
+    s.read.clear();
     ++stats.barriers;
     FlushWritebacks();
+}
+
+void NativeRenderer::PassBarrier() {
+    Stream& s = stream;
+    EndRendering();
+    constexpr auto stages = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                            vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                            vk::PipelineStageFlagBits2::eLateFragmentTests;
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = stages,
+        .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite |
+                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+        .dstStageMask = stages,
+        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                         vk::AccessFlagBits2::eColorAttachmentWrite |
+                         vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+    };
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+    s.attach_dirty.clear();
+    ++stats.pass_barriers;
 }
 
 void NativeRenderer::FlushWritebacks() {
@@ -1256,12 +1282,18 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     !RegionOver(base, size) && direct->EnsureImported(base, size)) {
                     // D3: read in place through the page table; nothing bound.
                     direct_entries[buffer_index] = {u32(base), u32(base >> 32), u32(size), 1u};
+                    if (InPlaceSampled()) {
+                        in_place.Note(2, base, size); // NAT-142
+                    }
                 } else if (const auto found = GuestBuffer(base, size, desc.is_written)) {
                     const u64 aligned = Common::AlignDown(found->second, alignment);
                     const u64 adjust = found->second - aligned;
                     b.push.AddOffset(binding.buffer, static_cast<u32>(adjust));
                     info = {found->first, aligned, size + adjust};
                     b.writes_buffers |= desc.is_written;
+                    if (InPlaceSampled()) {
+                        in_place.Note(desc.is_written ? 4 : 3, base, size); // NAT-142
+                    }
                     if (desc.is_written) {
                         b.gpu_writes.emplace_back(base, size); // NAT-119
                     }
@@ -1480,6 +1512,9 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
             r.memory->MappedAreaEnd(guest.base_address, guest.base_address + 1) != 0) {
             size = r.memory->ClampRangeSize(guest.base_address, guest.GetSize());
             found = GuestBuffer(guest.base_address, size, false);
+            if (InPlaceSampled()) {
+                in_place.Note(0, guest.base_address, size); // NAT-142
+            }
         }
         v.buffers.push_back(found ? found->first : vk::Buffer{});
         v.offsets.push_back(found ? found->second : 0);
@@ -1549,6 +1584,9 @@ bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u
     const auto found = GuestBuffer(address, u64(regs.num_indices) * index_size, false);
     if (!found) {
         return false;
+    }
+    if (InPlaceSampled()) {
+        in_place.Note(1, address, u64(regs.num_indices) * index_size); // NAT-142
     }
     v.index_buffer = found->first;
     v.index_offset = found->second;
@@ -1715,7 +1753,21 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
             s.written.push_back(entry);
         }
     };
+    for (const auto* entry : b.sampled) {
+        if (entry && std::ranges::find(s.read, entry) == s.read.end()) {
+            s.read.push_back(entry); // NAT-140
+        }
+    }
     if (targets) {
+        const auto attached = [&](const Native::ImageEntry* entry) {
+            if (entry && std::ranges::find(s.attach_dirty, entry) == s.attach_dirty.end()) {
+                s.attach_dirty.push_back(entry); // NAT-140
+            }
+        };
+        for (const auto* entry : targets->colors) {
+            attached(entry);
+        }
+        attached(targets->depth);
         for (const auto* entry : targets->colors) {
             note(entry);
             // NAT-112: small pictures go back to guest memory.
@@ -1861,8 +1913,37 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PrepareImages();
     }
     PhaseClock record_clock{stats.phase_ns[7]};
-    if (!s.rendering || !(s.render == targets.state) || NeedsBarrierFor(b)) {
-        GlobalBarrier();
+    {
+        // NAT-140: a full barrier only when the draw reads what was written since the last
+        // one, or draws into what was read since; a pass that draws into pictures earlier
+        // passes drew waits for their attachment writes only; other passes don't wait.
+        static const bool pass_barriers = [] {
+            const char* env = std::getenv("RYGT_NATIVE_PASS_BARRIERS");
+            return !(env && env[0] == '0');
+        }();
+        const bool pass_change = !s.rendering || !(s.render == targets.state);
+        const auto targets_in = [&](const std::vector<const Native::ImageEntry*>& list) {
+            if (list.empty()) {
+                return false;
+            }
+            for (const auto* entry : targets.colors) {
+                if (entry && std::ranges::find(list, entry) != list.end()) {
+                    return true;
+                }
+            }
+            return targets.depth && std::ranges::find(list, targets.depth) != list.end();
+        };
+        if (!pass_barriers) {
+            if (pass_change || NeedsBarrierFor(b)) {
+                GlobalBarrier();
+            }
+        } else if (NeedsBarrierFor(b) || (pass_change && targets_in(s.read))) {
+            GlobalBarrier();
+        } else if (pass_change && targets_in(s.attach_dirty)) {
+            PassBarrier();
+        } else if (pass_change) {
+            ++stats.passes_unblocked;
+        }
     }
     BeginRendering(targets.state);
 
@@ -2588,6 +2669,13 @@ void NativeRenderer::Splice() {
 std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCore::ImageInfo& info,
                                                                    vk::Format view_format) {
     std::scoped_lock lock{mutex};
+    if (InPlaceSampled()) {
+        for (u32 i = 0; i < in_place.pages.size(); ++i) {
+            in_place.total[i] += in_place.pages[i].size();
+            in_place.pages[i].clear();
+        }
+        ++in_place.frames;
+    }
     ++frame;
     // The game's render target there (its layout from the CB registers may differ in details
     // from the video out description), else an image of the display layout.
@@ -2777,7 +2865,8 @@ void NativeRenderer::Report() {
     report_base = {uploads, upload_bytes, evicted, stale};
     LOG_INFO(Render_Vulkan,
              "NAT-100 native (10 s): {} draws, {} dispatches, {} skipped, {} without pipeline; "
-             "{} passes, {} barriers, {} lists run; {} reads copied ({:.1f} MB), {} ranges bound "
+             "{} passes, {} barriers ({} pass barriers, {} passes unblocked, NAT-140), {} lists "
+             "run; {} reads copied ({:.1f} MB), {} ranges bound "
              "empty, {} images bound empty; {} fills, {} copies, {} meta clears, {} inline "
              "writes, {} pictures copied from targets, {} written back, {} CPU writes to textures, "
              "{} ranges gathered, region binds/made/refreshes {}/{}/{} (NAT-114), "
@@ -2789,7 +2878,8 @@ void NativeRenderer::Report() {
              "reason (none/unmapped/format/geometry/outside/FIX-081/no image) {}; us per draw in "
              "pipeline/targets/buffers/textures(sources)/vertices/prepare/record {}",
              stats.draws, stats.dispatches, stats.skipped, stats.no_pipeline, stats.passes,
-             stats.barriers, stats.splices, stats.copied_reads, stats.copied_bytes / 1048576.0,
+             stats.barriers, stats.pass_barriers, stats.passes_unblocked, stats.splices,
+             stats.copied_reads, stats.copied_bytes / 1048576.0,
              stats.unbound, stats.null_images, stats.fills, stats.copies, stats.meta_clears,
              stats.inline_writes, stats.source_copies, stats.writebacks,
              stats.cpu_writes.exchange(0),
@@ -2812,6 +2902,16 @@ void NativeRenderer::Report() {
                  }
                  return text;
              }());
+    if (in_place.frames != 0) {
+        const auto mb = [&](u32 i) { return in_place.total[i] * 64.0 / 1024.0 / in_place.frames; };
+        LOG_INFO(Render_Vulkan,
+                 "NAT-142: guest memory used in place per frame (64 KB pages, MB): vertices "
+                 "{:.1f}, indices {:.1f}, read-only storage {:.1f}, storage read {:.1f}, storage "
+                 "written {:.1f} ({} frames sampled)",
+                 mb(0), mb(1), mb(2), mb(3), mb(4), in_place.frames);
+        in_place.total = {};
+        in_place.frames = 0;
+    }
     const u64 cpu_writes = stats.cpu_writes.load();
     stats.draws = stats.dispatches = stats.skipped = stats.no_pipeline = stats.passes = 0;
     stats.barriers = stats.splices = stats.copied_reads = stats.copied_bytes = stats.unbound = 0;
@@ -2821,6 +2921,7 @@ void NativeRenderer::Report() {
     stats.region_binds = stats.regions_made = stats.region_refreshes = 0;
     stats.fill_shaders = stats.rewrite_clears = stats.rewrite_uploads = 0;
     stats.rewrite_partial = stats.rewrite_fills = 0;
+    stats.pass_barriers = stats.passes_unblocked = 0;
     stats.null_reasons = {};
     stats.phase_ns = {};
     (void)cpu_writes;
