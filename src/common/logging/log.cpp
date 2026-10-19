@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <ranges>
 #include <string>
 #include <fmt/std.h>
 #include <spdlog/sinks/async_sink.h>
@@ -28,6 +30,7 @@ using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/logging/stdout_level.h"
 #include "common/logging/log_file_sink.h"
 #include "common/path_util.h"
 #include "common/thread.h"
@@ -36,8 +39,11 @@ using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 
 namespace Common::Log {
 
-static std::shared_ptr<spdlog_stdout> g_console_sink;
+static std::shared_ptr<spdlog::sinks::sink> g_console_sink;
 static std::shared_ptr<LogFileSink> g_shad_file_sink;
+#ifdef RYTY_GPU
+static std::unique_ptr<spdlog::logger> g_stdout_logger;
+#endif
 static std::array<std::unique_ptr<spdlog::logger>, NUM_LOG_CLASSES> ALL_LOGGERS{};
 
 std::array<Level, NUM_LOG_CLASSES> g_class_levels{};
@@ -65,10 +71,13 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
     fmt::memory_buffer msg;
     fmt::vformat_to(fmt::appender(msg), format, args);
     const std::string_view fn = std::string_view(func) == "operator()" ? "lambda" : func;
-    logger->log(ToSpdlog(level), "[{}] <{}> ({}) {}:{} {}: {}", NameOf(log_class),
-                NameOf(ToSpdlog(level)), Common::GetCurrentThreadName(),
-                spdlog::source_loc::basename(file), line, fn,
-                std::string_view(msg.data(), msg.size()));
+    const auto entry = fmt::format("[{}] <{}> ({}) {}:{} {}: {}", NameOf(log_class),
+        NameOf(ToSpdlog(level)), Common::GetCurrentThreadName(),
+        spdlog::source_loc::basename(file), line, fn, std::string_view(msg.data(), msg.size()));
+    logger->log(ToSpdlog(level), "{}", entry);
+#ifdef RYTY_GPU
+    if (g_stdout_logger) g_stdout_logger->log(ToSpdlog(level), "{}", entry);
+#endif
 }
 
 template <typename T>
@@ -124,7 +133,9 @@ void Setup(std::string_view shadps4_filename) {
 
     // Setup console
 
-#ifdef _WIN32
+#ifdef RYTY_GPU
+    g_console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>(spdlog::color_mode::never);
+#elif defined(_WIN32)
     if (EmulatorSettings.GetLogType() == "wincolor") {
         g_console_sink = std::make_shared<spdlog::sinks::wincolor_stdout_sink_mt>();
     } else {
@@ -136,6 +147,12 @@ void Setup(std::string_view shadps4_filename) {
 #endif
 
     g_console_sink->set_pattern("%^%v%$");
+#ifdef RYTY_GPU
+    const auto root = std::filesystem::current_path();
+    g_stdout_logger = std::make_unique<spdlog::logger>("stdout", g_console_sink);
+    g_stdout_logger->set_level(static_cast<spdlog::level>(StdoutLevel::Read(root / "RyGT.ini")));
+    g_stdout_logger->flush_on(spdlog::level::trace);
+#endif
 
     // Setup file
 
@@ -145,6 +162,9 @@ void Setup(std::string_view shadps4_filename) {
     g_shad_file_sink->set_pattern("%^%v%$");
 
     UpdateSinks();
+#ifdef RYTY_GPU
+    UpdateLogLevels(EmulatorSettings.GetLogFilter());
+#endif
 }
 
 void Switch(std::string_view game_filename, bool append_log) {
@@ -164,6 +184,9 @@ void Shutdown() {
     }
 
     g_shad_file_sink.reset();
+#ifdef RYTY_GPU
+    g_stdout_logger.reset();
+#endif
     g_console_sink.reset();
 }
 
@@ -178,7 +201,12 @@ void Flush() {
 }
 
 void UpdateSinks() {
+#ifdef RYTY_GPU
+    // Keep existing per-class file logging independent of the stdout threshold.
+    std::initializer_list<spdlog::sink_ptr> sinks{g_shad_file_sink};
+#else
     std::initializer_list<spdlog::sink_ptr> sinks{g_console_sink, g_shad_file_sink};
+#endif
 
     std::initializer_list<spdlog::sink_ptr> async_sink{std::make_shared<spdlog::sinks::async_sink>(
         spdlog::sinks::async_sink::config{.sinks = sinks})};
@@ -233,6 +261,12 @@ void UpdateLogLevels(std::string_view log_filter) {
             logger->set_level(spdlog::level::off);
             g_class_levels[i] = Level::Off;
         }
+#ifdef RYTY_GPU
+        if (g_stdout_logger) {
+            // The macro gate must admit messages wanted by either independent output.
+            g_class_levels[i] = FromSpdlog((std::min)(logger->log_level(), g_stdout_logger->log_level()));
+        }
+#endif
     }
 }
 
