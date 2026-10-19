@@ -110,15 +110,26 @@ game thread (render job)                     submit (PGL 0x1c56610 / sceGnmSubmi
    (~0.1%) are draws whose pixel shader comes from earlier work outside the job's ancestry
    (the job sees no pixel shader): detectable on the job thread, so such draws can fall back
    to the command processor.
-5. **N4 Native mode, hybrid first.** Job threads record each job's draws into secondary command
-   lists, split at the job's flushes, events, waits and writes. The command processor keeps
-   walking packets and handling those (fences, labels, flips, compute rings, as today), and at
-   the first draw of a recorded segment runs its list instead of decoding the draws. Vulkan v1
-   reuses shadGT's pipeline cache from the job threads (Liverpool::SetThreadDrawState gives it
-   the job's registers; selection is under its lookup lock) and binds resources natively: images
-   from the registry, buffers in place through DirectMemory's imported guest memory. Open
-   points: memory the command processor still writes through the old caches (DMA, fills) must
-   land in guest memory for in-place reads; the presenter must show native display images.
+5. **N4 Native mode.** Lessons from N3 and the direct renderer's profile: the serial
+   bottleneck is the recorder (resources: BindTextures/FindImage and friends, ~9 ms per
+   submit), not the decoder; selecting pipelines elsewhere alone does not raise the frame rate.
+   The old texture and buffer caches are single-threaded and keep images in step with guest
+   memory as the command processor sees it, so job threads can't use them. Native mode
+   therefore uses its own thread-safe caches for all of a frame's GPU work:
+   - Job threads record each job's draws into secondary command lists (split at the job's
+     flushes, events, waits and writes): pipeline from shadGT's cache (SetThreadDrawState +
+     lookup lock, later a lock-free cache), buffers read in place from imported guest memory,
+     textures and targets as ImageRegistry handles. Work that must happen at the GPU's point
+     in time (uploads from guest memory, invalidation, layout/metadata operations) is queued
+     with the segment, not done at record time.
+   - The command processor keeps walking packets in GPU order: it runs each segment's list
+     after its queued work, and does syncs (labels, EOP, waits), dispatches, clears, copies and
+     the root context's draws through the same native rasterizer. The old rasterizer is not
+     used in native mode; the presenter shows the registry's display images.
+   Steps: **N4.0 (NAT-030)** the job-thread recorder in shadow mode (record, don't run):
+   pipelines, bindings and lists per draw, checked against what the current renderer binds for
+   the same draw packet, with the cost per draw. **N4.1** native mode for whole frames, boot
+   screen and menus first. **N4.2** races, screenshots compared with the current renderer.
 6. **N5 Speed**: lock-free pipeline lookups for repeated draws, pipelines built ahead from the
    shader pack.
 7. **N6 DX12**: the backend interface on D3D12, SPIR-V to DXIL, and pipelines built natively
