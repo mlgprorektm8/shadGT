@@ -168,6 +168,8 @@ Common::NativeClock* GetClock() {
 }
 } // namespace Dev
 
+#ifndef RYTY_GUEST_PTHREADS
+// The NP guest-pthread bridge provides its own firmware query.
 // ryGT: for the on-screen keyboard dialog (its panel size depends on the firmware version).
 s32 PS4_SYSV_ABI sceKernelGetSystemSwVersion(SwVersionStruct* ret) {
     if (ret != nullptr) {
@@ -179,6 +181,7 @@ s32 PS4_SYSV_ABI sceKernelGetSystemSwVersion(SwVersionStruct* ret) {
     return 0;
 }
 
+#endif
 } // namespace Libraries::Kernel
 
 namespace Libraries::SystemService {

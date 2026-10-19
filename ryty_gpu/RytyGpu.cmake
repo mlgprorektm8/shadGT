@@ -215,3 +215,8 @@ ryty_add_library(ryty_np libSceNpAuth
 target_compile_definitions(ryty_np PRIVATE RYTY_GUEST_PTHREADS)
 target_link_libraries(ryty_np PRIVATE libprotobuf Cpp_Httplib minimp3 miniupnpc::miniupnpc ws2_32 iphlpapi)
 target_include_directories(ryty_np PRIVATE "${SHADNET_PROTO_OUT}")
+
+# Non-renderer libraries do not link the Vulkan shader compiler.
+foreach(target IN ITEMS ryty_ngs2 ryty_ajm ryty_audio3d ryty_zlib ryty_discmap ryty_screenshot ryty_np)
+    target_sources(${target} PRIVATE ryty_gpu/ryty_hle_precompile.cpp)
+endforeach()
