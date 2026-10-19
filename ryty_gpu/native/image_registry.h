@@ -187,6 +187,7 @@ public:
     struct Stats {
         std::atomic<u64> lookups, hits, created_textures, created_targets, uploads, upload_bytes;
         std::atomic<u64> evicted;
+        std::atomic<u64> reused_larger; ///< NAT-113
         std::array<std::atomic<u64>, 3> stale; ///< textures marked, by Stale
     };
     const Stats& GetStats() const {

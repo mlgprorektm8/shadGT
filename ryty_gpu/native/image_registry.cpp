@@ -151,6 +151,34 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 return it->second.get();
             }
         }
+        if (render_target) {
+            // NAT-113: a target drawn at the same address in the same layout (pitch, tiling,
+            // texel size) that is at least as large is drawn into again: GT Sport's dynamic
+            // resolution changes target sizes a little from frame to frame (depth 354x150, then
+            // 336x150), and the next pass reads what the last one drew there.
+            ImageEntry* best = nullptr;
+            for (auto it = first; it != last; ++it) {
+                const auto& c = it->second->info;
+                if (!it->second->from_cpu && it->second->image && c.pitch == info.pitch &&
+                    c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
+                    c.num_samples == info.num_samples && c.props.is_depth == info.props.is_depth &&
+                    c.props.has_stencil == info.props.has_stencil && c.type == info.type &&
+                    c.resources.levels >= info.resources.levels &&
+                    c.resources.layers >= info.resources.layers &&
+                    c.size.width >= info.size.width && c.size.height >= info.size.height &&
+                    (!info.props.is_depth || c.pixel_format == info.pixel_format) &&
+                    (!best || u64(c.size.width) * c.size.height <
+                                  u64(best->info.size.width) * best->info.size.height)) {
+                    best = it->second.get();
+                }
+            }
+            if (best) {
+                ++stats.hits;
+                ++stats.reused_larger;
+                best->last_use.store(frame, std::memory_order_relaxed);
+                return best;
+            }
+        }
     }
     if (!render_target) {
         // NAT-040: a depth buffer read as a texture (the T# names R32/R16, the image is D32/D16):
@@ -159,9 +187,10 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         const auto [first, last] = shard.images.equal_range(info.guest_address);
         for (auto it = first; it != last; ++it) {
             const auto& cached = it->second->info;
-            if (cached.props.is_depth && !info.props.is_depth &&
-                cached.size.width == info.size.width && cached.size.height == info.size.height &&
-                cached.num_bits == info.num_bits) {
+            if (cached.props.is_depth && !info.props.is_depth && cached.num_bits == info.num_bits &&
+                ((cached.size.width == info.size.width && cached.size.height == info.size.height) ||
+                 (cached.pitch == info.pitch && cached.size.width >= info.size.width &&
+                  cached.size.height >= info.size.height))) { // NAT-113
                 ++stats.hits;
                 it->second->last_use.store(frame, std::memory_order_relaxed);
                 return it->second.get();

@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -168,6 +169,23 @@ private:
     Chunk TakeChunk(u64 size);
     vk::DescriptorPool TakeDescriptorPool();
 
+    /// NAT-114: a range shaders write that no single imported view holds lives in a buffer of
+    /// its own on the GPU (a region), filled from guest memory when made; every later binding
+    /// over it uses the region, and CPU writes to its pages are copied in before the next use.
+    struct Region {
+        VAddr begin = 0;
+        VAddr end = 0;
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        std::vector<VAddr> dirty_pages; ///< written by the CPU since the last use
+    };
+    std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
+    std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
+    std::vector<std::pair<VAddr, VAddr>> pending_region_writes;
+    std::atomic<bool> has_pending_region_writes{false};
+    void SortRegionWrites();
+    Region* RegionOver(VAddr address, u64 size);
+    Region* MakeRegion(VAddr address, u64 size);
+    void RefreshRegion(Region& region);
     /// NAT-107: a guest range gathered on the GPU from the imported views holding it, into a
     /// buffer of the list (none when part of it is not imported).
     std::optional<std::pair<vk::Buffer, u64>> GatherOnGpu(VAddr address, u64 size);
@@ -258,7 +276,8 @@ private:
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
             fills = 0, copies = 0, meta_clears = 0, inline_writes = 0, source_copies = 0,
-            draw_ns = 0, dispatch_ns = 0, gathers = 0, gathered_bytes = 0, writebacks = 0;
+            draw_ns = 0, dispatch_ns = 0, gathers = 0, gathered_bytes = 0, writebacks = 0,
+            region_binds = 0, regions_made = 0, region_refreshes = 0;
         /// Images bound empty: no address or format, not mapped for the GPU, format the
         /// device lacks, bad geometry, outside guest memory, FIX-081, no image made.
         std::array<u64, 7> null_reasons{};

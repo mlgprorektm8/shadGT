@@ -771,10 +771,154 @@ vk::DescriptorPool NativeRenderer::TakeDescriptorPool() {
     return pool;
 }
 
+NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
+    auto it = regions.upper_bound(address);
+    if (it != regions.begin()) {
+        Region& region = std::prev(it)->second;
+        if (address < region.end) {
+            return &region;
+        }
+    }
+    if (it != regions.end() && it->second.begin < address + size) {
+        return &it->second;
+    }
+    return nullptr;
+}
+
+NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    // The new region takes in every region it overlaps (their GPU-written contents kept).
+    VAddr begin = Common::AlignDown(address, 4096);
+    VAddr end = Common::AlignUp(address + size, 4096);
+    std::vector<Region> merged;
+    for (auto it = regions.begin(); it != regions.end();) {
+        if (it->second.begin < end && it->second.end > begin) {
+            begin = std::min(begin, it->second.begin);
+            end = std::max(end, it->second.end);
+            merged.push_back(std::move(it->second));
+            it = regions.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (!direct || end - begin > 1_GB || !direct->EnsureImported(begin, end - begin)) {
+        return nullptr;
+    }
+    Region region;
+    region.begin = begin;
+    region.end = end;
+    region.buffer = device->CreateBuffer({.size = end - begin,
+                                          .usage = Native::Rhi::BufferUsageStorage |
+                                                   Native::Rhi::BufferUsageVertex |
+                                                   Native::Rhi::BufferUsageIndex |
+                                                   Native::Rhi::BufferUsageIndirect |
+                                                   Native::Rhi::BufferUsageTransferSrc |
+                                                   Native::Rhi::BufferUsageTransferDst,
+                                          .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                                          .name = "native region"});
+    if (!region.buffer) {
+        return nullptr;
+    }
+    Stream& s = Begin();
+    GlobalBarrier();
+    const vk::Buffer dst{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
+    // Guest memory first, then what the GPU wrote into the regions taken in.
+    direct->ForEachPart(begin, end - begin,
+                        [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
+                            s.cmd.copyBuffer(view.Handle(), dst,
+                                             vk::BufferCopy{.srcOffset = view_offset,
+                                                            .dstOffset = offset,
+                                                            .size = bytes});
+                        });
+    for (auto& old : merged) {
+        s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(old.buffer->NativeHandle())}, dst,
+                         vk::BufferCopy{.srcOffset = 0,
+                                        .dstOffset = old.begin - begin,
+                                        .size = old.end - old.begin});
+        s.keep.push_back(std::move(old.buffer)); // freed once the list ran
+    }
+    s.buffers_written = true;
+    // CPU writes to it from now on are copied in before its next use.
+    WatchPages(begin, end - begin);
+    ++stats.regions_made;
+    LOG_INFO(Render_Vulkan, "NAT-114: region {:#x}+{:#x} on the GPU ({} taken in)", begin,
+             end - begin, merged.size());
+    auto [it, inserted] = regions.emplace(begin, std::move(region));
+    return &it->second;
+}
+
+void NativeRenderer::SortRegionWrites() {
+    if (!has_pending_region_writes.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    std::vector<std::pair<VAddr, VAddr>> writes;
+    {
+        std::scoped_lock lock{region_dirty_mutex};
+        writes.swap(pending_region_writes);
+    }
+    for (const auto& [begin, end] : writes) {
+        for (auto& [base, region] : regions) {
+            if (region.begin < end && region.end > begin) {
+                for (VAddr page = std::max(begin, region.begin); page < std::min(end, region.end);
+                     page += 4096) {
+                    region.dirty_pages.push_back(page);
+                }
+            }
+        }
+    }
+}
+
+void NativeRenderer::RefreshRegion(Region& region) {
+    SortRegionWrites();
+    std::vector<VAddr> pages;
+    pages.swap(region.dirty_pages);
+    if (pages.empty()) {
+        return;
+    }
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    if (!direct) {
+        return;
+    }
+    Stream& s = Begin();
+    GlobalBarrier();
+    const vk::Buffer dst{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
+    std::ranges::sort(pages);
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    for (const VAddr page : pages) {
+        if (page < region.begin || page >= region.end) {
+            continue;
+        }
+        direct->ForEachPart(page, std::min<u64>(4096, region.end - page),
+                            [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
+                                u64 bytes) {
+                                s.cmd.copyBuffer(view.Handle(), dst,
+                                                 vk::BufferCopy{.srcOffset = view_offset,
+                                                                .dstOffset = page - region.begin +
+                                                                             offset,
+                                                                .size = bytes});
+                            });
+    }
+    s.buffers_written = true;
+    WatchPages(region.begin, region.end - region.begin);
+    ++stats.region_refreshes;
+}
+
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr address, u64 size,
                                                                       bool write) {
     if (size == 0) {
         return std::nullopt;
+    }
+    // NAT-114: ranges in (or reaching into) a region use it.
+    if (Region* region = RegionOver(address, size)) {
+        if (address < region->begin || address + size > region->end) {
+            region = MakeRegion(address, size);
+        }
+        if (region) {
+            RefreshRegion(*region);
+            ++stats.region_binds;
+            return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
+                             u64{address - region->begin}};
+        }
     }
     if (auto* direct = r.buffer_cache.GetDirectMemory();
         direct && direct->EnsureImported(address, size)) {
@@ -788,7 +932,11 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
         }
     }
     if (write) {
-        // Written ranges must be the game's memory itself.
+        if (Region* region = MakeRegion(address, size)) {
+            ++stats.region_binds;
+            return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
+                             u64{address - region->begin}};
+        }
         ++stats.unbound;
         static std::atomic<u32> logged{};
         if (Sample(logged)) {
@@ -1093,7 +1241,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
                 const u64 size = r.memory->ClampRangeSize(base, sharp_size);
                 if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) &&
-                    direct->EnsureImported(base, size)) {
+                    !RegionOver(base, size) && direct->EnsureImported(base, size)) {
                     // D3: read in place through the page table; nothing bound.
                     direct_entries[buffer_index] = {u32(base), u32(base >> 32), u32(size), 1u};
                 } else if (const auto found = GuestBuffer(base, size, desc.is_written)) {
@@ -2015,6 +2163,13 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     }
     registry->CpuWrite(begin, end - begin, exact != 0 ? (address - begin) + exact : 0);
     ++stats.cpu_writes;
+    // NAT-114: pages of regions written by the CPU (a fault on any thread) are copied in before
+    // the region's next use; the recorder sorts them to their regions.
+    {
+        std::scoped_lock pending_lock{region_dirty_mutex};
+        pending_region_writes.emplace_back(begin, end);
+    }
+    has_pending_region_writes.store(true, std::memory_order_release);
 }
 
 u32 NativeRenderer::ReadGds(u32 gds_offset) {
@@ -2156,7 +2311,7 @@ void NativeRenderer::Report() {
              "{} passes, {} barriers, {} lists run; {} reads copied ({:.1f} MB), {} ranges bound "
              "empty, {} images bound empty; {} fills, {} copies, {} meta clears, {} inline "
              "writes, {} pictures copied from targets, {} written back, {} CPU writes to textures, "
-             "{} ranges gathered "
+             "{} ranges gathered, region binds/made/refreshes {}/{}/{} (NAT-114), "
              "on the GPU ({:.1f} MB), uploads from guest memory on the GPU/CPU {}/{}; images so far: "
              "{} lookups, {} textures and {} targets made, {} uploads ({:.1f} MB); {:.0f} draws/s, "
              "{:.2f} us a draw, {:.2f} us a dispatch on the recorder; images bound empty by "
@@ -2167,7 +2322,8 @@ void NativeRenderer::Report() {
              stats.unbound, stats.null_images, stats.fills, stats.copies, stats.meta_clears,
              stats.inline_writes, stats.source_copies, stats.writebacks,
              stats.cpu_writes.exchange(0),
-             stats.gathers, stats.gathered_bytes / 1048576.0,
+             stats.region_binds, stats.regions_made, stats.region_refreshes, stats.gathers,
+             stats.gathered_bytes / 1048576.0,
              registry->GetUploadStats().gpu.load(), registry->GetUploadStats().cpu.load(),
              registry_stats.lookups.load(),
              registry_stats.created_textures.load(), registry_stats.created_targets.load(),
@@ -2189,6 +2345,7 @@ void NativeRenderer::Report() {
     stats.null_images = stats.fills = stats.copies = stats.meta_clears = stats.inline_writes = 0;
     stats.source_copies = stats.draw_ns = stats.dispatch_ns = 0;
     stats.gathers = stats.gathered_bytes = stats.writebacks = 0;
+    stats.region_binds = stats.regions_made = stats.region_refreshes = 0;
     stats.null_reasons = {};
     stats.phase_ns = {};
     (void)cpu_writes;
