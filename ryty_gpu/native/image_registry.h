@@ -98,9 +98,13 @@ public:
     /// (GT Sport clears depth buffers and pictures with a fill shader). Applied at the
     /// target's next use: cleared with the fill pattern, or uploaded from memory. The stencil
     /// plane (its own memory) only takes clears. Recorder thread only.
+    /// NAT-124: a fill of only the first bytes (a metadata clear in memory a picture shares)
+    /// clears only the rows they hold; other writes of part of a picture are left alone (its
+    /// picture is not in memory: uploading it wiped glows and the wet road's reflection).
     enum class Rewrite : u8 { None, Upload, Clear };
     Rewrite rewrite = Rewrite::None;
     std::array<u32, 2> rewrite_pattern{};
+    u64 rewrite_bytes = 0; ///< how much of the picture's memory the fill wrote
     bool stencil_clear_pending = false;
     u8 stencil_clear_value = 0;
 
@@ -178,7 +182,10 @@ public:
     /// a pending rewrite (ImageEntry::rewrite), textures the write overlaps are uploaded again
     /// (not those made of targets: their pictures come from the targets). A write inside a
     /// render target leaves it (its pictures are on the GPU only).
-    void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern);
+    /// NAT-129: `exact` when the size is what was written (a fill, a CP copy); a storage buffer's
+    /// size is only what the shader may write (GT Sport binds its whole scratch pool), so such a
+    /// write uploads a target again only when the buffer is about the target's size.
+    void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern, bool exact);
     /// NAT-120: uploads the image from guest memory before its next use.
     void RequestUpload(ImageEntry& entry) {
         MarkStale(entry, Stale::GpuWrite);

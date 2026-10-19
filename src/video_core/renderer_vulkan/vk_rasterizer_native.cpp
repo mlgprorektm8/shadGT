@@ -1350,6 +1350,20 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         if (!entry->from_cpu) {
             ApplyRewrite(*entry); // NAT-120
         }
+        if (!storage && r.FrameDumpCollecting()) {
+            bool gpu_written = !entry->from_cpu;
+            if (!gpu_written) {
+                std::scoped_lock lock{entry->sources_mutex};
+                gpu_written = !entry->sources.empty();
+            }
+            if (gpu_written) {
+                auto key = Rasterizer::FrameDumpTextureKey(desc.info); // NAT-123
+                if (std::ranges::find(dump_textures, key, &decltype(dump_textures)::value_type::first) ==
+                    dump_textures.end()) {
+                    dump_textures.emplace_back(std::move(key), entry);
+                }
+            }
+        }
         if (!storage && entry->from_cpu) {
             const auto start = std::chrono::steady_clock::now();
             RefreshSources(*entry); // NAT-104
@@ -1651,21 +1665,37 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
         const u32 height =
             std::min({place.height, std::max(texture.info.size.height >> place.mip, 1u),
                       pick.source->info.size.height});
+        // NAT-125: a layered target (a cube's faces drawn in one pass, the layer from the
+        // vertex shader) gives all its layers.
+        const u32 layers = std::max<u32>(
+            1u, std::min<u32>(std::max<u32>(pick.source->image->Desc().layers, 1u),
+                              std::max<u32>(texture.image->Desc().layers, 1u) - u32(place.layer)));
         const vk::ImageCopy region{
             .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
                             .mipLevel = 0,
                             .baseArrayLayer = 0,
-                            .layerCount = 1},
+                            .layerCount = layers},
             .srcOffset = {0, 0, 0},
             .dstSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
                             .mipLevel = u32(place.mip),
                             .baseArrayLayer = u32(place.layer),
-                            .layerCount = 1},
+                            .layerCount = layers},
             .dstOffset = {0, 0, 0},
             .extent = {width, height, 1},
         };
         CmdBuf{s.cmd}.copyImage(vk::Image{Handle<VkImage_T>(pick.source->image->NativeHandle())},
                                 vk::ImageLayout::eGeneral, dst, vk::ImageLayout::eGeneral, region);
+        if (Rasterizer::Traced(texture.info.guest_address, texture.info.guest_size)) {
+            LOG_WARNING(Render_Vulkan,
+                        "NAT-130: texture {:#x} {}x{} mips {} layers {} <- target {:#x} {}x{} "
+                        "layers {} at mip {} layer {} ({} layers, version {})",
+                        texture.info.guest_address, texture.info.size.width,
+                        texture.info.size.height, texture.info.resources.levels,
+                        texture.info.resources.layers, pick.source->info.guest_address,
+                        pick.source->info.size.width, pick.source->info.size.height,
+                        pick.source->info.resources.layers, place.mip, place.layer, layers,
+                        pick.version);
+        }
         held[(u32(place.mip) << 16) | u32(place.layer)] = pick.version;
     }
     s.written.push_back(&texture); // read after the next barrier
@@ -1711,9 +1741,9 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     // GPU order: the next PrepareImages records the uploads behind a barrier).
     for (const auto& [address, size] : b.gpu_writes) {
         if (b.fill_pattern && address == b.fill_address) {
-            GpuWrote(address, std::min(size, b.fill_size), &*b.fill_pattern); // NAT-120
+            GpuWrote(address, std::min(size, b.fill_size), &*b.fill_pattern, true); // NAT-120
         } else {
-            GpuWrote(address, size, nullptr);
+            GpuWrote(address, size, nullptr, false); // NAT-129: what the shader may write
         }
     }
 }
@@ -1805,7 +1835,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock clock{stats.phase_ns[1]};
         ResolveTargets(regs, *pipeline, targets);
     }
-    if (r.FrameDumpCollecting()) {
+    if (r.FrameDumpActive()) {
         r.FrameDumpPass(regs, targets.state, pipeline); // NAT-117
     }
     DrawBindings& b = bindings;
@@ -1877,8 +1907,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     Report();
 }
 
-void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern) {
-    registry->GpuWrote(address, size, pattern);
+void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
+                              bool exact) {
+    registry->GpuWrote(address, size, pattern, exact);
     // A fill of a stencil plane: depth images whose stencil is there clear it at next use.
     const auto it = stencil_owners.find(address);
     if (it == stencil_owners.end() || !pattern) {
@@ -1905,6 +1936,76 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
     const bool stencil = std::exchange(entry.stencil_clear_pending, false);
     const u32 lo = entry.rewrite_pattern[0];
     const u32 hi = entry.rewrite_pattern[1];
+    // NAT-124: a fill of the first bytes only: those rows of the first mip and layer get the
+    // pattern (copied from a buffer filled with it, which suits any format).
+    if (rewrite == Rewrite::Clear && entry.rewrite_bytes < info.guest_size) {
+        const u32 texel = info.props.is_depth
+                              ? (info.pixel_format == vk::Format::eD16Unorm ||
+                                         info.pixel_format == vk::Format::eD16UnormS8Uint
+                                     ? 2u
+                                     : 4u)
+                              : info.num_bits / 8;
+        const u64 row_bytes = u64(std::max(info.pitch, info.size.width)) * texel;
+        const u32 rows = row_bytes ? u32(std::min<u64>((entry.rewrite_bytes + row_bytes - 1) /
+                                                           row_bytes,
+                                                       info.size.height))
+                                   : 0;
+        if (lo == hi && rows != 0 && texel != 0 && !info.props.is_block &&
+            info.num_samples == 1 && entry.image) {
+            const u64 bytes = u64(info.size.width) * rows * texel;
+            auto pattern = device->CreateBuffer({.size = Common::AlignUp(bytes, 4),
+                                                 .usage = Native::Rhi::BufferUsageTransferDst |
+                                                          Native::Rhi::BufferUsageTransferSrc,
+                                                 .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                                                 .name = "native partial clear"});
+            if (pattern) {
+                Stream& s = Begin();
+                GlobalBarrier();
+                const vk::Buffer buffer{Handle<VkBuffer_T>(pattern->NativeHandle())};
+                s.cmd.fillBuffer(buffer, 0, Common::AlignUp(bytes, 4), lo);
+                const vk::BufferMemoryBarrier2 filled{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                    .buffer = buffer,
+                    .offset = 0,
+                    .size = VK_WHOLE_SIZE,
+                };
+                s.cmd.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1,
+                                                          .pBufferMemoryBarriers = &filled});
+                const vk::BufferImageCopy copy{
+                    .bufferOffset = 0,
+                    .bufferRowLength = info.size.width,
+                    .bufferImageHeight = rows,
+                    .imageSubresource{.aspectMask = info.props.is_depth
+                                                        ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
+                                      .mipLevel = 0,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1},
+                    .imageOffset = {0, 0, 0},
+                    .imageExtent = {info.size.width, rows, 1},
+                };
+                s.cmd.copyBufferToImage(buffer,
+                                        vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
+                                        vk::ImageLayout::eGeneral, copy);
+                Written(&entry);
+                s.buffers_written = true;
+                ++s.commands;
+                ++stats.rewrite_partial;
+                // the device frees the buffer once the GPU ran this list
+            }
+        }
+        if (!stencil) {
+            return;
+        }
+        // (the stencil plane's own fill is applied below)
+        entry.stencil_clear_pending = true;
+        entry.rewrite = Rewrite::None;
+        ApplyRewrite(entry);
+        return;
+    }
     // What a clear can do: a depth plane filled with one value (32-bit float, or 16-bit
     // unorm), a color picture filled with zeros. Anything else is uploaded from memory.
     std::optional<float> depth_value;
@@ -2021,7 +2122,7 @@ bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
         if (!desc.IsSpecial() && desc.is_written && known_meta.contains(address)) {
             cleared_meta.insert(address);
             cleared = true;
-            if (r.FrameDumpCollecting()) {
+            if (r.FrameDumpActive()) {
                 r.FrameDumpEvent(fmt::format("dispatch: metadata clear {:#x}", address));
             }
         }
@@ -2051,7 +2152,7 @@ void NativeRenderer::DispatchDirect() {
     }
     const auto& regs = r.liverpool->DrawRegs();
     MetaClearDispatch(pipeline->GetStage(Shader::SwStage::Compute));
-    if (r.FrameDumpCollecting()) {
+    if (r.FrameDumpActive()) {
         r.FrameDumpDispatch(pipeline->GetStage(Shader::SwStage::Compute), cs_program,
                             false); // NAT-118
     }
@@ -2091,7 +2192,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
     const auto& regs = r.liverpool->DrawRegs();
-    if (r.FrameDumpCollecting()) {
+    if (r.FrameDumpActive()) {
         r.FrameDumpDispatch(pipeline->GetStage(Shader::SwStage::Compute),
                             r.liverpool->DrawCsRegs(), true); // NAT-118
     }
@@ -2136,13 +2237,14 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     // resolved picture at its first read: GT Sport's minimaps, resolved into the scratch pool).
     ApplyRewrite(*src);
     ApplyRewrite(*dst);
-    if (r.FrameDumpCollecting()) {
+    if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("resolve {:#x} {}x{} x{} -> {:#x} {}x{} x{}",
                                      src->info.guest_address, src->info.size.width,
                                      src->info.size.height, src->info.num_samples,
                                      dst->info.guest_address, dst->info.size.width,
                                      dst->info.size.height, dst->info.num_samples));
-        if (std::ranges::find(dump_entries, dst) == dump_entries.end()) {
+        if (r.FrameDumpCollecting() &&
+            std::ranges::find(dump_entries, dst) == dump_entries.end()) {
             dump_entries.push_back(dst);
         }
     }
@@ -2200,7 +2302,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
         cleared_meta.insert(address); // a CMASK/HTILE cleared by the CP
         ++stats.meta_clears;
     }
-    if (r.FrameDumpCollecting()) {
+    if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("fill {:#x}+{:#x} = {:#x}{}", address, num_bytes, value,
                                      meta ? " (metadata clear)" : "")); // NAT-117
     }
@@ -2217,7 +2319,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
         }
     }
     const std::array<u32, 2> pattern{value, value};
-    GpuWrote(address, num_bytes, &pattern); // NAT-119/120
+    GpuWrote(address, num_bytes, &pattern, true); // NAT-119/120
 }
 
 void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
@@ -2227,7 +2329,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
     std::scoped_lock lock{mutex};
     Stream& s = Begin();
     ++stats.copies;
-    if (r.FrameDumpCollecting()) {
+    if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("copy {:#x}{} <- {:#x}{} ({:#x} bytes)", dst,
                                      dst_gds ? " (GDS)" : "", src, src_gds ? " (GDS)" : "",
                                      num_bytes)); // NAT-117
@@ -2259,7 +2361,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
         }
     }
     if (!dst_gds) {
-        GpuWrote(dst, num_bytes, nullptr); // NAT-119
+        GpuWrote(dst, num_bytes, nullptr, true); // NAT-119
     }
 }
 
@@ -2478,15 +2580,53 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     std::vector<Readback> readbacks;
     Stream& s = Begin();
     GlobalBarrier();
+    // NAT-123: the sampled GPU-written textures follow the targets (named tex_<key>).
+    std::vector<std::pair<const Native::ImageEntry*, std::string>> jobs;
+    {
+        u32 order = 0;
+        for (const auto* entry : dump_entries) {
+            jobs.emplace_back(entry, fmt::format("{:03}_{:x}_{}x{}_{}{}.bin", order++,
+                                                 entry->info.guest_address,
+                                                 entry->image ? entry->image->Desc().width : 0,
+                                                 entry->image ? entry->image->Desc().height : 0,
+                                                 entry->image ? u32(entry->image->Desc().format)
+                                                              : 0,
+                                                 entry->info.props.is_depth ? "_depth" : ""));
+        }
+        std::string list;
+        for (const auto& [key, entry] : dump_textures) {
+            u32 sources;
+            {
+                std::scoped_lock lock{const_cast<Native::ImageEntry*>(entry)->sources_mutex};
+                sources = u32(entry->sources.size());
+            }
+            const auto& info = entry->info;
+            list += fmt::format("{} -> {} {:#x} {}x{} mips {} layers {} {}, {} sources, "
+                                "version {}{}\n",
+                                key, entry->from_cpu ? "texture" : "target", info.guest_address,
+                                info.size.width, info.size.height, info.resources.levels,
+                                info.resources.layers, vk::to_string(info.pixel_format), sources,
+                                entry->write_version.load(),
+                                info.num_samples > 1 ? " (multisampled, not dumped)" : "");
+            jobs.emplace_back(entry, fmt::format("tex_{}{}.bin", key,
+                                                 info.props.is_depth ? "_depth" : ""));
+        }
+        if (std::FILE* file = std::fopen((dir / "textures.txt").string().c_str(), "w")) {
+            std::fwrite(list.data(), 1, list.size(), file);
+            std::fclose(file);
+        }
+    }
     u32 index = 0;
-    for (const auto* entry : dump_entries) {
+    for (const auto& [entry, name] : jobs) {
         const u32 order = index++;
         if (!entry->image || entry->info.props.is_block) {
             continue;
         }
         const auto& desc = entry->image->Desc();
         const u32 texel = entry->info.props.is_depth ? 4u : std::max(entry->info.num_bits / 8, 1u);
-        const u64 size = u64(desc.width) * desc.height * texel;
+        // NAT-125: every layer of the first mip (cube faces, layered targets), one after another.
+        const u32 layers = desc.dim == Native::Rhi::ImageDim::D3 ? 1u : std::max(desc.layers, 1u);
+        const u64 size = u64(desc.width) * desc.height * texel * layers;
         auto buffer = device->CreateBuffer({.size = size,
                                             .usage = Native::Rhi::BufferUsageTransferDst,
                                             .memory = Native::Rhi::MemoryKind::Readback,
@@ -2503,7 +2643,7 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
                                                : vk::ImageAspectFlagBits::eColor,
                               .mipLevel = 0,
                               .baseArrayLayer = 0,
-                              .layerCount = 1},
+                              .layerCount = layers},
             .imageOffset = {0, 0, 0},
             .imageExtent = {desc.width, desc.height, 1},
         };
@@ -2517,18 +2657,16 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     for (const auto& readback : readbacks) {
         const auto& info = readback.entry->info;
         const auto& desc = readback.entry->image->Desc();
-        const auto path =
-            dir / fmt::format("{:03}_{:x}_{}x{}_{}{}.bin", readback.index, info.guest_address,
-                              desc.width, desc.height, u32(desc.format),
-                              info.props.is_depth ? "_depth" : "");
+        const auto path = dir / jobs[readback.index].second;
         if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
             std::fwrite(readback.buffer->Mapped(), 1, readback.size, file);
             std::fclose(file);
         }
     }
-    LOG_WARNING(Render_Vulkan, "NAT-116: {} render targets of the frame dumped to {}",
+    LOG_WARNING(Render_Vulkan, "NAT-116: {} render targets and textures of the frame dumped to {}",
                 readbacks.size(), dir.string());
     dump_entries.clear();
+    dump_textures.clear();
 }
 
 void NativeRenderer::Report() {
@@ -2547,19 +2685,19 @@ void NativeRenderer::Report() {
         stale[i] = registry_stats.stale[i].load();
     }
     // The textures uploaded most in the window.
-    std::vector<std::tuple<u32, VAddr, u32, u32, u64>> busy;
+    std::vector<std::tuple<u32, VAddr, u32, u32, u64, bool>> busy;
     registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& entry) {
         if (const u32 count = entry.upload_count.exchange(0); count >= 4) {
             busy.emplace_back(count, entry.info.guest_address, entry.info.size.width,
-                              entry.info.size.height, entry.info.guest_size);
+                              entry.info.size.height, entry.info.guest_size, entry.from_cpu);
         }
     });
     std::ranges::sort(busy, std::greater{});
     std::string busiest;
     for (size_t i = 0; i < std::min<size_t>(busy.size(), 5); ++i) {
-        const auto& [count, address, width, height, size] = busy[i];
-        busiest += fmt::format(" {:#x} {}x{} ({} KB) x{};", address, width, height, size / 1024,
-                               count);
+        const auto& [count, address, width, height, size, texture] = busy[i];
+        busiest += fmt::format(" {} {:#x} {}x{} ({} KB) x{};", texture ? "texture" : "target",
+                               address, width, height, size / 1024, count);
     }
     std::string crowded;
     for (const auto& [address, count] : registry->Crowded(4)) {
@@ -2583,7 +2721,8 @@ void NativeRenderer::Report() {
              "empty, {} images bound empty; {} fills, {} copies, {} meta clears, {} inline "
              "writes, {} pictures copied from targets, {} written back, {} CPU writes to textures, "
              "{} ranges gathered, region binds/made/refreshes {}/{}/{} (NAT-114), "
-             "fill shaders {}, targets rewritten by clears/uploads {}/{} (NAT-120), "
+             "fill shaders {}, targets rewritten by clears/uploads/partial clears {}/{}/{} "
+             "(NAT-120/124), "
              "on the GPU ({:.1f} MB), uploads from guest memory on the GPU/CPU {}/{}; images so far: "
              "{} lookups, {} textures and {} targets made, {} uploads ({:.1f} MB); {:.0f} draws/s, "
              "{:.2f} us a draw, {:.2f} us a dispatch on the recorder; images bound empty by "
@@ -2596,6 +2735,7 @@ void NativeRenderer::Report() {
              stats.cpu_writes.exchange(0),
              stats.gathers, stats.region_binds, stats.regions_made, stats.region_refreshes,
              stats.fill_shaders, stats.rewrite_clears, stats.rewrite_uploads,
+             stats.rewrite_partial,
              stats.gathered_bytes / 1048576.0,
              registry->GetUploadStats().gpu.load(), registry->GetUploadStats().cpu.load(),
              registry_stats.lookups.load(),
@@ -2620,6 +2760,7 @@ void NativeRenderer::Report() {
     stats.gathers = stats.gathered_bytes = stats.writebacks = 0;
     stats.region_binds = stats.regions_made = stats.region_refreshes = 0;
     stats.fill_shaders = stats.rewrite_clears = stats.rewrite_uploads = 0;
+    stats.rewrite_partial = 0;
     stats.null_reasons = {};
     stats.phase_ns = {};
     (void)cpu_writes;

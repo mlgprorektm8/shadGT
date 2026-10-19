@@ -324,12 +324,27 @@ public:
     bool FrameDumpCollecting() const noexcept {
         return frame_dump_collecting;
     }
+    /// NAT-130 (RYGT_TRACE_RANGE=<hex lo>-<hex hi>): passes, dispatches, copies and fills that
+    /// touch guest memory in [lo, hi) are logged all run long (NAT-130 lines), as the frame dump's
+    /// events. The hooks run when this or the dump wants them.
+    static std::pair<VAddr, VAddr> TraceRange();
+    bool FrameDumpActive() const noexcept {
+        return frame_dump_collecting || TraceRange().first != TraceRange().second;
+    }
+    /// NAT-130: whether [address, address + size) meets the traced range.
+    static bool Traced(VAddr address, u64 size) {
+        const auto [lo, hi] = TraceRange();
+        return lo != hi && address < hi && address + std::max<u64>(size, 1) > lo;
+    }
     /// NAT-117: the dumped frame's work in GPU order (passes with the targets the registers name
     /// and whether they start cleared, fills, metadata clears), written as events.txt next to
     /// the dump. Consecutive draws into the same targets are one line.
     void FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& state,
                        const GraphicsPipeline* pipeline);
     void FrameDumpEvent(std::string text);
+    /// NAT-123: the name a sampled texture is dumped under (its T#: address, size, mips,
+    /// layers, format), the same in both renderers.
+    static std::string FrameDumpTextureKey(const VideoCore::ImageInfo& info);
     /// NAT-118: a dispatch of the dumped frame with what it writes (buffers, storage images).
     void FrameDumpDispatch(const Shader::Info& cs, const AmdGpu::ComputeProgram& program,
                            bool indirect);
@@ -614,7 +629,11 @@ private:
         u32 draws;
     };
     std::vector<FrameDumpEntry> frame_dump_events;
+    std::string trace_last_pass; // NAT-130
+    void TraceText(const std::string& text);
     void FrameDumpWriteEvents(const std::filesystem::path& dir);
+    /// NAT-123: GPU-written images the frame sampled, by texture key (old path).
+    std::vector<std::tuple<std::string, VideoCore::ImageId, u64>> frame_dump_textures;
 };
 
 } // namespace Vulkan

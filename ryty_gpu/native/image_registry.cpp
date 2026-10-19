@@ -9,6 +9,7 @@
 #include <xxhash.h>
 #include "ryty_gpu/native/image_registry.h"
 #include "video_core/amdgpu/tiling.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 
 #include "video_core/host_shaders/tiling_macro_128_comp.h"
 #include "video_core/host_shaders/tiling_macro_16_comp.h"
@@ -141,36 +142,50 @@ ImageRegistry::~ImageRegistry() = default;
 ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame) {
     ++stats.lookups;
     Shard& shard = ShardOf(info.guest_address);
-    if (!render_target && !info.props.is_depth) {
-        // NAT-040: a depth buffer read as a texture (the T# names R32/R16, the image is D32/D16):
-        // the depth image itself, viewed through its depth aspect. NAT-121: looked for first, so
-        // a texture of the same layout made before the depth buffer existed (an upload of the
-        // memory under it, where only the CPU's or a fill's bytes are) does not hide it: GT
-        // Sport's shadow cascades (a 256x256 depth target with 14 layers, read with 13).
-        std::shared_lock lock{shard.mutex};
-        const auto [first, last] = shard.images.equal_range(info.guest_address);
-        for (auto it = first; it != last; ++it) {
-            const auto& cached = it->second->info;
-            if (cached.props.is_depth && cached.num_bits == info.num_bits &&
-                cached.resources.layers >= info.resources.layers &&
-                ((cached.size.width == info.size.width && cached.size.height == info.size.height) ||
-                 (cached.pitch == info.pitch && cached.size.width >= info.size.width &&
-                  cached.size.height >= info.size.height))) { // NAT-113
-                ++stats.hits;
-                it->second->last_use.store(frame, std::memory_order_relaxed);
-                return it->second.get();
-            }
-        }
-    }
     {
         std::shared_lock lock{shard.mutex};
         const auto [first, last] = shard.images.equal_range(info.guest_address);
+        ImageEntry* exact = nullptr;
         for (auto it = first; it != last; ++it) {
             if (SameLayout(it->second->info, info)) {
-                ++stats.hits;
-                it->second->last_use.store(frame, std::memory_order_relaxed);
-                return it->second.get();
+                exact = it->second.get();
+                if (render_target || !exact->from_cpu) {
+                    break;
+                }
             }
+        }
+        // A target of the texture's own layout is read as it is.
+        if (exact && (render_target || !exact->from_cpu)) {
+            ++stats.hits;
+            exact->last_use.store(frame, std::memory_order_relaxed);
+            return exact;
+        }
+        if (!render_target && !info.props.is_depth &&
+            Vulkan::LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format)) {
+            // NAT-040: a depth buffer read as a texture (the T# names R32/R16, the image is
+            // D32/D16): the depth image itself, viewed through its depth aspect. NAT-121: before a
+            // texture of the same layout (an upload of the memory under the depth buffer, made
+            // before it existed, would hide it: GT Sport's shadow cascades, a 256x256 depth
+            // target with 14 layers read with 13). NAT-126: only for depth-like formats (a
+            // B10G11R11 bloom picture in the scratch pool matched a bigger depth buffer there).
+            for (auto it = first; it != last; ++it) {
+                const auto& cached = it->second->info;
+                if (cached.props.is_depth && cached.num_bits == info.num_bits &&
+                    cached.resources.layers >= info.resources.layers &&
+                    ((cached.size.width == info.size.width &&
+                      cached.size.height == info.size.height) ||
+                     (cached.pitch == info.pitch && cached.size.width >= info.size.width &&
+                      cached.size.height >= info.size.height))) { // NAT-113
+                    ++stats.hits;
+                    it->second->last_use.store(frame, std::memory_order_relaxed);
+                    return it->second.get();
+                }
+            }
+        }
+        if (exact) {
+            ++stats.hits;
+            exact->last_use.store(frame, std::memory_order_relaxed);
+            return exact;
         }
         if (render_target) {
             // NAT-113: a target drawn at the same address in the same layout (pitch, tiling,
@@ -245,6 +260,16 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
     if (render_target) {
         ++stats.created_targets;
         LinkTarget(*result);
+        // NAT-127: a new target starts with what memory holds there, as on the console (a pass
+        // that draws part of it leaves the rest as it was). GT Sport draws its 16x16 brightness
+        // grid into a 64x16 target the CPU reads back for the exposure: the undrawn part went
+        // back to memory as uninitialized video memory, and the picture came out too dark.
+        if (info.num_samples == 1) {
+            result->needs_upload.store(true, std::memory_order_relaxed);
+            result->force_upload.store(true, std::memory_order_relaxed);
+            std::scoped_lock lock{upload_mutex};
+            pending_uploads.push_back(result);
+        }
     } else {
         ++stats.created_textures;
         LinkTexture(*result);
@@ -540,9 +565,16 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     });
 }
 
-void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern) {
+void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
+                             bool exact) {
     ForEachOverlapping(address, address + std::max<u64>(size, 1), [&](ImageEntry& entry) {
         if (entry.from_cpu) {
+            // NAT-129: a storage buffer as big as GT Sport's scratch pool would upload every
+            // texture in it again at each dispatch (10-30 GB in 10 s): only buffers about the
+            // texture's size count, as for targets below.
+            if (!exact && size > 2 * std::max<u64>(entry.info.guest_size, 1)) {
+                return;
+            }
             bool made_of_targets;
             {
                 std::scoped_lock lock{entry.sources_mutex};
@@ -556,12 +588,16 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
         if (entry.info.guest_address != address) {
             return;
         }
-        ++stats.targets_rewritten;
-        if (pattern && size >= entry.info.guest_size) {
+        if (pattern) {
+            ++stats.targets_rewritten;
             entry.rewrite = ImageEntry::Rewrite::Clear;
             entry.rewrite_pattern = *pattern;
-        } else {
+            entry.rewrite_bytes = std::min<u64>(size, entry.info.guest_size);
+        } else if (size >= entry.info.guest_size &&
+                   (exact || size <= 2 * entry.info.guest_size)) {
+            ++stats.targets_rewritten;
             entry.rewrite = ImageEntry::Rewrite::Upload;
+            entry.rewrite_bytes = entry.info.guest_size;
         }
     });
 }

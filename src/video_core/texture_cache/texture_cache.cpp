@@ -105,7 +105,9 @@ bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path
     }
     const u32 width = image.info.size.width;
     const u32 height = image.info.size.height;
-    const u32 size = width * height * bytes_per_texel;
+    // NAT-125: every layer of the first mip, one after another.
+    const u32 layers = image.info.props.is_volume ? 1u : std::max<u32>(image.info.resources.layers, 1u);
+    const u32 size = width * height * bytes_per_texel * layers;
     const auto download = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16);
     const vk::BufferImageCopy copy = {
         .bufferOffset = download.offset,
@@ -117,7 +119,7 @@ bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path
                                     : vk::ImageAspectFlagBits::eColor,
                 .mipLevel = 0,
                 .baseArrayLayer = 0,
-                .layerCount = 1,
+                .layerCount = layers,
             },
         .imageOffset = {0, 0, 0},
         .imageExtent = {width, height, 1},

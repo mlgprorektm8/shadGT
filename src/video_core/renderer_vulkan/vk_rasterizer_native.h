@@ -227,11 +227,13 @@ private:
     void FlushWritebacks();
     std::vector<Native::ImageEntry*> writebacks;
     std::vector<const Native::ImageEntry*> dump_entries; // NAT-116
+    /// NAT-123: GPU-written images the dumped frame sampled, by texture key.
+    std::vector<std::pair<std::string, const Native::ImageEntry*>> dump_textures;
     /// NAT-120: depth images by the address of their stencil plane (fills clear it there).
     std::unordered_map<VAddr, boost::container::small_vector<Native::ImageEntry*, 2>>
         stencil_owners;
     /// NAT-120: GPU work wrote guest memory (targets there get a pending rewrite).
-    void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern);
+    void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern, bool exact);
     /// NAT-120: a target's pending rewrite, before it is used: a clear, or an upload.
     void ApplyRewrite(Native::ImageEntry& entry);
     /// NAT-120: GT Sport's fill shader (cs 0x8aa6e00c): its pattern and range, from the
@@ -295,6 +297,7 @@ private:
 
     struct Stats {
         u64 rewrite_clears = 0, rewrite_uploads = 0, fill_shaders = 0; ///< NAT-120
+        u64 rewrite_partial = 0; ///< NAT-124
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
             fills = 0, copies = 0, meta_clears = 0, inline_writes = 0, source_copies = 0,
