@@ -136,6 +136,12 @@ public:
         return background.size();
     }
 
+    /// PERF-160: jobs waiting for a worker, foreground and background.
+    size_t Pending() {
+        std::scoped_lock lk{mutex};
+        return jobs.size() + background.size();
+    }
+
     /// Wakes the workers waiting for jobs or a pause, so they can see a stop request.
     void NotifyAll() {
         cv.notify_all();

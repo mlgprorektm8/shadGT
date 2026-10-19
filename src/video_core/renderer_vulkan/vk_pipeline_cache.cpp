@@ -305,6 +305,12 @@ private:
         Common::PreferEfficiencyCores();
         bool low_priority = false;
         bool all_cores = false;
+        bool backlog = false;
+        // PERF-160: when new pipelines pile up (a new menu, the first seconds on a new track), the
+        // workers may use every core, at low priority so the game's own threads keep theirs; on
+        // Intel hybrid CPUs they otherwise stay on the efficiency cores (PERF-097), where a pile of
+        // compiles took several times longer. -DisablePerf 160 keeps them there.
+        static const bool backlog_cores = Common::PerfFeatureEnabled(160);
         while (true) {
             BuildQueue::Job job;
             bool background = false;
@@ -314,16 +320,26 @@ private:
             // PERF-102: while the game waits on the splash screen for the precompile, every core
             // builds (and at normal priority); afterwards only the efficiency cores.
             const bool boosted = queue.Boosted();
-            if (boosted != all_cores) {
-                all_cores = boosted;
+            if (backlog_cores) {
+                const size_t pending = queue.Pending();
+                if (pending >= 16) {
+                    backlog = true;
+                } else if (pending <= 2) {
+                    backlog = false;
+                }
+            }
+            const bool wide = boosted || backlog;
+            if (wide != all_cores) {
+                all_cores = wide;
                 if (all_cores) {
                     Common::AllowAllCores();
                 } else {
                     Common::PreferEfficiencyCores();
                 }
             }
-            if ((background && !boosted) != low_priority) {
-                low_priority = background && !boosted;
+            const bool low = !boosted && (background || backlog);
+            if (low != low_priority) {
+                low_priority = low;
                 Common::SetCurrentThreadPriority(low_priority ? Common::ThreadPriority::Low
                                                               : Common::ThreadPriority::Normal);
             }
@@ -740,6 +756,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (const char* dir = std::getenv("SHADGT_TEMPLATE_TEST"); dir && *dir) {
         static std::jthread template_test{[this, d = std::string{dir}] { TemplateTest(d); }};
     }
+    if (const char* dir = std::getenv("SHADGT_DUMP_STORE"); dir && *dir) {
+        static std::jthread dump_store{[this, d = std::string{dir}] { DumpStore(d); }};
+    }
     // FIX-078: a quarter of the hardware threads (at least 2) translate read-ahead shaders.
     if (Common::PerfFeatureEnabled(102)) {
         const u32 count = std::max(2u, std::thread::hardware_concurrency() / 4);
@@ -973,7 +992,8 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(
 // shader record. False when it could not be translated.
 bool ReplayTranslate(const Shader::Profile& profile, Shader::Pools& pools,
                      const std::vector<u8>& program, const Shader::Info& stored,
-                     const Shader::StageSpecialization& spec, std::vector<u32>& spv) {
+                     const Shader::StageSpecialization& spec, std::vector<u32>& spv,
+                     const std::function<void(const Shader::Info&)>& inspect = {}) {
     if (program.size() < 64 || stored.flattened_ud_buf.size() < 16) {
         return false;
     }
@@ -1038,6 +1058,10 @@ bool ReplayTranslate(const Shader::Profile& profile, Shader::Pools& pools,
         Common::RecoverableScope recoverable;
         const auto ir = Shader::TranslateProgram(params.code, pools, info, runtime_info, profile);
         spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir, binding);
+        if (inspect) {
+            // PB-4: the translation's resources (their sharps come from the record's user data).
+            inspect(info);
+        }
     } catch (...) {
         return false;
     }
@@ -1057,54 +1081,74 @@ void PipelineCache::RebuildFromPrograms() {
     }
     auto& store = Storage::DataBase::Instance();
     const auto start = std::chrono::steady_clock::now();
-    Shader::Pools pools;
-    u64 rebuilt = 0, failed = 0, no_program = 0;
-    for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::ShaderMeta)) {
-        std::vector<u8> blob;
-        store.Load(Storage::BlobType::ShaderMeta, name, blob);
-        Shader::Info info{};
-        Shader::StageSpecialization spec{};
-        spec.info = &info;
-        size_t perm_idx{};
-        Serialization::Archive ar{std::move(blob)};
-        try {
-            Common::RecoverableScope recoverable;
-            if (ar.SizeBytes() < 24 || !LoadShaderMeta(ar, info, spec, perm_idx)) {
+    const auto metas = store.ListBlobs(Storage::BlobType::ShaderMeta);
+    std::atomic<u64> rebuilt = 0, failed = 0, no_program = 0;
+    std::atomic<size_t> next = 0;
+    // PERF-161: translated on several threads (a first boot with RyGT's shader pack translated
+    // 12,590 shaders in 36 s on one). -DisablePerf 161 uses one.
+    static const bool parallel = Common::PerfFeatureEnabled(161);
+    const u32 threads =
+        parallel ? std::clamp(std::thread::hardware_concurrency() - 2, 1u, 12u) : 1u;
+    const auto work = [&] {
+        Shader::Pools pools;
+        for (size_t i = next++; i < metas.size(); i = next++) {
+            const auto& name = metas[i].first;
+            std::vector<u8> blob;
+            store.Load(Storage::BlobType::ShaderMeta, name, blob);
+            Shader::Info info{};
+            Shader::StageSpecialization spec{};
+            spec.info = &info;
+            size_t perm_idx{};
+            Serialization::Archive ar{std::move(blob)};
+            try {
+                Common::RecoverableScope recoverable;
+                if (ar.SizeBytes() < 24 || !LoadShaderMeta(ar, info, spec, perm_idx)) {
+                    continue;
+                }
+            } catch (...) {
                 continue;
             }
-        } catch (...) {
-            continue;
+            const auto spv_name = fmt::format("{:#018x}_{}", info.pgm_hash, perm_idx);
+            if (store.Exists(Storage::BlobType::ShaderBinary, spv_name)) {
+                continue;
+            }
+            std::vector<u8> program;
+            if (Common::FS::IOFile file{dir / fmt::format("{:016x}.bin", info.pgm_hash),
+                                        Common::FS::FileAccessMode::Read};
+                file.IsOpen()) {
+                program.resize(file.GetSize());
+                file.ReadSpan(std::span{program});
+            }
+            if (program.empty()) {
+                ++no_program;
+                continue;
+            }
+            std::vector<u32> spv;
+            if (!ReplayTranslate(profile, pools, program, info, spec, spv)) {
+                ++failed;
+                continue;
+            }
+            RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+            ++rebuilt;
         }
-        const auto spv_name = fmt::format("{:#018x}_{}", info.pgm_hash, perm_idx);
-        if (store.Exists(Storage::BlobType::ShaderBinary, spv_name)) {
-            continue;
+    };
+    {
+        std::vector<std::jthread> workers;
+        for (u32 t = 1; t < threads; ++t) {
+            workers.emplace_back([&] {
+                Common::SetCurrentThreadName("shadGT:PackTranslate");
+                work();
+            });
         }
-        std::vector<u8> program;
-        if (Common::FS::IOFile file{dir / fmt::format("{:016x}.bin", info.pgm_hash),
-                                    Common::FS::FileAccessMode::Read};
-            file.IsOpen()) {
-            program.resize(file.GetSize());
-            file.ReadSpan(std::span{program});
-        }
-        if (program.empty()) {
-            ++no_program;
-            continue;
-        }
-        std::vector<u32> spv;
-        if (!ReplayTranslate(profile, pools, program, info, spec, spv)) {
-            ++failed;
-            continue;
-        }
-        RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
-        ++rebuilt;
+        work();
     }
     if (rebuilt + failed + no_program != 0) {
         LOG_WARNING(Render_Vulkan,
-                    "PB-1: {} shaders translated from this PC's game files in {:.1f} s ({} failed, "
-                    "{} without their program)",
-                    rebuilt,
+                    "PB-1: {} shaders translated from this PC's game files in {:.1f} s on {} "
+                    "threads ({} failed, {} without their program)",
+                    rebuilt.load(),
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
-                    failed, no_program);
+                    threads, failed.load(), no_program.load());
     }
 }
 
@@ -1406,6 +1450,187 @@ void PipelineCache::ReplayTest(const std::string& dir) {
     for (const auto& name : not_identical) {
         other << name << '\n';
     }
+}
+
+// PB-4 (SHADGT_DUMP_STORE=<folder>): writes the store's shader records and pipeline keys as
+// text, for research on predicting them from the game's files: <folder>\metas.tsv (each record
+// translated again from <folder>\programs\<hash>.bin, with every resource's sharp read from the
+// record's user data) and <folder>\keys.tsv.
+void PipelineCache::DumpStore(const std::string& dir) {
+    Common::SetCurrentThreadName("shadGT:DumpStore");
+    const auto hex = [](const void* data, size_t size) {
+        std::string out;
+        const auto* bytes = static_cast<const u8*>(data);
+        for (size_t i = 0; i < size; ++i) {
+            out += fmt::format("{:02x}", bytes[i]);
+        }
+        return out;
+    };
+    auto& store = Storage::DataBase::Instance();
+    Shader::Pools pools;
+    u64 written = 0, no_program = 0, failed = 0;
+    {
+        std::ofstream out{std::filesystem::path{dir} / "metas.tsv"};
+        out << "name\tpgm\tperm\tstage\tflat_dw\truntime\tvs_attribs\tfetch\tbuffers\timages\tsamplers"
+               "\tspec_buffers\tspec_images\tspec_samplers\n";
+        for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::ShaderMeta)) {
+            std::vector<u8> blob;
+            store.Load(Storage::BlobType::ShaderMeta, name, blob);
+            Shader::Info stored{};
+            Shader::StageSpecialization spec{};
+            spec.info = &stored;
+            size_t perm_idx{};
+            Serialization::Archive ar{std::move(blob)};
+            try {
+                Common::RecoverableScope recoverable;
+                if (ar.SizeBytes() < 24 || !LoadShaderMeta(ar, stored, spec, perm_idx)) continue;
+            } catch (...) {
+                continue;
+            }
+            std::string runtime;
+            const auto& rt = spec.runtime_info;
+            if (stored.sw_stage == Shader::SwStage::Fragment) {
+                const auto& fs = rt.hw.fs;
+                runtime = fmt::format("fs en={} addr={} inputs={} [",
+                                      hex(&fs.en_flags, sizeof(fs.en_flags)),
+                                      hex(&fs.addr_flags, sizeof(fs.addr_flags)), fs.num_inputs);
+                for (u32 i = 0; i < fs.num_inputs && i < fs.inputs.size(); ++i) {
+                    const auto& in = fs.inputs[i];
+                    runtime += fmt::format("{}{}{}{},", in.param_index, in.is_default ? "d" : "",
+                                           in.is_flat ? "f" : "", in.is_default ? in.default_value : 0);
+                }
+                runtime += "] cb=[";
+                for (const auto& cb : fs.color_buffers) {
+                    runtime += fmt::format("{}/{}/{}/{}/{},", u32(cb.data_format), u32(cb.num_format),
+                                           u32(cb.num_conversion), u32(cb.export_format),
+                                           hex(&cb.swizzle, sizeof(cb.swizzle)));
+                }
+                runtime += fmt::format("] z={} samples={} mrtz={} dual={}", u32(fs.z_export_format),
+                                       fs.num_samples, fs.mrtz_mask, fs.dual_source_blending);
+            } else if (stored.hw_stage == Shader::HwStage::Vertex) {
+                const auto& vs = rt.hw.vs;
+                runtime = fmt::format("vs outputs={} map={} clip_disable={} ucp={}", vs.num_outputs,
+                                      hex(vs.outputs.data(), sizeof(vs.outputs)), vs.clip_disable,
+                                      vs.user_clip_plane_mask);
+            } else {
+                runtime = fmt::format("stage{} {}", u32(stored.hw_stage), hex(&rt, sizeof(rt)));
+            }
+            runtime += fmt::format(" ud={} vgprs={}/{}", rt.props.num_user_data,
+                                   rt.props.num_input_vgprs, rt.props.num_allocated_vgprs);
+            std::string vs_attribs;
+            for (const auto& a : spec.vs_attribs) {
+                vs_attribs += fmt::format("{}/{}/{},", a.divisor, u32(a.num_class),
+                                          hex(&a.dst_select, sizeof(a.dst_select)));
+            }
+            std::string fetch;
+            for (const auto& a : spec.fetch_shader_data.attributes) {
+                fetch += hex(&a, sizeof(a)) + ",";
+            }
+            std::string spec_buffers, spec_images, spec_samplers;
+            for (const auto& b : spec.buffers) {
+                spec_buffers += fmt::format("{}/{}/{}/{}/{},", u32(b.stride), u32(b.is_formatted),
+                                            u32(b.data_format), u32(b.num_format),
+                                            u32(b.swizzle_enable));
+            }
+            for (const auto& i : spec.images) {
+                spec_images += fmt::format("{}/{}/{}/{}/{}/{},", u32(i.type), i.is_integer,
+                                           i.is_storage, i.is_srgb, u32(i.num_conversion),
+                                           i.num_bindings);
+            }
+            for (const auto& s : spec.samplers) {
+                spec_samplers += fmt::format("{}/{},", u32(s.force_unnormalized), u32(s.force_degamma));
+            }
+            std::string buffers = "-", images = "-", samplers = "-";
+            std::vector<u8> program;
+            if (Common::FS::IOFile file{std::filesystem::path{dir} / "programs" /
+                                            fmt::format("{:016x}.bin", stored.pgm_hash),
+                                        Common::FS::FileAccessMode::Read};
+                file.IsOpen()) {
+                program.resize(file.GetSize());
+                file.ReadSpan(std::span{program});
+            }
+            if (program.empty()) {
+                ++no_program;
+            } else {
+                std::vector<u32> spv;
+                const bool ok = ReplayTranslate(
+                    profile, pools, program, stored, spec, spv, [&](const Shader::Info& info) {
+                        buffers.clear();
+                        images.clear();
+                        samplers.clear();
+                        for (const auto& b : info.buffers) {
+                            const auto sharp = b.GetSharp(info);
+                            buffers += fmt::format("{}/{}/{}/{}:{},", u32(b.buffer_type), b.is_written,
+                                                   b.is_formatted, u32(b.used_types),
+                                                   hex(&sharp, sizeof(sharp)));
+                        }
+                        for (const auto& i : info.images) {
+                            const auto sharp = i.GetSharp(info);
+                            images += fmt::format("{}{}{}{}:{},", i.is_depth ? "d" : "",
+                                                  i.is_array ? "a" : "", i.is_written ? "w" : "",
+                                                  i.is_r128 ? "r" : "", hex(&sharp, sizeof(sharp)));
+                        }
+                        for (const auto& s : info.samplers) {
+                            const auto sharp = s.GetSharp(info);
+                            samplers += hex(&sharp, sizeof(sharp)) + ",";
+                        }
+                    });
+                if (!ok) {
+                    ++failed;
+                }
+            }
+            out << name << '\t' << fmt::format("{:016x}", stored.pgm_hash) << '\t' << perm_idx << '\t'
+                << u32(stored.sw_stage) << '\t' << stored.flattened_ud_buf.size() << '\t' << runtime
+                << '\t' << vs_attribs << '\t' << fetch << '\t' << buffers << '\t' << images << '\t'
+                << samplers << '\t' << spec_buffers << '\t' << spec_images << '\t' << spec_samplers
+                << '\n';
+            ++written;
+        }
+    }
+    u64 keys = 0;
+    {
+        std::ofstream out{std::filesystem::path{dir} / "keys.tsv"};
+        out << "name\tstages\tvertex_formats\tcolor\tblend\twrite_masks\tmisc\n";
+        for (const auto& [name, time] : store.ListBlobs(Storage::BlobType::PipelineKey)) {
+            if (!name.starts_with("g_")) continue;
+            std::vector<u8> blob;
+            store.Load(Storage::BlobType::PipelineKey, name, blob);
+            GraphicsPipelineKey key{};
+            GraphicsPipeline::SerializationSupport sdata{};
+            try {
+                Common::RecoverableScope recoverable;
+                if (!LoadStoredGraphicsPipeline(std::move(blob), key, sdata)) continue;
+            } catch (...) {
+                continue;
+            }
+            std::string stages, formats, color, blend, masks;
+            for (const auto h : key.stage_hashes) stages += fmt::format("{:x},", h);
+            for (const auto f : key.vertex_buffer_formats) {
+                if (f != vk::Format::eUndefined) formats += fmt::format("{},", u32(f));
+            }
+            for (u32 i = 0; i < key.num_color_attachments && i < key.color_buffers.size(); ++i) {
+                const auto& cb = key.color_buffers[i];
+                color += fmt::format("{}/{}/{}/{},", u32(cb.data_format), u32(cb.num_format),
+                                     u32(cb.num_conversion), u32(cb.export_format));
+                blend += hex(&key.blend_controls[i], sizeof(key.blend_controls[i])) + ",";
+                masks += fmt::format("{},", u32(key.write_masks[i]));
+            }
+            out << name << '\t' << stages << '\t' << formats << '\t' << color << '\t' << blend << '\t'
+                << masks << '\t'
+                << fmt::format("cbmask={} samples={}/{} mrt={:x} z={} stencil={} prim={} poly={} "
+                               "patch={}",
+                               hex(&key.cb_shader_mask, sizeof(key.cb_shader_mask)),
+                               key.num_samples, key.depth_samples, key.mrt_mask, u32(key.z_format),
+                               u32(key.stencil_format), u32(key.prim_type), u32(key.polygon_mode),
+                               key.patch_control_points)
+                << '\n';
+            ++keys;
+        }
+    }
+    LOG_WARNING(Render_Vulkan,
+                "PB-4 store dump: {} shader records ({} without a program, {} failed), {} pipeline "
+                "keys in {}",
+                written, no_program, failed, keys, dir);
 }
 
 bool PipelineCache::LegacyWaits() const {

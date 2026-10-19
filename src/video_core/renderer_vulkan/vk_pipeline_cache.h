@@ -163,6 +163,8 @@ private:
     void ReplayTest(const std::string& dir);
     /// PB-2: SHADGT_TEMPLATE_TEST, see the constructor.
     void TemplateTest(const std::string& dir);
+    /// PB-4: SHADGT_DUMP_STORE, see the constructor.
+    void DumpStore(const std::string& dir);
     /// PB-1: translates stored shader records that have no SPIR-V yet from this PC's programs.
     void RebuildFromPrograms();
     /// PERF-038: queues a stored pipeline's build behind all other builds.
