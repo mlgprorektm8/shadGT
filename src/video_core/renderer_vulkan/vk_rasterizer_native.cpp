@@ -258,6 +258,10 @@ void NativeRenderer::DrawBindings::Clear() {
     push = {};
     sampled.clear();
     stored.clear();
+    gpu_writes.clear();
+    fill_pattern.reset();
+    fill_address = 0;
+    fill_size = 0;
     writes_buffers = false;
     failed = false;
 }
@@ -1039,6 +1043,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
         if (!view) {
             continue;
         }
+        ApplyRewrite(*entry); // NAT-120
         out.colors[cb] = entry;
         const u32 mip = desc.view_info.range.base.level;
         width = std::min<u32>(width, std::max(entry->info.size.width >> mip, 1u));
@@ -1069,6 +1074,13 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
         const vk::ImageView view =
             entry ? View(*entry, desc.view_info, ViewUse::Attachment) : vk::ImageView{};
         if (view) {
+            ApplyRewrite(*entry); // NAT-120
+            if (regs.depth_buffer.StencilValid() && entry->info.props.has_stencil) {
+                auto& owners = stencil_owners[regs.depth_buffer.StencilAddress()];
+                if (std::ranges::find(owners, entry) == owners.end()) {
+                    owners.push_back(entry);
+                }
+            }
             bool meta_clear = false;
             if (htile != 0) {
                 known_meta.insert(htile);
@@ -1250,6 +1262,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     b.push.AddOffset(binding.buffer, static_cast<u32>(adjust));
                     info = {found->first, aligned, size + adjust};
                     b.writes_buffers |= desc.is_written;
+                    if (desc.is_written) {
+                        b.gpu_writes.emplace_back(base, size); // NAT-119
+                    }
                 }
             }
         }
@@ -1331,6 +1346,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         if (!entry) {
             bind_null(6);
             continue;
+        }
+        if (!entry->from_cpu) {
+            ApplyRewrite(*entry); // NAT-120
         }
         if (!storage && entry->from_cpu) {
             const auto start = std::chrono::steady_clock::now();
@@ -1656,6 +1674,10 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     Stream& s = stream;
     const auto note = [&](const Native::ImageEntry* entry) {
         Written(entry);
+        if (entry && r.FrameDumpCollecting() &&
+            std::ranges::find(dump_entries, entry) == dump_entries.end()) {
+            dump_entries.push_back(entry); // NAT-116
+        }
         if (entry && std::ranges::find(s.written, entry) == s.written.end()) {
             s.written.push_back(entry);
         }
@@ -1682,6 +1704,15 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         }
     }
     s.buffers_written |= b.writes_buffers;
+    // NAT-119: images the shader overwrote in memory are uploaded again (after this work, in
+    // GPU order: the next PrepareImages records the uploads behind a barrier).
+    for (const auto& [address, size] : b.gpu_writes) {
+        if (b.fill_pattern && address == b.fill_address) {
+            GpuWrote(address, std::min(size, b.fill_size), &*b.fill_pattern); // NAT-120
+        } else {
+            GpuWrote(address, size, nullptr);
+        }
+    }
 }
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
@@ -1770,6 +1801,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock clock{stats.phase_ns[1]};
         ResolveTargets(regs, *pipeline, targets);
     }
+    if (r.FrameDumpCollecting()) {
+        r.FrameDumpPass(regs, targets.state, pipeline); // NAT-117
+    }
     DrawBindings& b = bindings;
     b.Clear();
     b.push = UserData(regs);
@@ -1839,6 +1873,131 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     Report();
 }
 
+void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern) {
+    registry->GpuWrote(address, size, pattern);
+    // A fill of a stencil plane: depth images whose stencil is there clear it at next use.
+    const auto it = stencil_owners.find(address);
+    if (it == stencil_owners.end() || !pattern) {
+        return;
+    }
+    const u32 lo = (*pattern)[0];
+    const bool uniform = (*pattern)[0] == (*pattern)[1] && lo == (lo & 0xffu) * 0x01010101u;
+    if (!uniform) {
+        return;
+    }
+    for (auto* entry : it->second) {
+        entry->stencil_clear_pending = true;
+        entry->stencil_clear_value = static_cast<u8>(lo);
+    }
+}
+
+void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
+    using Rewrite = Native::ImageEntry::Rewrite;
+    if (entry.rewrite == Rewrite::None && !entry.stencil_clear_pending) {
+        return;
+    }
+    const auto& info = entry.info;
+    const Rewrite rewrite = std::exchange(entry.rewrite, Rewrite::None);
+    const bool stencil = std::exchange(entry.stencil_clear_pending, false);
+    const u32 lo = entry.rewrite_pattern[0];
+    const u32 hi = entry.rewrite_pattern[1];
+    // What a clear can do: a depth plane filled with one value (32-bit float, or 16-bit
+    // unorm), a color picture filled with zeros. Anything else is uploaded from memory.
+    std::optional<float> depth_value;
+    bool color_zero = false;
+    if (rewrite == Rewrite::Clear) {
+        if (info.props.is_depth) {
+            const auto format = info.pixel_format;
+            const bool d16 = format == vk::Format::eD16Unorm || format == vk::Format::eD16UnormS8Uint;
+            if (!d16 && lo == hi) {
+                depth_value = std::bit_cast<float>(lo);
+            } else if (d16 && lo == hi && (lo >> 16) == (lo & 0xffffu)) {
+                depth_value = float(lo & 0xffffu) / 65535.0f;
+            }
+        } else if (!info.props.is_block && lo == 0 && hi == 0) {
+            color_zero = true;
+        }
+    }
+    const bool clear = depth_value || color_zero || (stencil && info.props.has_stencil);
+    if (rewrite != Rewrite::None && !depth_value && !color_zero) {
+        if (info.num_samples == 1) {
+            registry->RequestUpload(entry); // in GPU order, before the next draw or dispatch
+            ++stats.rewrite_uploads;
+        }
+    }
+    if (!clear || !entry.image) {
+        return;
+    }
+    Stream& s = Begin();
+    GlobalBarrier(); // the work before is done with the picture
+    const vk::Image image{Handle<VkImage_T>(entry.image->NativeHandle())};
+    const auto range = [](vk::ImageAspectFlags aspect) {
+        return vk::ImageSubresourceRange{
+            .aspectMask = aspect,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
+    };
+    if (depth_value) {
+        s.cmd.clearDepthStencilImage(image, vk::ImageLayout::eGeneral,
+                                     vk::ClearDepthStencilValue{.depth = *depth_value},
+                                     range(vk::ImageAspectFlagBits::eDepth));
+    }
+    if (stencil && info.props.has_stencil) {
+        s.cmd.clearDepthStencilImage(
+            image, vk::ImageLayout::eGeneral,
+            vk::ClearDepthStencilValue{.stencil = entry.stencil_clear_value},
+            range(vk::ImageAspectFlagBits::eStencil));
+    }
+    if (color_zero) {
+        s.cmd.clearColorImage(image, vk::ImageLayout::eGeneral, vk::ClearColorValue{},
+                              range(vk::ImageAspectFlagBits::eColor));
+    }
+    Written(&entry);
+    s.buffers_written = true; // the next work waits for the clear
+    ++s.commands;
+    ++stats.rewrite_clears;
+}
+
+void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
+    // GT Sport's fill shader reads [lo, hi, count] from its first buffer and writes lo, hi,
+    // lo, hi... (count dwords) to its second: a memset of depth buffers, stencil planes and
+    // pictures.
+    constexpr u64 FillShader = 0x8aa6e00c;
+    if (cs.pgm_hash != FillShader || cs.buffers.size() < 2) {
+        return;
+    }
+    const Shader::BufferResource* args = nullptr;
+    const Shader::BufferResource* out = nullptr;
+    for (const auto& desc : cs.buffers) {
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        if (desc.is_written) {
+            out = out ? out : &desc;
+        } else {
+            args = args ? args : &desc;
+        }
+    }
+    if (!args || !out) {
+        return;
+    }
+    const auto args_sharp = args->GetSharp(cs);
+    const auto out_sharp = out->GetSharp(cs);
+    const void* arguments = reinterpret_cast<const void*>(args_sharp.base_address);
+    if (args_sharp.base_address == 0 || !Native::Readable(arguments, 12)) {
+        return;
+    }
+    std::array<u32, 3> words{};
+    std::memcpy(words.data(), arguments, sizeof(words));
+    b.fill_pattern = std::array<u32, 2>{words[0], words[1]};
+    b.fill_address = out_sharp.base_address;
+    b.fill_size = std::min<u64>(u64(words[2]) * 4, out_sharp.GetSize());
+    ++stats.fill_shaders;
+}
+
 bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
     // As IsComputeMetaClear: a shader writing a known CMASK/HTILE without tile address math
     // (no XOR) and reading none clears it. The dispatch still runs (FIX-112: GT Sport reuses
@@ -1858,6 +2017,9 @@ bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
         if (!desc.IsSpecial() && desc.is_written && known_meta.contains(address)) {
             cleared_meta.insert(address);
             cleared = true;
+            if (r.FrameDumpCollecting()) {
+                r.FrameDumpEvent(fmt::format("dispatch: metadata clear {:#x}", address));
+            }
         }
     }
     stats.meta_clears += cleared;
@@ -1885,6 +2047,10 @@ void NativeRenderer::DispatchDirect() {
     }
     const auto& regs = r.liverpool->DrawRegs();
     MetaClearDispatch(pipeline->GetStage(Shader::SwStage::Compute));
+    if (r.FrameDumpCollecting()) {
+        r.FrameDumpDispatch(pipeline->GetStage(Shader::SwStage::Compute), cs_program,
+                            false); // NAT-118
+    }
     Stream& s = Begin();
     DrawBindings& b = bindings;
     b.Clear();
@@ -1894,6 +2060,7 @@ void NativeRenderer::DispatchDirect() {
         ++stats.skipped;
         return;
     }
+    ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
     PrepareImages();
     GlobalBarrier();
     const CmdBuf cmdbuf{s.cmd};
@@ -1920,6 +2087,10 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         return;
     }
     const auto& regs = r.liverpool->DrawRegs();
+    if (r.FrameDumpCollecting()) {
+        r.FrameDumpDispatch(pipeline->GetStage(Shader::SwStage::Compute),
+                            r.liverpool->DrawCsRegs(), true); // NAT-118
+    }
     Stream& s = Begin();
     const auto args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
     if (!args) {
@@ -2006,9 +2177,14 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
         ++s.commands;
         return;
     }
-    if (known_meta.contains(address)) {
+    const bool meta = known_meta.contains(address);
+    if (meta) {
         cleared_meta.insert(address); // a CMASK/HTILE cleared by the CP
         ++stats.meta_clears;
+    }
+    if (r.FrameDumpCollecting()) {
+        r.FrameDumpEvent(fmt::format("fill {:#x}+{:#x} = {:#x}{}", address, num_bytes, value,
+                                     meta ? " (metadata clear)" : "")); // NAT-117
     }
     ++stats.fills;
     if (const auto found = GuestBuffer(address, num_bytes, true)) {
@@ -2022,7 +2198,8 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
             std::fill_n(reinterpret_cast<u32*>(address), num_bytes / 4, value);
         }
     }
-    registry->Invalidate(address, num_bytes, Native::ImageRegistry::Stale::GpuWrite);
+    const std::array<u32, 2> pattern{value, value};
+    GpuWrote(address, num_bytes, &pattern); // NAT-119/120
 }
 
 void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
@@ -2032,6 +2209,11 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
     std::scoped_lock lock{mutex};
     Stream& s = Begin();
     ++stats.copies;
+    if (r.FrameDumpCollecting()) {
+        r.FrameDumpEvent(fmt::format("copy {:#x}{} <- {:#x}{} ({:#x} bytes)", dst,
+                                     dst_gds ? " (GDS)" : "", src, src_gds ? " (GDS)" : "",
+                                     num_bytes)); // NAT-117
+    }
     const vk::Buffer gds_buffer{Handle<VkBuffer_T>(gds->NativeHandle())};
     const auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
                                 : GuestBuffer(src, num_bytes, false);
@@ -2059,7 +2241,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
         }
     }
     if (!dst_gds) {
-        registry->Invalidate(dst, num_bytes, Native::ImageRegistry::Stale::GpuWrite);
+        GpuWrote(dst, num_bytes, nullptr); // NAT-119
     }
 }
 
@@ -2116,6 +2298,12 @@ void NativeRenderer::EvictImages() {
         held_versions.erase(&entry);
         std::erase(stream.written, &entry);
         std::erase(writebacks, &entry);
+        std::erase(dump_entries, &entry);
+        for (auto it = stencil_owners.begin(); it != stencil_owners.end();) {
+            auto& owners = it->second;
+            owners.erase(std::remove(owners.begin(), owners.end(), &entry), owners.end());
+            it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
+        }
     });
 }
 
@@ -2261,6 +2449,70 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     return display;
 }
 
+void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
+    std::scoped_lock lock{mutex};
+    struct Readback {
+        const Native::ImageEntry* entry;
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        u64 size;
+        u32 index;
+    };
+    std::vector<Readback> readbacks;
+    Stream& s = Begin();
+    GlobalBarrier();
+    u32 index = 0;
+    for (const auto* entry : dump_entries) {
+        const u32 order = index++;
+        if (!entry->image || entry->info.props.is_block) {
+            continue;
+        }
+        const auto& desc = entry->image->Desc();
+        const u32 texel = entry->info.props.is_depth ? 4u : std::max(entry->info.num_bits / 8, 1u);
+        const u64 size = u64(desc.width) * desc.height * texel;
+        auto buffer = device->CreateBuffer({.size = size,
+                                            .usage = Native::Rhi::BufferUsageTransferDst,
+                                            .memory = Native::Rhi::MemoryKind::Readback,
+                                            .name = "native dump"});
+        if (!buffer || !buffer->Mapped() || desc.samples != 1) {
+            continue;
+        }
+        const vk::BufferImageCopy copy{
+            .bufferOffset = 0,
+            .bufferRowLength = desc.width,
+            .bufferImageHeight = desc.height,
+            .imageSubresource{.aspectMask = entry->info.props.is_depth
+                                               ? vk::ImageAspectFlagBits::eDepth
+                                               : vk::ImageAspectFlagBits::eColor,
+                              .mipLevel = 0,
+                              .baseArrayLayer = 0,
+                              .layerCount = 1},
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {desc.width, desc.height, 1},
+        };
+        s.cmd.copyImageToBuffer(vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
+                                vk::ImageLayout::eGeneral,
+                                vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, copy);
+        readbacks.push_back({entry, std::move(buffer), size, order});
+    }
+    Splice();
+    r.scheduler.Finish();
+    for (const auto& readback : readbacks) {
+        const auto& info = readback.entry->info;
+        const auto& desc = readback.entry->image->Desc();
+        const auto path =
+            dir / fmt::format("{:03}_{:x}_{}x{}_{}{}.bin", readback.index, info.guest_address,
+                              desc.width, desc.height, u32(desc.format),
+                              info.props.is_depth ? "_depth" : "");
+        if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
+            std::fwrite(readback.buffer->Mapped(), 1, readback.size, file);
+            std::fclose(file);
+        }
+    }
+    LOG_WARNING(Render_Vulkan, "NAT-116: {} render targets of the frame dumped to {}",
+                readbacks.size(), dir.string());
+    dump_entries.clear();
+}
+
 void NativeRenderer::Report() {
     const auto now = std::chrono::steady_clock::now();
     if (now - last_report < std::chrono::seconds{10}) {
@@ -2297,12 +2549,13 @@ void NativeRenderer::Report() {
     }
     LOG_INFO(Render_Vulkan,
              "NAT-108 images (10 s): {} uploads ({:.1f} MB), {} skipped as unchanged (NAT-109), "
-             "textures made stale by CPU writes {}, unmaps {}, GPU copies {}; {} evicted, {} "
-             "live, most at one address:{}; uploaded most:{}",
+             "textures made stale by CPU writes {}, unmaps {}, GPU writes {} ({} targets so far, "
+             "NAT-119); {} evicted, {} live, most at one address:{}; uploaded most:{}",
              uploads - report_base.uploads, (upload_bytes - report_base.upload_bytes) / 1048576.0,
              registry->GetUploadStats().unchanged.exchange(0),
              stale[0] - report_base.stale[0], stale[1] - report_base.stale[1],
-             stale[2] - report_base.stale[2], evicted - report_base.evicted, registry->Count(),
+             stale[2] - report_base.stale[2], registry_stats.targets_rewritten.load(),
+             evicted - report_base.evicted, registry->Count(),
              crowded,
              busiest.empty() ? std::string{" none"} : busiest);
     report_base = {uploads, upload_bytes, evicted, stale};
@@ -2312,6 +2565,7 @@ void NativeRenderer::Report() {
              "empty, {} images bound empty; {} fills, {} copies, {} meta clears, {} inline "
              "writes, {} pictures copied from targets, {} written back, {} CPU writes to textures, "
              "{} ranges gathered, region binds/made/refreshes {}/{}/{} (NAT-114), "
+             "fill shaders {}, targets rewritten by clears/uploads {}/{} (NAT-120), "
              "on the GPU ({:.1f} MB), uploads from guest memory on the GPU/CPU {}/{}; images so far: "
              "{} lookups, {} textures and {} targets made, {} uploads ({:.1f} MB); {:.0f} draws/s, "
              "{:.2f} us a draw, {:.2f} us a dispatch on the recorder; images bound empty by "
@@ -2322,7 +2576,8 @@ void NativeRenderer::Report() {
              stats.unbound, stats.null_images, stats.fills, stats.copies, stats.meta_clears,
              stats.inline_writes, stats.source_copies, stats.writebacks,
              stats.cpu_writes.exchange(0),
-             stats.region_binds, stats.regions_made, stats.region_refreshes, stats.gathers,
+             stats.gathers, stats.region_binds, stats.regions_made, stats.region_refreshes,
+             stats.fill_shaders, stats.rewrite_clears, stats.rewrite_uploads,
              stats.gathered_bytes / 1048576.0,
              registry->GetUploadStats().gpu.load(), registry->GetUploadStats().cpu.load(),
              registry_stats.lookups.load(),
@@ -2346,6 +2601,7 @@ void NativeRenderer::Report() {
     stats.source_copies = stats.draw_ns = stats.dispatch_ns = 0;
     stats.gathers = stats.gathered_bytes = stats.writebacks = 0;
     stats.region_binds = stats.regions_made = stats.region_refreshes = 0;
+    stats.fill_shaders = stats.rewrite_clears = stats.rewrite_uploads = 0;
     stats.null_reasons = {};
     stats.phase_ns = {};
     (void)cpu_writes;

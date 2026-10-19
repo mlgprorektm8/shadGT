@@ -141,6 +141,27 @@ ImageRegistry::~ImageRegistry() = default;
 ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame) {
     ++stats.lookups;
     Shard& shard = ShardOf(info.guest_address);
+    if (!render_target && !info.props.is_depth) {
+        // NAT-040: a depth buffer read as a texture (the T# names R32/R16, the image is D32/D16):
+        // the depth image itself, viewed through its depth aspect. NAT-121: looked for first, so
+        // a texture of the same layout made before the depth buffer existed (an upload of the
+        // memory under it, where only the CPU's or a fill's bytes are) does not hide it: GT
+        // Sport's shadow cascades (a 256x256 depth target with 14 layers, read with 13).
+        std::shared_lock lock{shard.mutex};
+        const auto [first, last] = shard.images.equal_range(info.guest_address);
+        for (auto it = first; it != last; ++it) {
+            const auto& cached = it->second->info;
+            if (cached.props.is_depth && cached.num_bits == info.num_bits &&
+                cached.resources.layers >= info.resources.layers &&
+                ((cached.size.width == info.size.width && cached.size.height == info.size.height) ||
+                 (cached.pitch == info.pitch && cached.size.width >= info.size.width &&
+                  cached.size.height >= info.size.height))) { // NAT-113
+                ++stats.hits;
+                it->second->last_use.store(frame, std::memory_order_relaxed);
+                return it->second.get();
+            }
+        }
+    }
     {
         std::shared_lock lock{shard.mutex};
         const auto [first, last] = shard.images.equal_range(info.guest_address);
@@ -177,23 +198,6 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 ++stats.reused_larger;
                 best->last_use.store(frame, std::memory_order_relaxed);
                 return best;
-            }
-        }
-    }
-    if (!render_target) {
-        // NAT-040: a depth buffer read as a texture (the T# names R32/R16, the image is D32/D16):
-        // the depth image itself, viewed through its depth aspect.
-        std::shared_lock lock{shard.mutex};
-        const auto [first, last] = shard.images.equal_range(info.guest_address);
-        for (auto it = first; it != last; ++it) {
-            const auto& cached = it->second->info;
-            if (cached.props.is_depth && !info.props.is_depth && cached.num_bits == info.num_bits &&
-                ((cached.size.width == info.size.width && cached.size.height == info.size.height) ||
-                 (cached.pitch == info.pitch && cached.size.width >= info.size.width &&
-                  cached.size.height >= info.size.height))) { // NAT-113
-                ++stats.hits;
-                it->second->last_use.store(frame, std::memory_order_relaxed);
-                return it->second.get();
             }
         }
     }
@@ -536,6 +540,32 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     });
 }
 
+void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern) {
+    ForEachOverlapping(address, address + std::max<u64>(size, 1), [&](ImageEntry& entry) {
+        if (entry.from_cpu) {
+            bool made_of_targets;
+            {
+                std::scoped_lock lock{entry.sources_mutex};
+                made_of_targets = !entry.sources.empty();
+            }
+            if (!made_of_targets && entry.info.num_samples == 1) {
+                MarkStale(entry, Stale::GpuWrite);
+            }
+            return;
+        }
+        if (entry.info.guest_address != address) {
+            return;
+        }
+        ++stats.targets_rewritten;
+        if (pattern && size >= entry.info.guest_size) {
+            entry.rewrite = ImageEntry::Rewrite::Clear;
+            entry.rewrite_pattern = *pattern;
+        } else {
+            entry.rewrite = ImageEntry::Rewrite::Upload;
+        }
+    });
+}
+
 void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
     constexpr u64 HashedSize = 4ull << 20;
     const VAddr written_end = address + (exact != 0 ? exact : size);
@@ -659,7 +689,10 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
         if (size == 0) {
             continue;
         }
-        if (upload_hook) {
+        if (info.num_samples > 1) {
+            continue;
+        }
+        if (upload_hook && entry->from_cpu) {
             upload_hook(*entry); // NAT-105: CPU writes from here on are seen
         }
         // NAT-109: a small texture whose bytes did not change (a write elsewhere on its page)

@@ -95,8 +95,12 @@ void TextureCache::ProcessDownloadImages() {
 
 bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path) {
     Image& image = slot_images[image_id];
-    const u32 bytes_per_texel = image.info.num_bits / 8;
-    if (image.info.props.is_depth || image.info.props.is_block || bytes_per_texel == 0) {
+    // NAT-116: depth images give their depth aspect (32-bit float, or 16-bit).
+    const bool depth = image.info.props.is_depth;
+    const bool depth16 = depth && (image.info.pixel_format == vk::Format::eD16Unorm ||
+                                   image.info.pixel_format == vk::Format::eD16UnormS8Uint);
+    const u32 bytes_per_texel = depth ? (depth16 ? 2u : 4u) : image.info.num_bits / 8;
+    if (image.info.props.is_block || bytes_per_texel == 0) {
         return false;
     }
     const u32 width = image.info.size.width;
@@ -109,7 +113,8 @@ bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path
         .bufferImageHeight = height,
         .imageSubresource =
             {
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .aspectMask = depth ? vk::ImageAspectFlagBits::eDepth
+                                    : vk::ImageAspectFlagBits::eColor,
                 .mipLevel = 0,
                 .baseArrayLayer = 0,
                 .layerCount = 1,

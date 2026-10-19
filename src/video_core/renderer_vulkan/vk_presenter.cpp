@@ -842,6 +842,7 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
     g_prepared_frames.fetch_add(1, std::memory_order_relaxed); // DIAG-137
+    rasterizer->FrameDumpFlip(); // NAT-116
 #ifdef RYTY_GPU
     if (auto* native = rasterizer->Native()) {
         return PrepareNativeFrame(*native, attribute, cpu_address);

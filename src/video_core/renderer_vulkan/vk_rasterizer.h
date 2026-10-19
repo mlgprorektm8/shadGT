@@ -316,6 +316,23 @@ public:
     /// can't be (the caller writes it as before).
     bool NativeInlineWrite(VAddr address, std::span<const u8> data);
 #endif
+    /// NAT-116 (RYGT_FRAME_DUMP_AT=<seconds>): at a flip after that time, every render target
+    /// the next frame draws into is saved to user\log\dump-<old|native>-<seconds>\ at the flip
+    /// after it (raw texels; tools: dump2png.py). Called by the presenter at each flip.
+    void FrameDumpFlip();
+    /// NAT-116: whether the frame being drawn is dumped (render targets are noted).
+    bool FrameDumpCollecting() const noexcept {
+        return frame_dump_collecting;
+    }
+    /// NAT-117: the dumped frame's work in GPU order (passes with the targets the registers name
+    /// and whether they start cleared, fills, metadata clears), written as events.txt next to
+    /// the dump. Consecutive draws into the same targets are one line.
+    void FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& state,
+                       const GraphicsPipeline* pipeline);
+    void FrameDumpEvent(std::string text);
+    /// NAT-118: a dispatch of the dumped frame with what it writes (buffers, storage images).
+    void FrameDumpDispatch(const Shader::Info& cs, const AmdGpu::ComputeProgram& program,
+                           bool indirect);
 
     std::thread::id GetGpuCommandProcessorThread();
     /// The command processor thread or the draw pipe's recorder thread (PERF-031).
@@ -582,6 +599,22 @@ private:
 #ifdef RYTY_GPU
     std::unique_ptr<NativeRenderer> native; // NAT-100
 #endif
+    // NAT-116
+    bool frame_dump_collecting{};
+    bool frame_dump_done{};
+    bool frame_dump_write_old{}; // written at the next draw (not at the flip)
+    std::filesystem::path frame_dump_dir;
+    std::vector<std::pair<VideoCore::ImageId, u64>> frame_dump_old; // image, uid
+    void FrameDumpNoteOld();
+    void FrameDumpWriteOld();
+    std::mutex frame_dump_mutex; // NAT-117
+    struct FrameDumpEntry {
+        std::string key;    ///< what merges consecutive draws (targets, clears)
+        std::string detail; ///< the pass's first draw (NAT-118)
+        u32 draws;
+    };
+    std::vector<FrameDumpEntry> frame_dump_events;
+    void FrameDumpWriteEvents(const std::filesystem::path& dir);
 };
 
 } // namespace Vulkan

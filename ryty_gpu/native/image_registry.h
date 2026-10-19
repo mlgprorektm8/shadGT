@@ -94,6 +94,16 @@ public:
     std::atomic<bool> needs_upload{false};
     std::atomic<u64> last_use{0};
 
+    /// NAT-120: GPU work rewrote the guest memory of this render target from its first byte
+    /// (GT Sport clears depth buffers and pictures with a fill shader). Applied at the
+    /// target's next use: cleared with the fill pattern, or uploaded from memory. The stencil
+    /// plane (its own memory) only takes clears. Recorder thread only.
+    enum class Rewrite : u8 { None, Upload, Clear };
+    Rewrite rewrite = Rewrite::None;
+    std::array<u32, 2> rewrite_pattern{};
+    bool stencil_clear_pending = false;
+    u8 stencil_clear_value = 0;
+
     /// A view, made on first use.
     const Rhi::ImageView* View(Rhi::Device& device, const ImageViewKey& key);
 
@@ -162,6 +172,18 @@ public:
     /// range are uploaded again before their next use.
     void Invalidate(VAddr address, u64 size, Stale why = Stale::CpuWrite);
 
+    /// NAT-119/120: GPU work (a shader's storage buffer, a CP fill or copy) wrote [address,
+    /// address + size), with `pattern` (two dwords, repeated) when it is a fill. As the old
+    /// cache's InvalidateMemoryFromGPU: a render target that starts where the write starts gets
+    /// a pending rewrite (ImageEntry::rewrite), textures the write overlaps are uploaded again
+    /// (not those made of targets: their pictures come from the targets). A write inside a
+    /// render target leaves it (its pictures are on the GPU only).
+    void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern);
+    /// NAT-120: uploads the image from guest memory before its next use.
+    void RequestUpload(ImageEntry& entry) {
+        MarkStale(entry, Stale::GpuWrite);
+    }
+
     /// NAT-109: CPU writes to [address, address + size) (a page fault: the page stops being
     /// watched); `exact` is the bytes the instruction wrote there (0: unknown). Small textures
     /// on the page are checked by hash before their next use; large ones only when written.
@@ -189,6 +211,7 @@ public:
         std::atomic<u64> evicted;
         std::atomic<u64> reused_larger; ///< NAT-113
         std::array<std::atomic<u64>, 3> stale; ///< textures marked, by Stale
+        std::atomic<u64> targets_rewritten; ///< NAT-119
     };
     const Stats& GetStats() const {
         return stats;

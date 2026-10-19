@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -100,6 +101,9 @@ public:
     };
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format);
 
+    /// NAT-116: saves the render targets noted while the rasterizer collected a frame.
+    void DumpFrame(const std::filesystem::path& dir);
+
 private:
     enum class ViewUse : u8 { Sampled, Storage, Attachment };
 
@@ -123,6 +127,12 @@ private:
         Shader::PushData push{};
         std::vector<const Native::ImageEntry*> sampled;
         std::vector<const Native::ImageEntry*> stored;
+        /// NAT-119: guest memory the draw or dispatch writes through storage buffers.
+        boost::container::small_vector<std::pair<VAddr, u64>, 8> gpu_writes;
+        /// NAT-120: the dispatch is GT Sport's fill shader: what it fills, with what.
+        std::optional<std::array<u32, 2>> fill_pattern;
+        VAddr fill_address = 0;
+        u64 fill_size = 0;
         bool writes_buffers = false;
         bool failed = false;
         void Clear();
@@ -216,6 +226,17 @@ private:
     /// CPU reads its brightness chain there for auto exposure).
     void FlushWritebacks();
     std::vector<Native::ImageEntry*> writebacks;
+    std::vector<const Native::ImageEntry*> dump_entries; // NAT-116
+    /// NAT-120: depth images by the address of their stencil plane (fills clear it there).
+    std::unordered_map<VAddr, boost::container::small_vector<Native::ImageEntry*, 2>>
+        stencil_owners;
+    /// NAT-120: GPU work wrote guest memory (targets there get a pending rewrite).
+    void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern);
+    /// NAT-120: a target's pending rewrite, before it is used: a clear, or an upload.
+    void ApplyRewrite(Native::ImageEntry& entry);
+    /// NAT-120: GT Sport's fill shader (cs 0x8aa6e00c): its pattern and range, from the
+    /// arguments it reads from memory.
+    void ReadFillShader(const Shader::Info& cs, DrawBindings& b);
     /// NAT-104: the picture was written now (in GPU order).
     void Written(const Native::ImageEntry* entry);
     /// NAT-104: copies the newer pictures of the render targets a texture is made of into it.
@@ -273,6 +294,7 @@ private:
     std::unordered_set<VAddr> known_meta;
 
     struct Stats {
+        u64 rewrite_clears = 0, rewrite_uploads = 0, fill_shaders = 0; ///< NAT-120
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
             fills = 0, copies = 0, meta_clears = 0, inline_writes = 0, source_copies = 0,
