@@ -265,13 +265,16 @@ public:
 class VulkanPipelineLayout final : public PipelineLayout {
 public:
     VulkanPipelineLayout(VulkanDevice& device, vk::DescriptorSetLayout set_layout,
-                         vk::PipelineLayout layout, vk::ShaderStageFlags push_stages)
-        : device{device}, set_layout{set_layout}, layout{layout}, push_stages{push_stages} {}
+                         vk::PipelineLayout layout, vk::ShaderStageFlags push_stages,
+                         bool push_bindings)
+        : device{device}, set_layout{set_layout}, layout{layout}, push_stages{push_stages},
+          push_bindings{push_bindings} {}
     ~VulkanPipelineLayout() override;
     VulkanDevice& device;
     vk::DescriptorSetLayout set_layout;
     vk::PipelineLayout layout;
     vk::ShaderStageFlags push_stages;
+    bool push_bindings; // push descriptors; otherwise a descriptor set per draw
 };
 
 class VulkanPipeline final : public Pipeline {
@@ -288,9 +291,12 @@ public:
 
 class VulkanFence final : public Fence {
 public:
-    VulkanFence(vk::Device device, vk::Semaphore semaphore) : device{device}, semaphore{semaphore} {}
+    VulkanFence(vk::Device device, vk::Semaphore semaphore, bool owned = true)
+        : device{device}, semaphore{semaphore}, owned{owned} {}
     ~VulkanFence() override {
-        device.destroySemaphore(semaphore);
+        if (owned) {
+            device.destroySemaphore(semaphore);
+        }
     }
     u64 Completed() const override {
         const auto [result, value] = device.getSemaphoreCounterValue(semaphore);
@@ -306,14 +312,16 @@ public:
     }
     vk::Device device;
     vk::Semaphore semaphore;
+    bool owned;
 };
 
 struct ThreadPool;
 
 class VulkanCommandList final : public CommandList {
 public:
-    VulkanCommandList(VulkanDevice& device, ThreadPool& pool, vk::CommandBuffer cmd)
-        : device{device}, pool{pool}, cmd{cmd} {}
+    VulkanCommandList(VulkanDevice& device, ThreadPool& pool, vk::CommandBuffer cmd,
+                      CommandListLevel level)
+        : device{device}, pool{pool}, cmd{cmd}, level{level} {}
 
     void Begin() override;
     void End() override;
@@ -327,6 +335,8 @@ public:
     void SetDepthBias(float constant, float clamp, float slope) override;
     void SetDepthBounds(float min, float max) override;
     void SetLineWidth(float width) override;
+    void SetRasterState(const DynamicRasterState& state) override;
+    void SetDepthStencilState(const DynamicDepthStencilState& state) override;
     void BindPipeline(const Pipeline* pipeline) override;
     void PushBindings(std::span<const Binding> bindings) override;
     void PushConstants(u32 offset, std::span<const u8> data) override;
@@ -348,11 +358,23 @@ public:
     void ClearColorImage(const Image* image, const std::array<float, 4>& color) override;
     void BeginMarker(std::string_view name) override;
     void EndMarker() override;
+    void ExecuteSecondary(std::span<CommandList* const> lists) override;
+    u64 NativeHandle() const override {
+        return reinterpret_cast<u64>(static_cast<VkCommandBuffer>(cmd));
+    }
+
+    /// Whether the GPU is done with the list (its retire fence reached the value).
+    bool Retired() const;
 
     VulkanDevice& device;
     ThreadPool& pool;
     vk::CommandBuffer cmd;
-    std::atomic<u64> retire{~0ULL}; // device tick of the submission that ran it
+    CommandListLevel level;
+    // The fence and value that free the list: the device timeline after Queue::Submit, another
+    // timeline after MarkExecuted, or nothing (value 0) after ReleaseUnsubmitted.
+    std::atomic<const Fence*> retire_fence{nullptr};
+    std::atomic<u64> retire_value{~0ULL};
+    vk::DescriptorPool descriptor_pool{}; // descriptor sets of layouts too big to push
     const VulkanPipeline* graphics = nullptr;
     const VulkanPipeline* compute = nullptr;
     vk::PipelineBindPoint last_bind = vk::PipelineBindPoint::eGraphics;
@@ -363,6 +385,7 @@ public:
 struct ThreadPool {
     vk::CommandPool pool;
     std::vector<VulkanCommandList*> free;
+    std::vector<VulkanCommandList*> free_secondary;
     std::deque<VulkanCommandList*> used;
     std::vector<std::unique_ptr<VulkanCommandList>> all;
 };
@@ -413,8 +436,10 @@ public:
     std::unique_ptr<Pipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc& desc) override;
     std::unique_ptr<Pipeline> CreateComputePipeline(const ComputePipelineDesc& desc) override;
     std::unique_ptr<Fence> CreateFence(u64 initial) override;
-    CommandList* AcquireCommandList() override;
+    std::unique_ptr<Fence> ImportFence(u64 native_handle) override;
+    CommandList* AcquireCommandList(CommandListLevel level) override;
     void ReleaseUnsubmitted(CommandList* list) override;
+    void MarkExecuted(CommandList* list, FenceValue retire) override;
     Queue& GraphicsQueue() override {
         return queue;
     }
@@ -440,6 +465,7 @@ public:
     DeviceCaps caps{};
     VulkanQueue queue{*this};
     vk::Semaphore timeline;           // one tick per submission
+    std::unique_ptr<VulkanFence> timeline_fence;
     std::atomic<u64> submitted{0};    // ticks handed out
     std::mutex retire_mutex;
     std::deque<Retired> retired;
@@ -499,7 +525,9 @@ VulkanDevice::VulkanDevice(VulkanContext context)
     caps.host_import_alignment =
         properties.get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>()
             .minImportedHostPointerAlignment;
-    caps.max_bindings = ctx.max_push_descriptors;
+    caps.max_push_bindings = ctx.max_push_descriptors;
+    caps.dynamic_raster_depth_stencil = true; // Vulkan 1.3 core dynamic state
+    caps.secondary_lists = true;
 
     const vk::SemaphoreTypeCreateInfo timeline_info{
         .semaphoreType = vk::SemaphoreType::eTimeline,
@@ -509,6 +537,7 @@ VulkanDevice::VulkanDevice(VulkanContext context)
         device.createSemaphore(vk::SemaphoreCreateInfo{.pNext = &timeline_info});
     ASSERT_MSG(result == vk::Result::eSuccess, "NAT-011: timeline semaphore failed");
     timeline = semaphore;
+    timeline_fence = std::make_unique<VulkanFence>(device, semaphore, false);
 
     const auto [pool_result, pool] = device.createCommandPool(vk::CommandPoolCreateInfo{
         .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
@@ -525,6 +554,11 @@ VulkanDevice::~VulkanDevice() {
         retired_object.destroy();
     }
     for (auto& [id, pool] : pools) {
+        for (auto& list : pool->all) {
+            if (list->descriptor_pool) {
+                device.destroyDescriptorPool(list->descriptor_pool);
+            }
+        }
         device.destroyCommandPool(pool->pool);
     }
     device.destroyCommandPool(init_pool);
@@ -787,9 +821,11 @@ std::unique_ptr<PipelineLayout> VulkanDevice::CreatePipelineLayout(const Pipelin
             .stageFlags = ToVkStages(slot.stages),
         });
     }
+    const bool push_bindings = bindings.size() <= caps.max_push_bindings;
     const auto [set_result, set_layout] =
         device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo{
-            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .flags = push_bindings ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+                                   : vk::DescriptorSetLayoutCreateFlagBits{},
             .bindingCount = static_cast<u32>(bindings.size()),
             .pBindings = bindings.data(),
         });
@@ -812,7 +848,8 @@ std::unique_ptr<PipelineLayout> VulkanDevice::CreatePipelineLayout(const Pipelin
         device.destroyDescriptorSetLayout(set_layout);
         return nullptr;
     }
-    return std::make_unique<VulkanPipelineLayout>(*this, set_layout, layout, push_stages);
+    return std::make_unique<VulkanPipelineLayout>(*this, set_layout, layout, push_stages,
+                                                  push_bindings);
 }
 
 std::unique_ptr<Pipeline> VulkanDevice::CreateGraphicsPipeline(const GraphicsPipelineDesc& desc) {
@@ -821,6 +858,8 @@ std::unique_ptr<Pipeline> VulkanDevice::CreateGraphicsPipeline(const GraphicsPip
     std::vector<vk::PipelineShaderStageCreateInfo> stages;
     std::vector<std::string> entries;
     entries.reserve(desc.shaders.size());
+    std::vector<std::vector<vk::SpecializationMapEntry>> spec_entries(desc.shaders.size());
+    std::vector<vk::SpecializationInfo> spec_infos(desc.shaders.size());
     const auto destroy_modules = [&] {
         for (const vk::ShaderModule module : modules) {
             device.destroyShaderModule(module);
@@ -837,10 +876,25 @@ std::unique_ptr<Pipeline> VulkanDevice::CreateGraphicsPipeline(const GraphicsPip
         }
         modules.push_back(module);
         entries.emplace_back(code.entry);
+        const size_t index = stages.size();
+        for (u32 i = 0; i < code.constants.size(); ++i) {
+            spec_entries[index].push_back({
+                .constantID = code.constants[i].id,
+                .offset = static_cast<u32>(i * sizeof(SpecConstant) + offsetof(SpecConstant, value)),
+                .size = sizeof(u32),
+            });
+        }
+        spec_infos[index] = {
+            .mapEntryCount = static_cast<u32>(spec_entries[index].size()),
+            .pMapEntries = spec_entries[index].data(),
+            .dataSize = code.constants.size_bytes(),
+            .pData = code.constants.data(),
+        };
         stages.push_back({
             .stage = ToVkStage(code.stage),
             .module = module,
             .pName = entries.back().c_str(),
+            .pSpecializationInfo = code.constants.empty() ? nullptr : &spec_infos[index],
         });
     }
     std::vector<vk::VertexInputBindingDescription> vertex_bindings;
@@ -946,13 +1000,23 @@ std::unique_ptr<Pipeline> VulkanDevice::CreateGraphicsPipeline(const GraphicsPip
         .attachmentCount = desc.color_count,
         .pAttachments = blend.data(),
     };
-    static constexpr std::array dynamic_states{
+    std::vector<vk::DynamicState> dynamic_states{
         vk::DynamicState::eViewport,          vk::DynamicState::eScissor,
         vk::DynamicState::eBlendConstants,    vk::DynamicState::eStencilReference,
         vk::DynamicState::eStencilCompareMask, vk::DynamicState::eStencilWriteMask,
         vk::DynamicState::eDepthBias,         vk::DynamicState::eDepthBounds,
         vk::DynamicState::eLineWidth,
     };
+    if (desc.dynamic_raster_depth_stencil) {
+        dynamic_states.insert(dynamic_states.end(), {
+            vk::DynamicState::eCullMode,           vk::DynamicState::eFrontFace,
+            vk::DynamicState::eDepthBiasEnable,    vk::DynamicState::ePrimitiveRestartEnable,
+            vk::DynamicState::eRasterizerDiscardEnable, vk::DynamicState::eDepthTestEnable,
+            vk::DynamicState::eDepthWriteEnable,   vk::DynamicState::eDepthCompareOp,
+            vk::DynamicState::eDepthBoundsTestEnable, vk::DynamicState::eStencilTestEnable,
+            vk::DynamicState::eStencilOp,
+        });
+    }
     const vk::PipelineDynamicStateCreateInfo dynamic{
         .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
         .pDynamicStates = dynamic_states.data(),
@@ -997,12 +1061,27 @@ std::unique_ptr<Pipeline> VulkanDevice::CreateComputePipeline(const ComputePipel
         return nullptr;
     }
     const std::string entry{desc.shader.entry};
+    std::vector<vk::SpecializationMapEntry> spec_entries;
+    for (u32 i = 0; i < desc.shader.constants.size(); ++i) {
+        spec_entries.push_back({
+            .constantID = desc.shader.constants[i].id,
+            .offset = static_cast<u32>(i * sizeof(SpecConstant) + offsetof(SpecConstant, value)),
+            .size = sizeof(u32),
+        });
+    }
+    const vk::SpecializationInfo spec_info{
+        .mapEntryCount = static_cast<u32>(spec_entries.size()),
+        .pMapEntries = spec_entries.data(),
+        .dataSize = desc.shader.constants.size_bytes(),
+        .pData = desc.shader.constants.data(),
+    };
     const auto [result, pipeline] = device.createComputePipeline(
         {}, vk::ComputePipelineCreateInfo{
                 .stage{
                     .stage = vk::ShaderStageFlagBits::eCompute,
                     .module = module,
                     .pName = entry.c_str(),
+                    .pSpecializationInfo = spec_entries.empty() ? nullptr : &spec_info,
                 },
                 .layout = layout->layout,
             });
@@ -1027,7 +1106,21 @@ std::unique_ptr<Fence> VulkanDevice::CreateFence(u64 initial) {
     return std::make_unique<VulkanFence>(device, semaphore);
 }
 
-CommandList* VulkanDevice::AcquireCommandList() {
+std::unique_ptr<Fence> VulkanDevice::ImportFence(u64 native_handle) {
+    return std::make_unique<VulkanFence>(
+        device, vk::Semaphore{reinterpret_cast<VkSemaphore>(native_handle)}, false);
+}
+
+bool VulkanCommandList::Retired() const {
+    const u64 value = retire_value.load(std::memory_order_acquire);
+    if (value == 0) {
+        return true; // released without being submitted
+    }
+    const Fence* fence = retire_fence.load(std::memory_order_acquire);
+    return fence && fence->Completed() >= value;
+}
+
+CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
     ThreadPool* pool;
     {
         std::scoped_lock lock{pools_mutex};
@@ -1043,35 +1136,50 @@ CommandList* VulkanDevice::AcquireCommandList() {
         }
         pool = slot.get();
     }
-    const u64 completed = CompletedTick();
-    while (!pool->used.empty() &&
-           pool->used.front()->retire.load(std::memory_order_acquire) <= completed) {
+    // Lists retire in roughly the order they were used; one still running stops the scan.
+    for (size_t scanned = 0; !pool->used.empty() && scanned < 64; ++scanned) {
         VulkanCommandList* list = pool->used.front();
+        if (!list->Retired()) {
+            break;
+        }
         pool->used.pop_front();
         std::ignore = list->cmd.reset();
-        pool->free.push_back(list);
+        if (list->descriptor_pool) {
+            std::ignore = device.resetDescriptorPool(list->descriptor_pool);
+        }
+        (list->level == CommandListLevel::Secondary ? pool->free_secondary : pool->free)
+            .push_back(list);
     }
+    auto& free = level == CommandListLevel::Secondary ? pool->free_secondary : pool->free;
     VulkanCommandList* list;
-    if (!pool->free.empty()) {
-        list = pool->free.back();
-        pool->free.pop_back();
+    if (!free.empty()) {
+        list = free.back();
+        free.pop_back();
     } else {
         const auto [result, buffers] = device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{
             .commandPool = pool->pool,
-            .level = vk::CommandBufferLevel::ePrimary,
+            .level = level == CommandListLevel::Secondary ? vk::CommandBufferLevel::eSecondary
+                                                          : vk::CommandBufferLevel::ePrimary,
             .commandBufferCount = 1,
         });
         ASSERT_MSG(result == vk::Result::eSuccess, "NAT-011: command buffer failed");
-        pool->all.push_back(std::make_unique<VulkanCommandList>(*this, *pool, buffers[0]));
+        pool->all.push_back(std::make_unique<VulkanCommandList>(*this, *pool, buffers[0], level));
         list = pool->all.back().get();
     }
-    list->retire.store(~0ULL, std::memory_order_relaxed);
+    list->retire_fence.store(nullptr, std::memory_order_relaxed);
+    list->retire_value.store(~0ULL, std::memory_order_relaxed);
     pool->used.push_back(list);
     return list;
 }
 
 void VulkanDevice::ReleaseUnsubmitted(CommandList* list) {
-    static_cast<VulkanCommandList*>(list)->retire.store(0, std::memory_order_release);
+    static_cast<VulkanCommandList*>(list)->retire_value.store(0, std::memory_order_release);
+}
+
+void VulkanDevice::MarkExecuted(CommandList* list, FenceValue retire) {
+    auto* vulkan_list = static_cast<VulkanCommandList*>(list);
+    vulkan_list->retire_fence.store(retire.fence, std::memory_order_relaxed);
+    vulkan_list->retire_value.store(retire.value, std::memory_order_release);
 }
 
 void VulkanDevice::Collect() {
@@ -1144,7 +1252,9 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
     ASSERT_MSG(result == vk::Result::eSuccess, "NAT-011: queue submit failed: {}",
                vk::to_string(result));
     for (CommandList* list : lists) {
-        static_cast<VulkanCommandList*>(list)->retire.store(tick, std::memory_order_release);
+        auto* vulkan_list = static_cast<VulkanCommandList*>(list);
+        vulkan_list->retire_fence.store(device.timeline_fence.get(), std::memory_order_relaxed);
+        vulkan_list->retire_value.store(tick, std::memory_order_release);
     }
 }
 
@@ -1153,8 +1263,12 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
 void VulkanCommandList::Begin() {
     graphics = nullptr;
     compute = nullptr;
+    // Secondary lists run outside render passes of the command buffer that executes them; they
+    // begin and end their own rendering.
+    const vk::CommandBufferInheritanceInfo inheritance{};
     std::ignore = cmd.begin(vk::CommandBufferBeginInfo{
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        .pInheritanceInfo = level == CommandListLevel::Secondary ? &inheritance : nullptr,
     });
 }
 
@@ -1257,6 +1371,28 @@ void VulkanCommandList::SetLineWidth(float width) {
     cmd.setLineWidth(width);
 }
 
+void VulkanCommandList::SetRasterState(const DynamicRasterState& state) {
+    cmd.setCullMode(static_cast<vk::CullModeFlagBits>(static_cast<u32>(state.cull)));
+    cmd.setFrontFace(state.front_counter_clockwise ? vk::FrontFace::eCounterClockwise
+                                                   : vk::FrontFace::eClockwise);
+    cmd.setDepthBiasEnable(state.depth_bias);
+    cmd.setPrimitiveRestartEnable(state.primitive_restart);
+    cmd.setRasterizerDiscardEnable(state.rasterizer_discard);
+}
+
+void VulkanCommandList::SetDepthStencilState(const DynamicDepthStencilState& state) {
+    cmd.setDepthTestEnable(state.depth_test);
+    cmd.setDepthWriteEnable(state.depth_write);
+    cmd.setDepthCompareOp(ToVk(state.depth_compare));
+    cmd.setDepthBoundsTestEnable(state.depth_bounds_test);
+    cmd.setStencilTestEnable(state.stencil_test);
+    const auto op = [&](vk::StencilFaceFlags face, const StencilFace& s) {
+        cmd.setStencilOp(face, ToVk(s.fail), ToVk(s.pass), ToVk(s.depth_fail), ToVk(s.compare));
+    };
+    op(vk::StencilFaceFlagBits::eFront, state.stencil_front);
+    op(vk::StencilFaceFlagBits::eBack, state.stencil_back);
+}
+
 void VulkanCommandList::BindPipeline(const Pipeline* pipeline) {
     const auto* vulkan_pipeline = static_cast<const VulkanPipeline*>(pipeline);
     cmd.bindPipeline(vulkan_pipeline->bind_point, vulkan_pipeline->pipeline);
@@ -1333,8 +1469,45 @@ void VulkanCommandList::PushBindings(std::span<const Binding> bindings) {
             break;
         }
     }
-    cmd.pushDescriptorSetKHR(pipeline->bind_point, pipeline->layout->layout, 0,
-                             static_cast<u32>(count), writes.data());
+    if (pipeline->layout->push_bindings) {
+        cmd.pushDescriptorSetKHR(pipeline->bind_point, pipeline->layout->layout, 0,
+                                 static_cast<u32>(count), writes.data());
+        return;
+    }
+    // More bindings than can be pushed: a descriptor set from this list's pool, freed with it.
+    if (!descriptor_pool) {
+        static constexpr std::array sizes{
+            vk::DescriptorPoolSize{vk::DescriptorType::eUniformBuffer, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eStorageBuffer, 4096},
+            vk::DescriptorPoolSize{vk::DescriptorType::eSampledImage, 8192},
+            vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 4096},
+            vk::DescriptorPoolSize{vk::DescriptorType::eUniformTexelBuffer, 1024},
+            vk::DescriptorPoolSize{vk::DescriptorType::eStorageTexelBuffer, 1024},
+        };
+        const auto [result, created] = device.device.createDescriptorPool(vk::DescriptorPoolCreateInfo{
+            .maxSets = 1024,
+            .poolSizeCount = static_cast<u32>(sizes.size()),
+            .pPoolSizes = sizes.data(),
+        });
+        if (result != vk::Result::eSuccess) {
+            return;
+        }
+        descriptor_pool = created;
+    }
+    const auto [result, sets] = device.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
+        .descriptorPool = descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &pipeline->layout->set_layout,
+    });
+    if (result != vk::Result::eSuccess) {
+        return; // pool exhausted: the draw goes without its resources
+    }
+    for (size_t i = 0; i < count; ++i) {
+        writes[i].dstSet = sets[0];
+    }
+    device.device.updateDescriptorSets(static_cast<u32>(count), writes.data(), 0, nullptr);
+    cmd.bindDescriptorSets(pipeline->bind_point, pipeline->layout->layout, 0, sets[0], {});
 }
 
 void VulkanCommandList::PushConstants(u32 offset, std::span<const u8> data) {
@@ -1454,6 +1627,20 @@ void VulkanCommandList::BeginMarker(std::string_view name) {
     }
     const std::string label{name};
     cmd.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{.pLabelName = label.c_str()});
+}
+
+void VulkanCommandList::ExecuteSecondary(std::span<CommandList* const> lists) {
+    std::array<vk::CommandBuffer, 64> buffers{};
+    for (size_t first = 0; first < lists.size(); first += buffers.size()) {
+        const size_t count = std::min(buffers.size(), lists.size() - first);
+        for (size_t i = 0; i < count; ++i) {
+            buffers[i] = static_cast<VulkanCommandList*>(lists[first + i])->cmd;
+        }
+        cmd.executeCommands(static_cast<u32>(count), buffers.data());
+    }
+    // State bound by the secondary lists does not carry over.
+    graphics = nullptr;
+    compute = nullptr;
 }
 
 void VulkanCommandList::EndMarker() {

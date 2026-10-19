@@ -157,10 +157,17 @@ enum StageMask : u32 {
     StageAllGraphics = 0x1f,
 };
 
+/// A specialization constant (SPIR-V constant_id).
+struct SpecConstant {
+    u32 id = 0;
+    u32 value = 0;
+};
+
 struct ShaderCode {
     ShaderStage stage = ShaderStage::Vertex;
     std::span<const u32> spirv; ///< D3D12 converts it to DXIL
     std::string_view entry = "main";
+    std::span<const SpecConstant> constants;
 };
 
 enum class BindingType : u8 {
@@ -278,6 +285,10 @@ struct GraphicsPipelineDesc {
     u8 logic_op = 0;
     Format depth_format = Format::Undefined;
     Format stencil_format = Format::Undefined;
+    /// Cull mode, front face, depth and stencil tests, depth bias enable and primitive restart
+    /// come from SetRasterState / SetDepthStencilState instead of the fields above, so fewer
+    /// pipelines are needed (Caps().dynamic_raster_depth_stencil; D3D12 bakes them in).
+    bool dynamic_raster_depth_stencil = false;
     std::string_view name;
 };
 
@@ -342,6 +353,29 @@ struct Rect {
 
 enum class IndexType : u8 { U16, U32 };
 
+/// Pipeline state set while recording, for pipelines made with dynamic_raster_depth_stencil.
+struct DynamicRasterState {
+    CullMode cull = CullMode::None;
+    bool front_counter_clockwise = false;
+    bool depth_bias = false;
+    bool primitive_restart = false;
+    bool rasterizer_discard = false;
+};
+struct DynamicDepthStencilState {
+    bool depth_test = false;
+    bool depth_write = false;
+    CompareOp depth_compare = CompareOp::Always;
+    bool depth_bounds_test = false;
+    bool stencil_test = false;
+    StencilFace stencil_front{};
+    StencilFace stencil_back{};
+};
+
+enum class CommandListLevel : u8 {
+    Primary,   ///< submitted with Queue::Submit
+    Secondary, ///< run inside another API's command buffer (see NativeHandle, MarkExecuted)
+};
+
 /// What a barrier waits for and what it holds back (global: all resources).
 enum BarrierScope : u32 {
     ScopeNone = 0,
@@ -384,6 +418,9 @@ public:
     virtual void SetDepthBounds(float min, float max) = 0;
     virtual void SetLineWidth(float width) = 0;
 
+    virtual void SetRasterState(const DynamicRasterState& state) = 0;
+    virtual void SetDepthStencilState(const DynamicDepthStencilState& state) = 0;
+
     virtual void BindPipeline(const Pipeline* pipeline) = 0;
     /// The per-draw descriptor set of the bound pipeline's layout.
     virtual void PushBindings(std::span<const Binding> bindings) = 0;
@@ -409,6 +446,13 @@ public:
 
     virtual void BeginMarker(std::string_view name) = 0;
     virtual void EndMarker() = 0;
+
+    /// Runs secondary lists (Caps().secondary_lists) here, outside any rendering.
+    virtual void ExecuteSecondary(std::span<CommandList* const> lists) = 0;
+
+    /// The backend's own object (Vulkan: VkCommandBuffer), for running a secondary list inside
+    /// a command buffer the renderer records elsewhere.
+    virtual u64 NativeHandle() const = 0;
 };
 
 /// A GPU timeline: Signal from a submission, wait from the CPU or another submission.
@@ -442,8 +486,10 @@ struct DeviceCaps {
     bool tessellation = false;
     bool depth_bounds = false;
     bool depth_clip_control = false;
+    bool dynamic_raster_depth_stencil = false;
+    bool secondary_lists = false; ///< CommandListLevel::Secondary and ExecuteSecondary
     u32 max_push_constant_bytes = 128;
-    u32 max_bindings = 0;
+    u32 max_push_bindings = 0; ///< more per-draw bindings than this use a descriptor set per draw
 };
 
 class Device {
@@ -465,12 +511,17 @@ public:
     virtual std::unique_ptr<Pipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc& desc) = 0;
     virtual std::unique_ptr<Pipeline> CreateComputePipeline(const ComputePipelineDesc& desc) = 0;
     virtual std::unique_ptr<Fence> CreateFence(u64 initial) = 0;
+    /// A timeline created elsewhere (Vulkan: a timeline VkSemaphore), not owned.
+    virtual std::unique_ptr<Fence> ImportFence(u64 native_handle) = 0;
 
     /// A command list from the calling thread's pool, ready for Begin. A list goes back to its
     /// pool once the GPU has run the submission it was part of (or when Release is called on a
     /// list that was never submitted).
-    virtual CommandList* AcquireCommandList() = 0;
+    virtual CommandList* AcquireCommandList(CommandListLevel level = CommandListLevel::Primary) = 0;
     virtual void ReleaseUnsubmitted(CommandList* list) = 0;
+    /// A list run by someone else's submission (a secondary list) goes back to its pool once
+    /// `retire` is reached.
+    virtual void MarkExecuted(CommandList* list, FenceValue retire) = 0;
     virtual Queue& GraphicsQueue() = 0;
 
     /// Recycles command lists and frees objects the GPU has finished with.

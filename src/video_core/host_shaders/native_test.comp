@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// NAT-012: the native renderer backend's self test fills a buffer with a specialization constant
+// plus the invocation index (ryty_gpu/native/rhi/rhi_selftest.cpp).
+
+#version 450
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint BASE = 0;
+
+layout(set = 0, binding = 0, std430) buffer Output {
+    uint values[];
+} result;
+
+void main() {
+    result.values[gl_GlobalInvocationID.x] = BASE + gl_GlobalInvocationID.x;
+}

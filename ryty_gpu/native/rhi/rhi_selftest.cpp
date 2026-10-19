@@ -18,6 +18,7 @@
 #include "ryty_gpu/native/rhi/rhi.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
+#include "video_core/host_shaders/native_test_comp.h"
 #include "video_core/host_shaders/native_test_frag.h"
 
 namespace {
@@ -43,7 +44,7 @@ bool RunSelfTest(std::string& log) {
     log += fmt::format("device: host import {} (alignment {}), push constants {} bytes, push "
                        "descriptors {}\n",
                        caps.import_host_memory, caps.host_import_alignment,
-                       caps.max_push_constant_bytes, caps.max_bindings);
+                       caps.max_push_constant_bytes, caps.max_push_bindings);
 
     // A 4x4 texture in four 2x2 colours: red, green / blue, white.
     const std::array<Rgba, 4> quadrant{{{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255},
@@ -243,6 +244,160 @@ bool RunSelfTest(std::string& log) {
                            "({:.2f} us per draw)\n",
                            us, us / 4000);
     }
+    // 4. Secondary lists (each draws one half through a pipeline with dynamic raster, depth and
+    //    stencil state) run from a primary list, as the executor will run render jobs.
+    if (caps.secondary_lists) {
+        GraphicsPipelineDesc dynamic_desc = pipeline_desc;
+        dynamic_desc.dynamic_raster_depth_stencil = true;
+        auto dynamic_pipeline = device->CreateGraphicsPipeline(dynamic_desc);
+        if (!dynamic_pipeline) {
+            log += "dynamic-state pipeline failed\n";
+            return false;
+        }
+        const std::array<std::array<float, 4>, 2> tints{{{0, 0, 1, 1}, {1, 0, 0, 1}}};
+        std::array<CommandList*, 2> secondaries{};
+        for (u32 i = 0; i < 2; ++i) {
+            CommandList* list = device->AcquireCommandList(CommandListLevel::Secondary);
+            list->Begin();
+            RenderingDesc rendering{.width = kSize, .height = kSize, .color_count = 1};
+            rendering.colors[0] = {.view = target_view.get()};
+            list->BeginRendering(rendering);
+            const Viewport viewport{0, 0, float(kSize), float(kSize), 0, 1};
+            const Rect scissor{0, s32(i * kSize / 2), kSize, kSize / 2};
+            list->SetViewports({&viewport, 1});
+            list->SetScissors({&scissor, 1});
+            list->BindPipeline(dynamic_pipeline.get());
+            list->SetRasterState({});
+            list->SetDepthStencilState({});
+            list->PushBindings(bindings);
+            list->PushConstants(0, {reinterpret_cast<const u8*>(tints[i].data()), sizeof(tints[i])});
+            list->Draw(3, 1, 0, 0);
+            list->EndRendering();
+            list->End();
+            secondaries[i] = list;
+        }
+        CommandList* primary = device->AcquireCommandList();
+        primary->Begin();
+        primary->ExecuteSecondary(secondaries);
+        primary->Barrier(ScopeDraw, ScopeTransfer);
+        primary->CopyImageToBuffer(target.get(), readback.get(), {&whole_target, 1});
+        primary->Barrier(ScopeTransfer, ScopeHost);
+        primary->End();
+        CommandList* lists[] = {primary};
+        device->GraphicsQueue().Submit(lists, {}, {fence.get(), 4});
+        if (!fence->Wait(4, 5'000'000'000ULL)) {
+            log += "secondary lists: GPU did not finish\n";
+            return false;
+        }
+        for (CommandList* secondary : secondaries) {
+            device->MarkExecuted(secondary, {fence.get(), 4});
+        }
+        const bool before = ok;
+        const auto tinted = [&](u32 q, u32 t) {
+            const Rgba c = quadrant[q];
+            return Rgba{u8(c.r * tints[t][0]), u8(c.g * tints[t][1]), u8(c.b * tints[t][2]), c.a};
+        };
+        expect("secondary lists", 8, 8, tinted(0, 0));
+        expect("secondary lists", 56, 8, tinted(1, 0));
+        expect("secondary lists", 8, 56, tinted(2, 1));
+        expect("secondary lists", 56, 56, tinted(3, 1));
+        log += fmt::format("secondary lists with dynamic state: {}\n",
+                           ok == before ? "picture correct" : "WRONG");
+    }
+
+    // 5. A layout with more bindings than can be pushed takes a descriptor set per draw.
+    {
+        std::vector<BindingSlot> many(caps.max_push_bindings + 8);
+        for (u32 i = 0; i < many.size(); ++i) {
+            many[i] = {i, i == 1 ? BindingType::Sampler : BindingType::SampledImage, StagePixel};
+        }
+        auto big_layout = device->CreatePipelineLayout(
+            {.bindings = many, .push_constant_bytes = 16, .push_constant_stages = StagePixel});
+        GraphicsPipelineDesc big_desc = pipeline_desc;
+        big_desc.layout = big_layout.get();
+        auto big_pipeline = big_layout ? device->CreateGraphicsPipeline(big_desc) : nullptr;
+        if (!big_pipeline) {
+            log += "pipeline with many bindings failed\n";
+            return false;
+        }
+        CommandList* list = device->AcquireCommandList();
+        list->Begin();
+        RenderingDesc rendering{.width = kSize, .height = kSize, .color_count = 1};
+        rendering.colors[0] = {.view = target_view.get(), .load = LoadOp::Clear, .clear = {0, 0, 0, 0}};
+        list->BeginRendering(rendering);
+        const Viewport viewport{0, 0, float(kSize), float(kSize), 0, 1};
+        const Rect scissor{0, 0, kSize, kSize};
+        const std::array<float, 4> tint{1, 1, 1, 1};
+        list->SetViewports({&viewport, 1});
+        list->SetScissors({&scissor, 1});
+        list->BindPipeline(big_pipeline.get());
+        list->PushBindings(bindings);
+        list->PushConstants(0, {reinterpret_cast<const u8*>(tint.data()), sizeof(tint)});
+        list->Draw(3, 1, 0, 0);
+        list->EndRendering();
+        list->Barrier(ScopeDraw, ScopeTransfer);
+        list->CopyImageToBuffer(target.get(), readback.get(), {&whole_target, 1});
+        list->Barrier(ScopeTransfer, ScopeHost);
+        list->End();
+        CommandList* lists[] = {list};
+        device->GraphicsQueue().Submit(lists, {}, {fence.get(), 5});
+        if (!fence->Wait(5, 5'000'000'000ULL)) {
+            log += "many bindings: GPU did not finish\n";
+            return false;
+        }
+        const bool before = ok;
+        expect("many bindings", 8, 8, quadrant[0]);
+        expect("many bindings", 56, 56, quadrant[3]);
+        log += fmt::format("{} bindings through a descriptor set: {}\n", many.size(),
+                           ok == before ? "picture correct" : "WRONG");
+    }
+
+    // 6. Compute with a specialization constant writing a storage buffer.
+    {
+        constexpr u32 kCount = 256;
+        auto output = device->CreateBuffer({.size = kCount * 4,
+                                            .usage = BufferUsageStorage | BufferUsageTransferSrc,
+                                            .memory = MemoryKind::Readback});
+        const std::array<BindingSlot, 1> compute_slots{{{0, BindingType::StorageBuffer, StageCompute}}};
+        auto compute_layout = device->CreatePipelineLayout({.bindings = compute_slots});
+        const std::array<SpecConstant, 1> constants{{{0, 1000}}};
+        auto compute = compute_layout && output
+                           ? device->CreateComputePipeline(
+                                 {.layout = compute_layout.get(),
+                                  .shader = {ShaderStage::Compute,
+                                             std::span<const u32>{NATIVE_TEST_COMP}, "main",
+                                             constants}})
+                           : nullptr;
+        if (!compute) {
+            log += "compute pipeline failed\n";
+            return false;
+        }
+        CommandList* list = device->AcquireCommandList();
+        list->Begin();
+        list->BindPipeline(compute.get());
+        const Binding out_binding{.slot = 0, .type = BindingType::StorageBuffer, .buffer = output.get(),
+                                  .size = kCount * 4};
+        list->PushBindings({&out_binding, 1});
+        list->Dispatch(kCount / 64, 1, 1);
+        list->Barrier(ScopeCompute, ScopeHost);
+        list->End();
+        CommandList* lists[] = {list};
+        device->GraphicsQueue().Submit(lists, {}, {fence.get(), 6});
+        if (!fence->Wait(6, 5'000'000'000ULL)) {
+            log += "compute: GPU did not finish\n";
+            return false;
+        }
+        u32 wrong = 0;
+        for (u32 i = 0; i < kCount; ++i) {
+            u32 value;
+            std::memcpy(&value, output->Mapped() + i * 4, 4);
+            wrong += value != 1000 + i;
+        }
+        ok = ok && wrong == 0;
+        log += fmt::format("compute with a specialization constant: {}\n",
+                           wrong == 0 ? "values correct" : fmt::format("{} WRONG values", wrong));
+    }
+
     device->Collect();
     return ok;
 }
