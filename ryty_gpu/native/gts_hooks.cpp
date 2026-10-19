@@ -113,6 +113,8 @@ enum CountKind : int {
     GnmDispatchB,
     GnmDispatchC,
     PglSubmit,
+    PglJobBegin,
+    PglJobEnd,
     kCountKinds
 };
 CountEntryInfo g_counts[kCountKinds] = {
@@ -123,6 +125,10 @@ CountEntryInfo g_counts[kCountKinds] = {
     {0x1cafa0, kPushRbx, "Gnm dispatch (b)"},
     {0x1db650, kPushRbx, "Gnm dispatch (c)"},
     {0x1c56610, kPushR14, "PGL submit"},
+    // A render job takes a PGL context from a pool, makes it current on its thread with a fresh
+    // command chunk and state from a template, and links its chunk after the previous job's.
+    {0x1c572c0, kPushR15, "PGL job begin"},
+    {0x1c57860, kPushR15, "PGL job end"},
 };
 
 u64 Count(CountKind kind) {
@@ -132,7 +138,7 @@ u64 Count(CountKind kind) {
 void ReporterLoop() {
     using namespace std::chrono_literals;
     const auto& work = Common::GetWorkCounters();
-    u64 last_draws[kDrawKinds]{}, last_gnm = 0, last_dispatch = 0, last_submits = 0;
+    u64 last_draws[kDrawKinds]{}, last_gnm = 0, last_dispatch = 0, last_submits = 0, last_jobs = 0;
     u64 last_renderer_draws = work.draws.load(), last_renderer_dispatches = work.dispatches.load();
     u64 start_renderer_draws = last_renderer_draws, start_renderer_dispatches = last_renderer_dispatches;
     while (true) {
@@ -168,6 +174,7 @@ void ReporterLoop() {
         const u64 dispatch = Count(GnmDispatchGfx) + Count(GnmDispatchAsync) + Count(GnmDispatchB) +
                              Count(GnmDispatchC);
         const u64 submits = Count(PglSubmit);
+        const u64 jobs = Count(PglJobBegin);
         const u64 renderer_draws = work.draws.load(std::memory_order_relaxed);
         const u64 renderer_dispatches = work.dispatches.load(std::memory_order_relaxed);
         // Totals since the hooks' first report window: the renderer gets a frame's draws after
@@ -175,12 +182,13 @@ void ReporterLoop() {
         // means draws reach the GPU without passing the hooks.
         LOG_INFO(Lib_GnmDriver,
                  "NAT-002 hooks (10 s): game draws {} ({}), Gnm draw wrappers {}, renderer draws "
-                 "{}; dispatches game {} renderer {}; submits {}. Since start: game draws {}, "
+                 "{}; dispatches game {} renderer {}; submits {}, render jobs {}. Since start: "
+                 "game draws {}, "
                  "renderer draws {} (diff {}), game dispatches {}, renderer dispatches {} (diff {})",
                  window_draws, by_kind.substr(1), gnm - last_gnm,
                  renderer_draws - last_renderer_draws, dispatch - last_dispatch,
                  renderer_dispatches - last_renderer_dispatches, submits - last_submits,
-                 game_draws, renderer_draws - start_renderer_draws,
+                 jobs - last_jobs, game_draws, renderer_draws - start_renderer_draws,
                  static_cast<s64>(renderer_draws - start_renderer_draws) - static_cast<s64>(game_draws),
                  dispatch, renderer_dispatches - start_renderer_dispatches,
                  static_cast<s64>(renderer_dispatches - start_renderer_dispatches) -
@@ -194,6 +202,7 @@ void ReporterLoop() {
         last_gnm = gnm;
         last_dispatch = dispatch;
         last_submits = submits;
+        last_jobs = jobs;
         last_renderer_draws = renderer_draws;
         last_renderer_dispatches = renderer_dispatches;
     }
