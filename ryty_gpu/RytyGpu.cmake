@@ -122,6 +122,9 @@ ryty_add_library(ryty_gpu libSceVideoOut
         # NAT-010/011: the native renderer's backend interface and its Vulkan backend.
         ryty_gpu/native/rhi/rhi_vulkan.cpp
         ryty_gpu/native/rhi/rhi_selftest.cpp
+        # NAT-020/021: the native image registry and its self test.
+        ryty_gpu/native/image_registry.cpp
+        ryty_gpu/native/native_selftest.cpp
         src/core/cpu_patches.cpp
         src/core/loader/dwarf.cpp
 )
