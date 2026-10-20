@@ -1392,6 +1392,8 @@ void PipelineCache::ReplayTest(const std::string& dir) {
 }
 
 bool PipelineCache::LegacyWaits() const {
+    // Keep going: rendering must not wait for a cosmetic pipeline.
+    if (CompileMode() == 2) return false;
     // FIX-119: a pipeline of the old renderer's translations (D10) is built at once, as the
     // driver usually has it already. Not in a race: there one the driver did not have stopped
     // the game for up to seconds (19.7 s of such waits in one test race); it builds in the
@@ -1409,6 +1411,7 @@ bool PipelineCache::LegacyWaits() const {
 }
 
 std::chrono::microseconds PipelineCache::QuickWait() {
+    if (CompileMode() == 2) return std::chrono::microseconds{0};
     // FIX-114: a draw whose new pipeline is building waits for it a little, so the pipelines
     // that build quickly (the driver had them, or small ones) are drawn at once and only the
     // slow ones pop in a moment later. At most 4 ms of waiting in any 16 ms, 2 ms per draw.
@@ -1431,6 +1434,8 @@ std::chrono::microseconds PipelineCache::QuickWait() {
 }
 
 bool PipelineCache::MenusWait() {
+    // Keep going: rendering must not wait for a cosmetic pipeline.
+    if (CompileMode() == 2) return false;
     // FIX-110: in GT Sport's menus a draw waits for its new pipeline (the guest clocks are held
     // meanwhile, as in the "pause" compile mode); only races skip draws. Some menu scenes draw
     // once into a texture they keep showing: the GR86 slide of the home screen played on black
@@ -1909,7 +1914,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 }
                 return it->second.get();
             }
-            if (stored->async && !LegacyWaits() && !WritesMemory(infos) && !NeverSkipped(infos) &&
+            if ((stored->async || (CompileMode() == 2 && AsyncPipelines())) &&
+                !LegacyWaits() && !WritesMemory(infos) && !NeverSkipped(infos) &&
                 !MenusWait()) {
                 // PERF-076: still building; this draw is skipped, the next ones look again.
                 graphics_pipelines.erase(it);
@@ -1924,7 +1930,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 ++prewarm_stats.cancelled;
             }
         }
-        if (build_workers) {
+        if (build_workers && CompileMode() != 2) {
             build_workers->PauseBackground(std::chrono::steady_clock::now() +
                                            std::chrono::seconds{2});
         }
@@ -1955,6 +1961,10 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         } else if (queued_states) {
             // PERF-034: a worker builds it while this thread starts the builds the command
             // thread's read-ahead queues meanwhile.
+            build = StartPipelineBuild(true);
+        } else if (CompileMode() == 2 && AsyncPipelines()) {
+            // Queue even when read-ahead/draw-pipe helpers are disabled. Retain the job
+            // in pending_builds below so a later draw installs its completed pipeline.
             build = StartPipelineBuild(true);
         }
         // PERF-076: a draw does not wait for a new pipeline. Its build goes on on a worker, the
@@ -2893,6 +2903,8 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
 }
 
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
+    // Keep going: rendering must not wait for a cosmetic pipeline.
+    if (CompileMode() == 2) return false;
     // FIX-064: tessellated draws wait for their pipeline. On GT Sport's race summary they are
     // the driver figure; skipped while each of its pipelines built, parts of it blinked out
     // frame after frame. -DisablePerf 88 skips them like other draws.
