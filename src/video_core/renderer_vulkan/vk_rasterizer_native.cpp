@@ -574,6 +574,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     s.rendering = false;
     s.dynamic.Invalidate();
     s.pipeline = vk::Pipeline{};
+    s.vertex_state_known = false; // OPT-005
     s.commands = 0;
     // What was recorded before this list (earlier lists, the presenter) is finished first.
     GlobalBarrier();
@@ -1255,6 +1256,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     }
     PhaseClock guest_clock{stats.guest_buffer_ns}; // NAT-145
     ++stats.guest_buffer_calls;
+    last_mirror = nullptr; // OPT-004
     // OPT-003: the range's last result, when nothing it depends on changed.
     const u32 flags = u32(write) | (u32(mirror) << 1);
     const std::array<u64, 3> memo_key{address, size, flags};
@@ -1277,6 +1279,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
                 memo.mirror->used_frame = frame;
             }
             last_bound = memo.bound;
+            last_mirror = memo.mirror; // OPT-004
             ++stats.buffer_memo_hits;
             return std::pair{memo.buffer, memo.offset};
         }
@@ -1285,6 +1288,9 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     memo_region = nullptr;
     memo_mirror = nullptr;
     const auto result = GuestBufferLookup(address, size, write, mirror);
+    if (result && memo_kind == MemoKind::Mirror) {
+        last_mirror = memo_mirror; // OPT-004
+    }
     if (result && memo_kind != MemoKind::None) {
         memo = BufferMemo{
             .address = address,
@@ -1831,12 +1837,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             }
         }
         if (!storage && entry->from_cpu) {
-            const auto start = std::chrono::steady_clock::now();
+            // (part of the textures' time; reported apart; OPT-001: on timed draws only)
+            PhaseClock sources_clock{stats.phase_ns[4]};
             RefreshSources(*entry); // NAT-104
-            // (part of the textures' time; reported apart)
-            stats.phase_ns[4] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                     std::chrono::steady_clock::now() - start)
-                                     .count();
         }
         const auto fallback = image_desc.mip_fallback_mode;
         for (u32 i = 0; i < num_bindings; ++i) {
@@ -1966,16 +1969,33 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
     VertexInputs<AmdGpu::Buffer> guest_buffers;
     pipeline.GetVertexInputs(v.attributes, v.input_bindings, divisors, guest_buffers,
                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+    // OPT-004: a draw's attributes mostly read one mesh (~12 V#s a draw in GT Sport races): a
+    // range inside the mirror the previous attribute was bound from, while it is there with
+    // nothing to copy in, is bound from it without a lookup (what the lookup would return).
+    Mirror* near = nullptr;
+    u64 near_generation = 0;
+    const bool sampled = InPlaceSampled();
     for (const auto& guest : guest_buffers) {
         std::optional<std::pair<vk::Buffer, u64>> found;
         u64 size = 0;
-        if (guest.base_address != 0 && guest.GetSize() > 0 &&
-            r.memory->MappedAreaEnd(guest.base_address, guest.base_address + 1) != 0) {
-            size = r.memory->ClampRangeSize(guest.base_address, guest.GetSize());
-            found = GuestBuffer(guest.base_address, size, false, true);
-            if (InPlaceSampled()) {
-                in_place.Note(BoundKind(0), guest.base_address, size); // NAT-142
+        const VAddr base = guest.base_address;
+        const u64 sharp_size = guest.GetSize();
+        if (near && !sampled && base != 0 && sharp_size > 0 &&
+            near_generation == buffer_generation && base >= near->begin &&
+            base + sharp_size <= near->end && near->dirty_pages.empty()) {
+            size = sharp_size;
+            found = std::pair{vk::Buffer{Handle<VkBuffer_T>(near->buffer->NativeHandle())},
+                              u64{base - near->begin}};
+            ++stats.mirror_binds;
+            ++stats.vertex_near;
+        } else if (base != 0 && sharp_size > 0 && r.memory->MappedAreaEnd(base, base + 1) != 0) {
+            size = r.memory->ClampRangeSize(base, sharp_size);
+            found = GuestBuffer(base, size, false, true);
+            if (sampled) {
+                in_place.Note(BoundKind(0), base, size); // NAT-142
             }
+            near = found ? last_mirror : nullptr;
+            near_generation = buffer_generation;
         }
         v.buffers.push_back(found ? found->first : vk::Buffer{});
         v.offsets.push_back(found ? found->second : 0);
@@ -2055,21 +2075,49 @@ bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u
 }
 
 void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
-    const CmdBuf cmdbuf{stream.cmd};
+    Stream& s = stream;
+    const CmdBuf cmdbuf{s.cmd};
     const bool dynamic_input = r.instance.IsVertexInputDynamicState();
+    // OPT-005: what the list already has is not recorded again (vertex input state and vertex
+    // and index bindings outlive pipeline binds; the list's other pipelines are compute).
+    const bool known = s.vertex_state_known;
+    s.vertex_state_known = true;
     if (dynamic_input) {
-        cmdbuf.setVertexInputEXT(v.input_bindings, v.attributes);
+        if (!known || !std::ranges::equal(s.input_bindings, v.input_bindings) ||
+            !std::ranges::equal(s.attributes, v.attributes)) {
+            cmdbuf.setVertexInputEXT(v.input_bindings, v.attributes);
+            s.input_bindings.assign(v.input_bindings.begin(), v.input_bindings.end());
+            s.attributes.assign(v.attributes.begin(), v.attributes.end());
+        } else {
+            ++stats.vertex_skipped;
+        }
     }
     if (const u32 count = static_cast<u32>(v.buffers.size()); count != 0) {
-        if (dynamic_input) {
-            cmdbuf.bindVertexBuffers(0, count, v.buffers.data(), v.offsets.data());
-        } else {
-            cmdbuf.bindVertexBuffers2(0, count, v.buffers.data(), v.offsets.data(),
-                                      v.sizes.data(), v.strides.data());
+        const bool same = known && std::ranges::equal(s.vertex_buffers, v.buffers) &&
+                          std::ranges::equal(s.vertex_offsets, v.offsets) &&
+                          (dynamic_input || (std::ranges::equal(s.vertex_sizes, v.sizes) &&
+                                             std::ranges::equal(s.vertex_strides, v.strides)));
+        if (!same) {
+            if (dynamic_input) {
+                cmdbuf.bindVertexBuffers(0, count, v.buffers.data(), v.offsets.data());
+            } else {
+                cmdbuf.bindVertexBuffers2(0, count, v.buffers.data(), v.offsets.data(),
+                                          v.sizes.data(), v.strides.data());
+            }
+            s.vertex_buffers.assign(v.buffers.begin(), v.buffers.end());
+            s.vertex_offsets.assign(v.offsets.begin(), v.offsets.end());
+            s.vertex_sizes.assign(v.sizes.begin(), v.sizes.end());
+            s.vertex_strides.assign(v.strides.begin(), v.strides.end());
         }
     }
     if (v.index_buffer) {
-        cmdbuf.bindIndexBuffer(v.index_buffer, v.index_offset, v.index_type);
+        if (!known || s.index_buffer != v.index_buffer || s.index_offset != v.index_offset ||
+            s.index_type != v.index_type) {
+            cmdbuf.bindIndexBuffer(v.index_buffer, v.index_offset, v.index_type);
+            s.index_buffer = v.index_buffer;
+            s.index_offset = v.index_offset;
+            s.index_type = v.index_type;
+        }
     }
 }
 
@@ -3375,7 +3423,8 @@ void NativeRenderer::Report() {
              "mirrors {} ({:.1f} MB; NAT-150: {} binds, {} made ({:.1f} MB), {} dropped as "
              "CPU-written, {} evicted, {} over budget, {} pages refreshed, {} granules read in "
              "place), "
-             "memo hits textures {}/{} buffers {} (OPT-002/003), "
+             "memo hits textures {}/{} buffers {} (OPT-002/003), vertex ranges in the "
+             "previous one's mirror {} (OPT-004), vertex records skipped {} (OPT-005), "
              "fill shaders {}, targets rewritten by clears/uploads/partial clears/fills "
              "{}/{}/{}/{} (NAT-120/124/132), "
              "on the GPU ({:.1f} MB), uploads from guest memory on the GPU/CPU {}/{}; images so far: "
@@ -3404,7 +3453,8 @@ void NativeRenderer::Report() {
              stats.mirror_binds, stats.mirrors_made, stats.mirror_made_bytes / 1048576.0,
              stats.mirrors_dropped, stats.mirrors_evicted, stats.mirror_over_budget,
              stats.mirror_refresh_pages, dynamic_granules.size(), stats.texture_memo_hits,
-             stats.texture_lookups, stats.buffer_memo_hits,
+             stats.texture_lookups, stats.buffer_memo_hits, stats.vertex_near,
+             stats.vertex_skipped,
              stats.fill_shaders, stats.rewrite_clears, stats.rewrite_uploads,
              stats.rewrite_partial, stats.rewrite_fills,
              stats.gathered_bytes / 1048576.0,
@@ -3442,6 +3492,7 @@ void NativeRenderer::Report() {
     stats.source_copies = stats.draw_ns = stats.dispatch_ns = 0;
     stats.timed_draws = 0;
     stats.texture_memo_hits = stats.texture_lookups = stats.buffer_memo_hits = 0;
+    stats.vertex_near = stats.vertex_skipped = 0;
     stats.gathers = stats.gathered_bytes = stats.writebacks = 0;
     stats.region_binds = stats.regions_made = stats.region_refreshes = 0;
     stats.fill_shaders = stats.rewrite_clears = stats.rewrite_uploads = 0;

@@ -147,6 +147,18 @@ private:
         RenderState render{};
         DynamicState dynamic{};
         vk::Pipeline pipeline{};
+        /// OPT-005: the vertex input layout, vertex buffers and index buffer last recorded in
+        /// this list (the same ones are not recorded again).
+        bool vertex_state_known = false;
+        boost::container::static_vector<vk::VertexInputBindingDescription2EXT, 32> input_bindings;
+        boost::container::static_vector<vk::VertexInputAttributeDescription2EXT, 32> attributes;
+        boost::container::static_vector<vk::Buffer, 32> vertex_buffers;
+        boost::container::static_vector<vk::DeviceSize, 32> vertex_offsets;
+        boost::container::static_vector<vk::DeviceSize, 32> vertex_sizes;
+        boost::container::static_vector<vk::DeviceSize, 32> vertex_strides;
+        vk::Buffer index_buffer{};
+        u64 index_offset = 0;
+        vk::IndexType index_type = vk::IndexType::eUint32;
         std::vector<const Native::ImageEntry*> written; ///< since the last barrier
         bool buffers_written = false;                   ///< by shaders since the last barrier
         /// NAT-140: attachments drawn since the last pass or global barrier, and pictures
@@ -254,13 +266,15 @@ private:
         Mirror* mirror = nullptr;
         Bound bound = Bound::InPlace;
     };
-    std::array<BufferMemo, 2048> buffer_memos{};
+    std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
     u64 buffer_generation = 0;
     /// OPT-003: what the last lookup can be remembered as (set by GuestBufferLookup).
     enum class MemoKind : u8 { None, Region, Mirror, InPlace };
     MemoKind memo_kind = MemoKind::None;
     Region* memo_region = nullptr;
     Mirror* memo_mirror = nullptr;
+    /// OPT-004: the mirror the last GuestBuffer bound from (none when it bound anything else).
+    Mirror* last_mirror = nullptr;
     std::optional<std::pair<vk::Buffer, u64>> GuestBufferLookup(VAddr address, u64 size, bool write,
                                                                 bool mirror);
     /// OPT-002: what a T# resolved to the last time (picture and views), by the T# and how the
@@ -273,7 +287,7 @@ private:
         Native::ImageEntry* entry = nullptr;
         std::array<vk::ImageView, 4> views{};
     };
-    std::array<TextureMemo, 4096> texture_memos{};
+    std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
     u64 unmap_generation = 0;
     /// NAT-107: a guest range gathered on the GPU from the imported views holding it, into a
     /// buffer of the list (none when part of it is not imported).
@@ -417,6 +431,8 @@ private:
         u64 guest_buffer_calls = 0, guest_buffer_ns = 0;     ///< NAT-145
         u64 rewrite_fills = 0;   ///< NAT-132
         u64 timed_draws = 0;     ///< OPT-001
+        u64 vertex_near = 0;     ///< OPT-004
+        u64 vertex_skipped = 0;  ///< OPT-005
         u64 texture_memo_hits = 0, texture_lookups = 0; ///< OPT-002
         u64 buffer_memo_hits = 0;                        ///< OPT-003
         u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,
