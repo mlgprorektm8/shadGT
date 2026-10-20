@@ -2268,12 +2268,29 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
     }
     auto* written = const_cast<Native::ImageEntry*>(entry);
     written->write_version.store(at != 0 ? at : ++write_clock, std::memory_order_relaxed);
-    if (Native::WatchedTexture(entry->info.guest_address, entry->info.guest_address + 1) &&
-        Native::WatchSample()) {
-        LOG_WARNING(Render_Vulkan, "FIX-157 watch: {} {:#x} {}x{} layers {} written, version {} "
-                    "(frame {})", entry->from_cpu ? "texture" : "target",
-                    entry->info.guest_address, entry->info.size.width, entry->info.size.height,
-                    entry->info.resources.layers, written->write_version.load(), frame);
+    if (Native::WatchedTexture(entry->info.guest_address, entry->info.guest_address + 1)) {
+        // FIX-159 (diagnosis, RYGT_FRAME_DUMP_ON_STORE=<seconds>): from that long after start,
+        // the first write of a watched picture starts a frame dump there (the frames a
+        // time-triggered dump never lands on).
+        static const double on_store = [] {
+            const char* env = std::getenv("RYGT_FRAME_DUMP_ON_STORE");
+            return env && *env ? std::atof(env) : -1.0;
+        }();
+        static const auto started = std::chrono::steady_clock::now();
+        static bool dumped = false;
+        if (on_store >= 0 && !dumped &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >=
+                on_store) {
+            dumped = true;
+            Native::g_dump_request = true;
+        }
+        if (Native::WatchSample()) {
+            LOG_WARNING(Render_Vulkan, "FIX-157 watch: {} {:#x} {}x{} layers {} written, version {} "
+                        "(frame {})", entry->from_cpu ? "texture" : "target",
+                        entry->info.guest_address, entry->info.size.width,
+                        entry->info.size.height, entry->info.resources.layers,
+                        written->write_version.load(), frame);
+        }
     }
     // NAT-111: the textures made of it copy its picture in before their next read.
     std::scoped_lock lock{written->sources_mutex};
