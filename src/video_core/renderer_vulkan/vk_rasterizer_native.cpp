@@ -1350,7 +1350,15 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         const char* env = std::getenv("RYGT_NATIVE_WRITE_REGIONS");
         return !(env && env[0] == '0');
     }();
-    if (write && write_regions && size <= 256_MB) {
+    // FIX-150: GT Sport's small buffers from 0xf000000000 up are ones the GPU writes for the CPU
+    // to read back (in a region the CPU never saw them: no rain drops on the windshield); written
+    // ranges there stay in guest memory. RYGT_NATIVE_INPLACE_FROM=<hex address> moves the limit
+    // (ffffffffffffffff: every written range gets a region, as before).
+    static const VAddr inplace_from = [] {
+        const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
+        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
+    }();
+    if (write && write_regions && size <= 256_MB && address < inplace_from) {
         if (Region* region = MakeRegion(address, size)) {
             ++stats.region_binds;
             memo_kind = MemoKind::Region; // OPT-003
