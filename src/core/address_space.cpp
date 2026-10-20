@@ -195,9 +195,11 @@ struct AddressSpace::Impl {
                        EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
 
         // Allocate backing file that represents the total physical memory.
-        backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
-                                            PAGE_EXECUTE_READWRITE, SEC_COMMIT, BackingSize,
-                                            nullptr, nullptr, 0);
+        // (CreateFileMappingW rather than CreateFileMapping2, which Wine 10 / Proton 10 lack.)
+        backing_handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
+                                            PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+                                            static_cast<DWORD>(BackingSize >> 32),
+                                            static_cast<DWORD>(BackingSize), nullptr);
 
         ASSERT_MSG(backing_handle, "{}", Common::GetLastErrorMsg());
         // Allocate a virtual memory for the backing file map as placeholder

@@ -266,8 +266,8 @@ uintptr_t IOFile::GetFileMapping() {
     HANDLE mapping = nullptr;
 
     if (file_access_mode == FileAccessMode::ReadWrite) {
-        mapping = CreateFileMapping2(hfile, NULL, FILE_MAP_WRITE, PAGE_READWRITE, SEC_COMMIT, 0,
-                                     NULL, NULL, 0);
+        // (CreateFileMappingW rather than CreateFileMapping2, which Wine 10 / Proton 10 lack.)
+        mapping = CreateFileMappingW(hfile, NULL, PAGE_READWRITE | SEC_COMMIT, 0, 0, NULL);
     } else {
         mapping = hfile;
     }
