@@ -5,3 +5,8 @@ bool PrecompileHoldsGame() {
     return false;
 }
 }
+
+// The in-game Controllers window lives in libSceVideoOut; here the settings hotkey has nothing to open.
+namespace Ryty {
+void ToggleControllerOverlay() {}
+}
