@@ -100,14 +100,17 @@ bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path
     const bool depth16 = depth && (image.info.pixel_format == vk::Format::eD16Unorm ||
                                    image.info.pixel_format == vk::Format::eD16UnormS8Uint);
     const u32 bytes_per_texel = depth ? (depth16 ? 2u : 4u) : image.info.num_bits / 8;
-    if (image.info.props.is_block || bytes_per_texel == 0) {
+    if (bytes_per_texel == 0) {
         return false;
     }
-    const u32 width = image.info.size.width;
-    const u32 height = image.info.size.height;
+    // FIX-152 (diagnosis): block-compressed images give their blocks (4x4 texels each).
+    const bool block = image.info.props.is_block;
+    const u32 width = block ? Common::AlignUp(image.info.size.width, 4u) : image.info.size.width;
+    const u32 height = block ? Common::AlignUp(image.info.size.height, 4u) : image.info.size.height;
     // NAT-125: every layer of the first mip, one after another.
     const u32 layers = image.info.props.is_volume ? 1u : std::max<u32>(image.info.resources.layers, 1u);
-    const u32 size = width * height * bytes_per_texel * layers;
+    const u32 size = block ? (width / 4) * (height / 4) * bytes_per_texel * layers
+                           : width * height * bytes_per_texel * layers;
     const auto download = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16);
     const vk::BufferImageCopy copy = {
         .bufferOffset = download.offset,
@@ -122,7 +125,7 @@ bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path
                 .layerCount = layers,
             },
         .imageOffset = {0, 0, 0},
-        .imageExtent = {width, height, 1},
+        .imageExtent = {image.info.size.width, image.info.size.height, 1},
     };
     runtime.DownloadImage(&image, download.buffer, std::span{&copy, 1});
     scheduler.Finish();

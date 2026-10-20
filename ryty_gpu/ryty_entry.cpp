@@ -33,6 +33,7 @@
 #include "ryty_gpu/ryty_input_bridge.h"
 #include "ryty_gpu/ryty_library.h"
 #include "ryty_gpu/native/gts_hooks.h"
+#include "ryty_gpu/native/image_registry.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "core/debug_state.h"
@@ -484,10 +485,12 @@ void Ryty::RytyLibraryInitialize() {
                 if (c1 == std::string::npos || c2 == std::string::npos) {
                     continue;
                 }
-                // "x<offset>": an instruction breakpoint at that offset in GTSport.exe.
+                // "x<offset>": an instruction breakpoint at that offset in GTSport.exe;
+                // "r<address>": reads of the address trap too (FIX-153 diagnosis).
                 const bool execute = item[0] == 'x';
-                u64 address = std::stoull(item.substr(execute ? 1 : 0, c1 - (execute ? 1 : 0)),
-                                          nullptr, 16);
+                const bool reads = item[0] == 'r';
+                const size_t skip = execute || reads ? 1 : 0;
+                u64 address = std::stoull(item.substr(skip, c1 - skip), nullptr, 16);
                 if (execute) {
                     address += reinterpret_cast<u64>(GetModuleHandleA(nullptr));
                 }
@@ -496,7 +499,9 @@ void Ryty::RytyLibraryInitialize() {
                 std::this_thread::sleep_until(start + std::chrono::milliseconds(
                                                           static_cast<long long>(at * 1000)));
                 Vulkan::RytyWatchWrites(address, ms,
-                                        fmt::format("{} {:#x}", execute ? "exec" : "watch", address));
+                                        fmt::format("{} {:#x}",
+                                                    execute ? "exec" : reads ? "rw" : "watch",
+                                                    address));
                 std::this_thread::sleep_for(std::chrono::milliseconds(ms + 200));
             }
         }).detach();
@@ -520,6 +525,9 @@ void Ryty::RytyLibraryInitialize() {
 // memory manager would otherwise do this. Without them the renderer keeps cached GPU copies and
 // page tracking for memory the game has freed and reused, and its watcher counts go wrong.
 extern "C" __declspec(dllexport) void RytyGpuUnmapMemory(u64 address, u64 size) {
+    if (Native::WatchedTexture(address, address + size)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: Ryty unmaps {:#x}+{:#x}", address, size);
+    }
     Core::RytyMemory::NoteMappingChange(address, size);
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->UnmapMemory(address, size);
@@ -535,6 +543,10 @@ extern "C" __declspec(dllexport) void RytyGpuMappingChanged(u64 address, u64 siz
 // Ryty calls this after the game changed the protection of guest memory (sceKernelMprotect),
 // which replaced the protections the renderer's page tracking had set there.
 extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 size) {
+    if (Native::WatchedTexture(address, address + size)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: game protection change {:#x}+{:#x}", address,
+                    size);
+    }
     Core::RytyMemory::NoteMappingChange(address, size);
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->GetPageManager().ReapplyProtection(address, size);
@@ -542,10 +554,17 @@ extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 
 }
 
 extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
+    if (Native::WatchedTexture(address, address + size)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: map {:#x}+{:#x}", address, size);
+    }
     Core::RytyMemory::NoteMappingChange(address, size);
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->MapMemory(address, size);
         rasterizer->RegisterMemory(address, size);
+        // FIX-153: new memory comes writable. Pages the renderer still tracks there (tracked
+        // between Ryty's unmap report and this map, or never released at the unmap) get their
+        // protection back, or writes to them would go unseen while they count as tracked.
+        rasterizer->GetPageManager().ReapplyProtection(address, size);
     }
 }
 
@@ -649,6 +668,10 @@ extern "C" __declspec(dllexport) u64 RytyGpuGuestTsc() {
 // Ryty calls this before the kernel writes guest memory directly (a file read into a guest
 // buffer), which would fail on a write-protected page instead of faulting.
 extern "C" __declspec(dllexport) void RytyGpuInvalidateMemory(u64 address, u64 size) {
+    if (Native::WatchedTexture(address, address + size)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: Ryty invalidates {:#x}+{:#x} (a file read)",
+                    address, size);
+    }
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->InvalidateMemory(address, size);
     }

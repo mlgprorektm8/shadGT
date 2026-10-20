@@ -91,6 +91,10 @@ public:
     /// NAT-109: hash of the guest bytes last uploaded (small textures; 0: none), so a texture
     /// made stale by a write to its page that left its bytes alone is not uploaded again.
     u64 content_hash = 0;
+    /// FIX-153 (diagnosis): uploads in all, and where the last one read its bytes (0: none,
+    /// 1: a region, 2: an imported buffer, 3: a gathered copy, 4: a CPU copy).
+    std::atomic<u32> total_uploads{0};
+    u8 upload_kind = 0;
     /// NAT-109: the GPU wrote its memory (the CPU can't tell what changed yet): upload.
     std::atomic<bool> force_upload{false};
     bool from_cpu = false; ///< texture data the CPU wrote; render targets are GPU-only
@@ -123,6 +127,16 @@ private:
     std::vector<std::pair<ImageViewKey, std::unique_ptr<Rhi::ImageView>>> views;
 };
 
+/// FIX-153 (diagnosis): RYGT_NATIVE_WATCH_TEXTURE=<hex address>: whether [begin, end) holds
+/// that address; what happens there (writes, unmaps, invalidations, uploads) is logged.
+bool WatchedTexture(VAddr begin, VAddr end);
+/// FIX-153 (diagnosis): the first 400 watched events of a kind, then one in 500.
+bool WatchSample();
+/// FIX-153 (diagnosis): on while a frame dump collects its frames: every watched event logs.
+extern std::atomic<bool> g_watch_window;
+/// FIX-153 (diagnosis): the first 16 bytes there, as text ("unreadable" when they are not).
+std::string WatchedBytes(VAddr address);
+
 class ImageRegistry {
 public:
     explicit ImageRegistry(Rhi::Device& device);
@@ -143,6 +157,7 @@ public:
     struct UploadSource {
         const Rhi::Buffer* buffer = nullptr;
         u64 offset = 0;
+        u8 kind = 0; ///< FIX-153 (diagnosis): see ImageEntry::upload_kind
         std::vector<std::unique_ptr<Rhi::Buffer>> keep; ///< alive until the GPU used them
     };
     void SetUploadSource(std::function<UploadSource(const ImageEntry&, Rhi::CommandList&)> source) {

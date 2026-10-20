@@ -314,6 +314,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             auto wrapped = device->WrapBuffer(region->buffer->NativeHandle(), region->buffer->Size());
             source.buffer = wrapped.get();
             source.offset = address - region->begin;
+            source.kind = 1;
             source.keep.push_back(std::move(wrapped));
             return source;
         }
@@ -324,6 +325,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                 found->first->SizeBytes());
             source.buffer = wrapped.get();
             source.offset = found->second;
+            source.kind = 2;
             source.keep.push_back(std::move(wrapped));
             return source;
         }
@@ -348,6 +350,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             list.Barrier(Native::Rhi::ScopeTransfer,
                          Native::Rhi::ScopeCompute | Native::Rhi::ScopeTransfer);
             source.buffer = gathered.get();
+            source.kind = 3;
         }
         source.keep.push_back(std::move(gathered));
         return source;
@@ -1500,6 +1503,15 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
             continue;
         }
         ApplyRewrite(*entry); // NAT-120
+        if (Native::WatchedTexture(entry->info.guest_address, entry->info.guest_address + 1) &&
+            Native::WatchSample()) {
+            LOG_WARNING(Render_Vulkan, "FIX-153 watch: draw into target {:#x} {}x{} layers {} "
+                        "({:#x} bytes), view layers {}+{} mip {}",
+                        entry->info.guest_address, entry->info.size.width,
+                        entry->info.size.height, entry->info.resources.layers,
+                        entry->info.guest_size, desc.view_info.range.base.layer,
+                        desc.view_info.range.extent.layers, desc.view_info.range.base.level);
+        }
         out.colors[cb] = entry;
         const u32 mip = desc.view_info.range.base.level;
         width = std::min<u32>(width, std::max(entry->info.size.width >> mip, 1u));
@@ -1611,6 +1623,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     const u64 alignment = r.instance.StorageMinAlignment();
     // DIAG-150 (SHADGT_WATCH_SHADERS=<hex,...>): a watched shader's buffers, how they are bound
     // and the first bytes guest memory holds there, and its flattened user data.
+    if (Rasterizer::ExposureLogOn()) {
+        r.ExposureLogShader(stage, "native"); // FIX-153 (diagnosis)
+    }
     static const bool watching = std::getenv("SHADGT_WATCH_SHADERS") != nullptr;
     const bool watched = watching && IsWatchedShader(stage.pgm_hash);
     static std::atomic<u64> watched_binds{};
@@ -1618,11 +1633,26 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     const bool log_watched = watched && (watched_bind <= 8 || watched_bind % 300 == 0);
     if (log_watched) {
         std::string flat;
-        for (size_t i = 0; i < std::min<size_t>(stage.flattened_ud_buf.size(), 24); ++i) {
+        for (size_t i = 0; i < std::min<size_t>(stage.flattened_ud_buf.size(), 192); ++i) {
             flat += fmt::format(" {:08x}", stage.flattened_ud_buf[i]);
         }
         LOG_WARNING(Render_Vulkan, "DIAG-150: native shader {:#x} use {}: {} dwords flattened:{}",
                     stage.pgm_hash, watched_bind, stage.flattened_ud_buf.size(), flat);
+        // FIX-153 (diagnosis): where the walker read each run of flattened dwords.
+        std::string sources;
+        const auto& src = stage.flattened_ud_src;
+        for (size_t i = 0; i < src.size();) {
+            size_t j = i + 1;
+            while (j < src.size() && src[j] != 0 && src[j] == src[j - 1] + 4) {
+                ++j;
+            }
+            if (src[i] != 0) {
+                sources += fmt::format(" [{}..{}] {:#x}", i, j - 1, src[i]);
+            }
+            i = j;
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-150: native shader {:#x} use {} sources:{}",
+                    stage.pgm_hash, watched_bind, sources);
     }
     auto* direct = stage.uses_direct ? r.buffer_cache.GetDirectMemory() : nullptr;
     // D3's table: page table L1 and zero page, then base, size and valid of each buffer read
@@ -2495,7 +2525,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock clock{stats.phase_ns[1]};
         ResolveTargets(regs, *pipeline, targets);
     }
-    if (r.FrameDumpActive()) {
+    if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
         r.FrameDumpPass(regs, targets.state, pipeline); // NAT-117
     }
     // OPT-010: the bindings the job thread worked out ahead, when they hold.
@@ -3545,6 +3575,16 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         return;
     }
     const auto& info = entry.info;
+    if (Native::WatchedTexture(info.guest_address, info.guest_address + 1) &&
+        Native::WatchSample()) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: apply {} to {} {:#x} ({:#x} bytes of {:#x}, "
+                    "pattern {:#x} {:#x})",
+                    entry.rewrite == Rewrite::Clear    ? "clear"
+                    : entry.rewrite == Rewrite::Upload ? "upload"
+                                                       : "stencil clear",
+                    entry.from_cpu ? "texture" : "target", info.guest_address, entry.rewrite_bytes,
+                    info.guest_size, entry.rewrite_pattern[0], entry.rewrite_pattern[1]);
+    }
     const Rewrite rewrite = std::exchange(entry.rewrite, Rewrite::None);
     const bool stencil = std::exchange(entry.stencil_clear_pending, false) &&
                          info.props.has_stencil && entry.image;
@@ -3971,7 +4011,19 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
 }
 
 void NativeRenderer::OnUnmap(VAddr address, u64 size) {
+    if (Native::WatchedTexture(address, address + size)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: unmap {:#x}+{:#x}", address, size);
+    }
     Native::ForgetReadable(address, size); // NAT-147
+    // FIX-153: the pages stop being watched (Ryty tells before it unmaps them). Memory mapped
+    // there again comes writable; a watch left in place counted as one in the page manager but
+    // protected nothing, and was never set again (the page was "watched"). GT Sport maps a car's
+    // models and textures into the same memory each time: the showroom's 32x32 lighting texture
+    // kept the zeros of the fresh mapping, and the car screens came out blown out.
+    if (size != 0) {
+        UnwatchPages(VideoCore::PageManager::GetPageAddr(address),
+                     VideoCore::PageManager::GetNextPageAddr(address + size - 1));
+    }
     registry->Invalidate(address, size, Native::ImageRegistry::Stale::Unmap);
     // NAT-146: regions over unmapped memory go (the device frees their buffers once the GPU is
     // done with them).
@@ -4033,6 +4085,14 @@ void NativeRenderer::WatchPages(VAddr address, u64 size) {
     const VAddr end = VideoCore::PageManager::GetNextPageAddr(address + size - 1);
     constexpr u64 PageSize = 4096;
     std::scoped_lock lock{watch_mutex};
+    if (Native::WatchedTexture(begin, end)) {
+        u32 fresh = 0;
+        for (VAddr page = begin; page < end; page += PageSize) {
+            fresh += watched_pages.contains(page) ? 0 : 1;
+        }
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: watch {:#x}-{:#x}, {} of {} pages not yet",
+                    begin, end, fresh, (end - begin) / PageSize);
+    }
     VAddr run = 0; // start of a run of pages not watched yet
     for (VAddr page = begin; page < end; page += PageSize) {
         const bool fresh = watched_pages.insert(page).second;
@@ -4048,28 +4108,34 @@ void NativeRenderer::WatchPages(VAddr address, u64 size) {
     }
 }
 
+void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
+    constexpr u64 PageSize = 4096;
+    std::scoped_lock lock{watch_mutex};
+    VAddr run = 0;
+    for (VAddr page = begin; page < end; page += PageSize) {
+        const bool watched = watched_pages.erase(page) != 0;
+        if (watched && run == 0) {
+            run = page;
+        } else if (!watched && run != 0) {
+            r.page_manager.UpdatePageWatchers(run, page - run, VideoCore::PageOp::Untrack);
+            run = 0;
+        }
+    }
+    if (run != 0) {
+        r.page_manager.UpdatePageWatchers(run, end - run, VideoCore::PageOp::Untrack);
+    }
+}
+
 void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     // The written pages stop being watched (so they open up and the write goes on), and the
     // textures over them are uploaded again when next used (which watches them again).
     const VAddr begin = VideoCore::PageManager::GetPageAddr(address);
     const VAddr end = VideoCore::PageManager::GetNextPageAddr(address + std::max<u64>(size, 1) - 1);
-    constexpr u64 PageSize = 4096;
-    {
-        std::scoped_lock lock{watch_mutex};
-        VAddr run = 0;
-        for (VAddr page = begin; page < end; page += PageSize) {
-            const bool watched = watched_pages.erase(page) != 0;
-            if (watched && run == 0) {
-                run = page;
-            } else if (!watched && run != 0) {
-                r.page_manager.UpdatePageWatchers(run, page - run, VideoCore::PageOp::Untrack);
-                run = 0;
-            }
-        }
-        if (run != 0) {
-            r.page_manager.UpdatePageWatchers(run, end - run, VideoCore::PageOp::Untrack);
-        }
+    if (Native::WatchedTexture(begin, end)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: CPU write fault {:#x}+{:#x} (exact {:#x}); "
+                    "memory {}", address, size, exact, Native::WatchedBytes(address));
     }
+    UnwatchPages(begin, end);
     registry->CpuWrite(begin, end - begin, exact != 0 ? (address - begin) + exact : 0);
     ++stats.cpu_writes;
     // NAT-114: pages of regions written by the CPU (a fault on any thread) are copied in before
@@ -4210,13 +4276,45 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
                 sources = u32(entry->sources.size());
             }
             const auto& info = entry->info;
+            // FIX-153 (diagnosis): what guest memory holds there, and whether the GPU writes it
+            // in a region.
+            std::array<u32, 4> head{};
+            const bool readable = Core::RytyMemory::GuardedCopy(
+                head.data(), reinterpret_cast<const void*>(info.guest_address), sizeof(head));
+            const Region* region =
+                RegionOver(info.guest_address, std::max<u64>(info.guest_size, 1));
+            // The bytes there now against the bytes last uploaded (NAT-109's hash).
+            u64 hash_now = 0;
+            const u64 size = info.guest_size;
+            if (size != 0 && size <= (4ull << 20) && r.memory->IsValidMapping(info.guest_address) &&
+                r.memory->ClampRangeSize(info.guest_address, size) == size &&
+                Native::ReadablePrefix(reinterpret_cast<const void*>(info.guest_address), size) ==
+                    size) {
+                hash_now =
+                    XXH3_64bits(reinterpret_cast<const void*>(info.guest_address), size) | 1;
+            }
             list += fmt::format("{} -> {} {:#x} {}x{} mips {} layers {} {}, {} sources, "
-                                "version {}{}\n",
+                                "version {}{}; memory {}; {}; uploads {}, stale {}; "
+                                "total uploads {} kind {}, tiled {} mode {} bits {} size {:#x}; "
+                                "hash now {:016x} uploaded {:016x}{}\n",
                                 key, entry->from_cpu ? "texture" : "target", info.guest_address,
                                 info.size.width, info.size.height, info.resources.levels,
                                 info.resources.layers, vk::to_string(info.pixel_format), sources,
                                 entry->write_version.load(),
-                                info.num_samples > 1 ? " (multisampled, not dumped)" : "");
+                                info.num_samples > 1 ? " (multisampled, not dumped)" : "",
+                                readable ? fmt::format("{:08x} {:08x} {:08x} {:08x}", head[0],
+                                                       head[1], head[2], head[3])
+                                         : std::string{"unreadable"},
+                                region ? fmt::format("in region {:#x}+{:#x}", region->begin,
+                                                     region->end - region->begin)
+                                       : std::string{"no region"},
+                                entry->upload_count.load(), entry->needs_upload.load(),
+                                entry->total_uploads.load(), entry->upload_kind,
+                                info.props.is_tiled, u32(info.tile_mode), info.num_bits, size,
+                                hash_now, entry->content_hash,
+                                hash_now && entry->content_hash && hash_now != entry->content_hash
+                                    ? " CHANGED"
+                                    : "");
             jobs.emplace_back(entry, fmt::format("tex_{}{}.bin", key,
                                                  info.props.is_depth ? "_depth" : ""));
         }
@@ -4228,14 +4326,19 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     u32 index = 0;
     for (const auto& [entry, name] : jobs) {
         const u32 order = index++;
-        if (!entry->image || entry->info.props.is_block) {
+        if (!entry->image) {
             continue;
         }
         const auto& desc = entry->image->Desc();
         const u32 texel = entry->info.props.is_depth ? 4u : std::max(entry->info.num_bits / 8, 1u);
         // NAT-125: every layer of the first mip (cube faces, layered targets), one after another.
         const u32 layers = desc.dim == Native::Rhi::ImageDim::D3 ? 1u : std::max(desc.layers, 1u);
-        const u64 size = u64(desc.width) * desc.height * texel * layers;
+        // FIX-152 (diagnosis): block-compressed images give their blocks (4x4 texels each).
+        const bool block = entry->info.props.is_block;
+        const u32 row = block ? Common::AlignUp(desc.width, 4u) : desc.width;
+        const u32 rows = block ? Common::AlignUp(desc.height, 4u) : desc.height;
+        const u64 size = block ? u64(row / 4) * (rows / 4) * texel * layers
+                               : u64(desc.width) * desc.height * texel * layers;
         auto buffer = device->CreateBuffer({.size = size,
                                             .usage = Native::Rhi::BufferUsageTransferDst,
                                             .memory = Native::Rhi::MemoryKind::Readback,
@@ -4245,8 +4348,8 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
         }
         const vk::BufferImageCopy copy{
             .bufferOffset = 0,
-            .bufferRowLength = desc.width,
-            .bufferImageHeight = desc.height,
+            .bufferRowLength = row,
+            .bufferImageHeight = rows,
             .imageSubresource{.aspectMask = entry->info.props.is_depth
                                                ? vk::ImageAspectFlagBits::eDepth
                                                : vk::ImageAspectFlagBits::eColor,

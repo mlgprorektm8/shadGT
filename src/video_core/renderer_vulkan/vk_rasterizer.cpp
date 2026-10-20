@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #ifdef RYTY_GPU
+#include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/shadow.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #endif
@@ -1958,7 +1959,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         if (frame_dump_collecting) {
             FrameDumpNoteOld(); // NAT-116
         }
-        if (FrameDumpActive()) {
+        if (FrameDumpActive() || ExposureLogOn()) {
             FrameDumpPass(regs, state, pipeline); // NAT-117
         }
 
@@ -2898,13 +2899,111 @@ void Rasterizer::FrameDumpNoteOld() {
     note(ctx->db_desc.first);
 }
 
+bool Rasterizer::ExposureLogOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_EXPOSURE_LOG");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+void Rasterizer::ExposureLogShader(const Shader::Info& stage, const char* renderer) {
+    // GT Sport's car shader 0x9030e833 gets the view's exposure in flattened dwords 108..111
+    // (and 1/exposure in 111); dword 121.. tells the views apart.
+    if (stage.pgm_hash != 0x9030e833 || stage.flattened_ud_buf.size() < 125) {
+        return;
+    }
+    const std::array<u32, 2> now{stage.flattened_ud_buf[108], stage.flattened_ud_buf[122]};
+    std::scoped_lock lock{exposure_mutex};
+    if (now == exposure_last) {
+        return;
+    }
+    exposure_last = now;
+    static const float dump_exposure = [] {
+        const char* env = std::getenv("RYGT_FRAME_DUMP_EXPOSURE");
+        return env && *env ? float(std::atof(env)) : -1.0f;
+    }();
+    const float key = std::bit_cast<float>(now[1]);
+    if (dump_exposure > 0 && key > 0.28f && key < 0.31f &&
+        std::bit_cast<float>(now[0]) >= dump_exposure && !exposure_dump_requested) {
+        exposure_dump_requested = true;
+        LOG_WARNING(Render_Vulkan, "EXP-LOG {} flip {}: exposure {} passed {}: frame dump",
+                    renderer, exposure_flip, std::bit_cast<float>(now[0]), dump_exposure);
+    }
+    LOG_WARNING(Render_Vulkan, "EXP-LOG {} flip {}: exposure {} (view key {})", renderer,
+                exposure_flip, std::bit_cast<float>(now[0]), std::bit_cast<float>(now[1]));
+}
+
 void Rasterizer::FrameDumpFlip() {
+    if (ExposureLogOn()) {
+        // The brightness grids drawn four or more flips ago, as the CPU reads them now.
+        std::scoped_lock lock{exposure_mutex};
+        ++exposure_flip;
+        for (auto it = exposure_targets.begin(); it != exposure_targets.end();) {
+            if (exposure_flip - it->second < 4) {
+                ++it;
+                continue;
+            }
+            std::array<u16, 64 * 16 * 4> grid{};
+            if (Core::RytyMemory::GuardedCopy(grid.data(), reinterpret_cast<const void*>(it->first),
+                                              sizeof(grid))) {
+                std::array<double, 3> sum{};
+                u32 bad = 0;
+                for (size_t i = 0; i < grid.size(); i += 4) {
+                    for (u32 c = 0; c < 3; ++c) {
+                        const u32 h = grid[i + c];
+                        const u32 e = (h >> 10) & 0x1f;
+                        const float m = float(h & 0x3ff);
+                        const float v = e == 31 ? std::numeric_limits<float>::infinity()
+                                        : e == 0 ? m * std::ldexp(1.0f, -24)
+                                                 : (1.0f + m / 1024.0f) * std::ldexp(1.0f, int(e) - 15);
+                        if (!std::isfinite(v)) {
+                            ++bad;
+                        } else {
+                            sum[c] += v;
+                        }
+                    }
+                }
+                const double n = grid.size() / 4.0;
+                LOG_WARNING(Render_Vulkan, "EXP-LOG flip {}: brightness {:#x} (drawn at flip {}) "
+                            "mean {:.5f} {:.5f} {:.5f}, {} not finite",
+                            exposure_flip, it->first, it->second, sum[0] / n, sum[1] / n,
+                            sum[2] / n, bad);
+            }
+            it = exposure_targets.erase(it);
+        }
+    }
     static const double dump_at = [] {
         const char* env = std::getenv("RYGT_FRAME_DUMP_AT");
         return env && *env ? std::atof(env) : -1.0;
     }();
     static const auto start = std::chrono::steady_clock::now();
-    if (dump_at < 0 || frame_dump_done) {
+    // FIX-153 (diagnosis): ten flips after the dump, the guest memory of the frame's CPU
+    // read-back targets as the CPU sees it.
+    if (frame_dump_done && !frame_dump_mem.empty() && ++frame_dump_mem_wait >= 10) {
+        std::string list;
+        for (const VAddr address : frame_dump_mem) {
+            std::vector<u8> bytes(16_KB);
+            const bool read = Core::RytyMemory::GuardedCopy(
+                bytes.data(), reinterpret_cast<const void*>(address), bytes.size());
+            list += fmt::format("{:#x} {}\n", address, read ? "read" : "unreadable");
+            if (read) {
+                if (std::FILE* file = std::fopen(
+                        (frame_dump_mem_dir / fmt::format("mem_{:x}.bin", address)).string().c_str(),
+                        "wb")) {
+                    std::fwrite(bytes.data(), 1, bytes.size(), file);
+                    std::fclose(file);
+                }
+            }
+        }
+        if (std::FILE* file =
+                std::fopen((frame_dump_mem_dir / "mem.txt").string().c_str(), "w")) {
+            std::fwrite(list.data(), 1, list.size(), file);
+            std::fclose(file);
+        }
+        frame_dump_mem.clear();
+    }
+    if ((dump_at < 0 && !exposure_dump_requested) || frame_dump_done) {
         return;
     }
     const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -2916,10 +3015,13 @@ void Rasterizer::FrameDumpFlip() {
     }();
     static u32 frames_seen = 0;
     if (!frame_dump_collecting) {
-        if (now >= dump_at) {
+        if ((dump_at >= 0 && now >= dump_at) || exposure_dump_requested) {
             frame_dump_collecting = true; // the next frame's targets are noted
             frame_dump_old.clear();
             frames_seen = 0;
+#ifdef RYTY_GPU
+            Native::g_watch_window = true; // FIX-153 (diagnosis)
+#endif
         }
         return;
     }
@@ -2929,11 +3031,18 @@ void Rasterizer::FrameDumpFlip() {
     }
     frame_dump_collecting = false;
     frame_dump_done = true;
+#ifdef RYTY_GPU
+    Native::g_watch_window = false;
+#endif
     const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
-                     fmt::format("dump-{}-{}", native ? "native" : "old", u32(dump_at));
+                     fmt::format("dump-{}-{}", native ? "native" : "old",
+                                 dump_at >= 0 ? fmt::format("{}", u32(dump_at))
+                                              : std::string{"exp"});
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     FrameDumpWriteEvents(dir);
+    frame_dump_mem_dir = dir; // FIX-153 (diagnosis)
+    frame_dump_mem_wait = 0;
 #ifdef RYTY_GPU
     if (native) {
         native->DumpFrame(dir);
@@ -2958,6 +3067,18 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
         text += fmt::format(" c{}={:#x} {}x{} fmt {}/{}{}", cb, col_buf.Address(), extent.width,
                             extent.height, u32(col_buf.GetDataFmt()),
                             u32(col_buf.GetNumberFmt()), attachment.is_clear ? " CLEAR" : "");
+        if (frame_dump_collecting && col_buf.Address() >= 0xf000000000 &&
+            std::ranges::find(frame_dump_mem, col_buf.Address()) == frame_dump_mem.end()) {
+            std::scoped_lock lock{frame_dump_mutex};
+            frame_dump_mem.push_back(col_buf.Address()); // FIX-153 (diagnosis)
+        }
+        if (ExposureLogOn() && col_buf.Address() >= 0xf000000000 && extent.width == 64 &&
+            extent.height == 16 && u32(col_buf.GetDataFmt()) == 12) {
+            std::scoped_lock lock{exposure_mutex};
+            if (exposure_targets.size() < 64) {
+                exposure_targets.emplace_back(col_buf.Address(), exposure_flip);
+            }
+        }
     }
     const auto& db = state.depth_stencil_attachment;
     if (db.image_view) {
@@ -3978,13 +4099,16 @@ static bool ShouldTraceCrashPage(VAddr address) {
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
+    if (ExposureLogOn()) {
+        ExposureLogShader(stage, "old"); // FIX-153 (diagnosis)
+    }
     const bool watched = IsWatchedShader(stage.pgm_hash);
     static std::atomic<u64> watched_binds{};
     const u64 watched_bind = watched ? ++watched_binds : 0;
     const bool log_watched = watched && (watched_bind <= 12 || watched_bind % 300 == 0);
     if (log_watched) {
         std::string flat;
-        for (size_t i = 0; i < std::min<size_t>(stage.flattened_ud_buf.size(), 24); ++i) {
+        for (size_t i = 0; i < std::min<size_t>(stage.flattened_ud_buf.size(), 192); ++i) {
             flat += fmt::format(" {:08x}", stage.flattened_ud_buf[i]);
         }
         LOG_WARNING(Render_Vulkan, "DIAG-150: old shader {:#x} use {}: {} dwords flattened:{}",

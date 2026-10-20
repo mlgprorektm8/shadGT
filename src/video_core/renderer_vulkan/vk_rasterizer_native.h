@@ -345,6 +345,8 @@ private:
     void NoteWrites(const Targets* targets, const DrawBindings& b);
     /// NAT-105: CPU writes to the pages of a range fault (once) from now on.
     void WatchPages(VAddr address, u64 size);
+    /// NAT-105, FIX-153: the watched pages of [begin, end) (page aligned) are watched no more.
+    void UnwatchPages(VAddr begin, VAddr end);
     /// NAT-112: small render targets drawn into are written back to guest memory (GT Sport's
     /// CPU reads its brightness chain there for auto exposure).
     void FlushWritebacks();

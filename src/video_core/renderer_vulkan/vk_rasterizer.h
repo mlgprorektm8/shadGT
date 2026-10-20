@@ -620,6 +620,24 @@ private:
     bool frame_dump_done{};
     bool frame_dump_write_old{}; // written at the next draw (not at the flip)
     std::filesystem::path frame_dump_dir;
+    /// FIX-153 (diagnosis): render targets of the dumped frame the CPU reads back (from
+    /// 0xf000000000 up), and how many flips to wait before their guest memory is saved.
+    std::vector<VAddr> frame_dump_mem;
+    std::filesystem::path frame_dump_mem_dir;
+    u32 frame_dump_mem_wait{};
+
+public:
+    /// FIX-153 (diagnosis, RYGT_EXPOSURE_LOG=1): the auto exposure's inputs over time: the
+    /// brightness grids the CPU reads back, and the exposure GT Sport's shaders get.
+    static bool ExposureLogOn();
+    void ExposureLogShader(const Shader::Info& stage, const char* renderer);
+
+private:
+    std::mutex exposure_mutex;
+    std::vector<std::pair<VAddr, u64>> exposure_targets; // brightness grid, flip drawn at
+    u64 exposure_flip{};
+    std::array<u32, 2> exposure_last{};
+    std::atomic<bool> exposure_dump_requested{false};
     std::vector<std::pair<VideoCore::ImageId, u64>> frame_dump_old; // image, uid
     void FrameDumpNoteOld();
     void FrameDumpWriteOld();

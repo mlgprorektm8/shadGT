@@ -5,7 +5,10 @@
 #include <bit>
 #include <cstring>
 
+#include <array>
+#include <cstdlib>
 #include "common/logging/log.h"
+#include "core/memory.h"
 #include <xxhash.h>
 #include "ryty_gpu/native/image_registry.h"
 #include "video_core/amdgpu/tiling.h"
@@ -95,6 +98,34 @@ Rhi::ImageDesc DescOf(const VideoCore::ImageInfo& info, bool render_target, bool
 
 } // namespace
 
+bool WatchedTexture(VAddr begin, VAddr end) {
+    static const VAddr watched = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WATCH_TEXTURE");
+        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0};
+    }();
+    return watched != 0 && begin <= watched && watched < std::max(end, begin + 1);
+}
+
+std::atomic<bool> g_watch_window{false};
+
+bool WatchSample() {
+    if (g_watch_window.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    static std::atomic<u32> count{};
+    const u32 n = count++;
+    return n < 400 || n % 500 == 0;
+}
+
+std::string WatchedBytes(VAddr address) {
+    std::array<u32, 4> head{};
+    if (!Core::RytyMemory::GuardedCopy(head.data(), reinterpret_cast<const void*>(address),
+                                       sizeof(head))) {
+        return "unreadable";
+    }
+    return fmt::format("{:08x} {:08x} {:08x} {:08x}", head[0], head[1], head[2], head[3]);
+}
+
 bool SameLayout(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b) {
     return a.guest_address == b.guest_address && a.num_bits == b.num_bits &&
            a.size == b.size && a.pitch == b.pitch && a.tile_mode == b.tile_mode &&
@@ -153,6 +184,39 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 if (render_target || !exact->from_cpu) {
                     break;
                 }
+            }
+        }
+        if (render_target) {
+            // FIX-154: targets at the same address in the same layout (pitch, tiling, texel
+            // size) are one picture in memory, so every draw goes into the largest of them (not
+            // into one of its own size). GT Sport draws the car's interior into a 720x680 corner
+            // of the showroom's 1920x1080 post-processing target, and its depth of field reads
+            // the whole 1920x1080 picture: drawn into a picture of its own, that corner kept the
+            // last frame's blurred result, the brightness the game measured there fell as the
+            // interior's exposure rose, and the exposure ran away (black car screens).
+            ImageEntry* largest = nullptr;
+            for (auto it = first; it != last; ++it) {
+                const auto& c = it->second->info;
+                if (!it->second->from_cpu && it->second->image && c.pitch == info.pitch &&
+                    c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
+                    c.num_samples == info.num_samples && c.props.is_depth == info.props.is_depth &&
+                    c.props.has_stencil == info.props.has_stencil && c.type == info.type &&
+                    c.resources.levels >= info.resources.levels &&
+                    c.resources.layers >= info.resources.layers &&
+                    c.size.width >= info.size.width && c.size.height >= info.size.height &&
+                    (!info.props.is_depth || c.pixel_format == info.pixel_format) &&
+                    (!largest || u64(c.size.width) * c.size.height >
+                                     u64(largest->info.size.width) * largest->info.size.height)) {
+                    largest = it->second.get();
+                }
+            }
+            if (largest) {
+                ++stats.hits;
+                if (largest != exact) {
+                    ++stats.reused_larger;
+                }
+                largest->last_use.store(frame, std::memory_order_relaxed);
+                return largest;
             }
         }
         // A target of the texture's own layout is read as it is.
@@ -264,6 +328,12 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         NoteChanges({&range, 1}); // OPT-002, OPT-010
     }
     IndexEntry(*result);
+    if (WatchedTexture(info.guest_address, info.guest_address + 1)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: made {} {:#x} {}x{} mips {} ({:#x} bytes); "
+                    "memory {}", render_target ? "target" : "texture", info.guest_address,
+                    info.size.width, info.size.height, info.resources.levels, info.guest_size,
+                    WatchedBytes(info.guest_address));
+    }
     if (render_target) {
         ++stats.created_targets;
         LinkTarget(*result);
@@ -609,6 +679,12 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
 
 void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
     ++stats.stale[static_cast<u32>(why)];
+    if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: {:#x} stale ({}), pending before {}; memory {}",
+                    entry.info.guest_address,
+                    why == Stale::CpuWrite ? "CPU write" : why == Stale::Unmap ? "unmap" : "GPU write",
+                    entry.needs_upload.load(), WatchedBytes(entry.info.guest_address));
+    }
     if (why != Stale::CpuWrite) {
         entry.force_upload.store(true, std::memory_order_relaxed);
     }
@@ -628,6 +704,11 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
 
 void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
                              bool exact, u64 clock) {
+    if (WatchedTexture(address, address + std::max<u64>(size, 1)) && WatchSample()) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: GPU {} {:#x}+{:#x} pattern {:#x} {:#x}",
+                    pattern ? "fill" : exact ? "copy" : "storage write", address, size,
+                    pattern ? (*pattern)[0] : 0u, pattern ? (*pattern)[1] : 0u);
+    }
     ForEachOverlapping(address, address + std::max<u64>(size, 1), [&](ImageEntry& entry) {
         if (entry.from_cpu) {
             // NAT-129: a storage buffer as big as GT Sport's scratch pool would upload every
@@ -676,6 +757,16 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
         if (entry.info.guest_address != address && !covered) {
             return;
         }
+        if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1) &&
+            WatchSample()) {
+            LOG_WARNING(Render_Vulkan, "FIX-153 watch: target {:#x} ({:#x} bytes, {} layers) "
+                        "written {:#x}+{:#x}: {}", entry.info.guest_address, entry.info.guest_size,
+                        entry.info.resources.layers, address, size,
+                        pattern ? (covered ? "clear (covered)" : "clear (partial)")
+                        : size >= entry.info.guest_size && (exact || size <= 2 * entry.info.guest_size)
+                            ? "upload"
+                            : "ignored");
+        }
         if (pattern) {
             ++stats.targets_rewritten;
             entry.rewrite = ImageEntry::Rewrite::Clear;
@@ -703,6 +794,10 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
 }
 
 void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
+    if (WatchedTexture(address, address + size)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: CPU write {:#x}+{:#x} (exact {:#x})", address,
+                    size, exact);
+    }
     constexpr u64 HashedSize = 4ull << 20;
     const VAddr written_end = address + (exact != 0 ? exact : size);
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
@@ -840,6 +935,10 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
                 XXH3_64bits(reinterpret_cast<const void*>(info.guest_address), size) | 1;
             if (!forced && hash == entry->content_hash) {
                 ++upload_stats.unchanged;
+                if (WatchedTexture(info.guest_address, info.guest_address + 1)) {
+                    LOG_WARNING(Render_Vulkan, "FIX-153 watch: {:#x} unchanged ({:016x}), not "
+                                "uploaded", info.guest_address, hash);
+                }
                 continue;
             }
             entry->content_hash = hash;
@@ -923,10 +1022,18 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
             copy.buffer_offset += linear_offset;
         }
         list.CopyBufferToImage(linear, entry->image.get(), copies);
+        const u8 kind = source ? 4 : gpu_source.kind; // FIX-153 (diagnosis)
         if (source) {
             staging.push_back(std::move(source));
         }
         stats.upload_bytes += size;
+        if (WatchedTexture(info.guest_address, info.guest_address + 1)) {
+            LOG_WARNING(Render_Vulkan, "FIX-153 watch: {:#x} uploaded (kind {}, forced {}, hash "
+                        "{:016x}); memory {}", info.guest_address, kind,
+                        forced, entry->content_hash, WatchedBytes(info.guest_address));
+        }
+        entry->upload_kind = kind;
+        ++entry->total_uploads;
         ++entry->upload_count;
         ++uploaded;
     }
