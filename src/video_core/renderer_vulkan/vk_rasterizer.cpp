@@ -3007,6 +3007,11 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
                 sampled += fmt::format(" {:#x}:{}x{}m{}l{}", tsharp.Address(), tsharp.width + 1,
                                        tsharp.height + 1, tsharp.last_level - tsharp.base_level + 1,
                                        tsharp.last_array - tsharp.base_array + 1);
+                // FIX-152 (diagnosis): format, tiling, type, depth and pitch.
+                sampled += fmt::format("[d{} n{} t{} y{} z{} p{}]", u32(tsharp.GetDataFmt()),
+                                       u32(tsharp.GetNumberFmt()), u32(tsharp.GetTileMode()),
+                                       u32(tsharp.GetType()), tsharp.depth + 1,
+                                       tsharp.pitch + 1);
             }
         }
     }
@@ -3977,6 +3982,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     static std::atomic<u64> watched_binds{};
     const u64 watched_bind = watched ? ++watched_binds : 0;
     const bool log_watched = watched && (watched_bind <= 12 || watched_bind % 300 == 0);
+    if (log_watched) {
+        std::string flat;
+        for (size_t i = 0; i < std::min<size_t>(stage.flattened_ud_buf.size(), 24); ++i) {
+            flat += fmt::format(" {:08x}", stage.flattened_ud_buf[i]);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-150: old shader {:#x} use {}: {} dwords flattened:{}",
+                    stage.pgm_hash, watched_bind, stage.flattened_ud_buf.size(), flat);
+    }
     // DIAG-032: once, well into the session, dump the GPU copy of every buffer of a grass vertex
     // dispatch (cs 0xab6a2d10), then the vertex ranges of the grass draws that follow.
     static std::atomic<u32> grass_dispatches{};
@@ -4347,13 +4360,20 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                 desc.is_formatted);
                 }
                 if (log_watched) {
+                    std::array<u32, 4> head{};
+                    const bool read = size != 0 && Core::RytyMemory::GuardedCopy(
+                        head.data(), reinterpret_cast<const void*>(u64(vsharp.base_address)),
+                        std::min<u64>(size, sizeof(head)));
                     LOG_WARNING(Render_Vulkan,
                                 "DIAG-030: shader {:#x} use {} buffer {} {} {:#x}+{:#x} stride {} "
-                                "records {:#x}: {}",
+                                "records {:#x}: {}; memory {} (DIAG-150)",
                                 stage.pgm_hash, watched_bind, buffer_index - 1,
                                 desc.is_written ? "write" : "read", u64(vsharp.base_address), size,
                                 vsharp.GetStride(), vsharp.num_records,
-                                buffer_cache.DescribeRange(vsharp.base_address, size));
+                                buffer_cache.DescribeRange(vsharp.base_address, size),
+                                read ? fmt::format("{:08x} {:08x} {:08x} {:08x}", head[0], head[1],
+                                                   head[2], head[3])
+                                     : std::string{"unreadable"});
                 }
                 if (watched && !desc.is_written && size <= 32_MB) {
                     buffer_cache.RefreshReadPages(vsharp.base_address, size, stage.pgm_hash, false);
@@ -4873,8 +4893,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             auto& image = texture_cache.GetImage(image_id);
+            // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
+            static const bool dump_all = [] {
+                const char* env = std::getenv("RYGT_FRAME_DUMP_ALL_TEXTURES");
+                return env && env[0] == '1';
+            }();
             if (frame_dump_collecting && !is_storage &&
-                True(image.flags & VideoCore::ImageFlagBits::GpuModified)) {
+                (dump_all || True(image.flags & VideoCore::ImageFlagBits::GpuModified))) {
                 auto key = FrameDumpTextureKey(desc.info); // NAT-123
                 if (std::ranges::find(frame_dump_textures, key,
                                       [](const auto& t) { return std::get<0>(t); }) ==

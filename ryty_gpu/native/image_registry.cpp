@@ -667,14 +667,21 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
             }
             return;
         }
-        if (entry.info.guest_address != address) {
+        // FIX-152: a fill that covers a whole target clears it wherever it starts. GT Sport
+        // clears the car showroom's six environment cube faces (six targets 256 KB apart) with
+        // one fill from the first face: only that one was cleared, the others added the studio's
+        // lights frame after frame, and the auto exposure made the showroom screens black.
+        const bool covered = pattern && address <= entry.info.guest_address &&
+                             address + size >= entry.info.guest_address + entry.info.guest_size;
+        if (entry.info.guest_address != address && !covered) {
             return;
         }
         if (pattern) {
             ++stats.targets_rewritten;
             entry.rewrite = ImageEntry::Rewrite::Clear;
             entry.rewrite_pattern = *pattern;
-            entry.rewrite_bytes = std::min<u64>(size, entry.info.guest_size);
+            entry.rewrite_bytes =
+                covered ? entry.info.guest_size : std::min<u64>(size, entry.info.guest_size);
             entry.rewrite_clock = clock;
         } else if (size >= entry.info.guest_size &&
                    (exact || size <= 2 * entry.info.guest_size)) {

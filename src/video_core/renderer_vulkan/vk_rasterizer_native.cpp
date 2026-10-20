@@ -1609,6 +1609,21 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
 void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
                                  Shader::Backend::Bindings& binding, DrawBindings& b) {
     const u64 alignment = r.instance.StorageMinAlignment();
+    // DIAG-150 (SHADGT_WATCH_SHADERS=<hex,...>): a watched shader's buffers, how they are bound
+    // and the first bytes guest memory holds there, and its flattened user data.
+    static const bool watching = std::getenv("SHADGT_WATCH_SHADERS") != nullptr;
+    const bool watched = watching && IsWatchedShader(stage.pgm_hash);
+    static std::atomic<u64> watched_binds{};
+    const u64 watched_bind = watched ? ++watched_binds : 0;
+    const bool log_watched = watched && (watched_bind <= 8 || watched_bind % 300 == 0);
+    if (log_watched) {
+        std::string flat;
+        for (size_t i = 0; i < std::min<size_t>(stage.flattened_ud_buf.size(), 24); ++i) {
+            flat += fmt::format(" {:08x}", stage.flattened_ud_buf[i]);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-150: native shader {:#x} use {}: {} dwords flattened:{}",
+                    stage.pgm_hash, watched_bind, stage.flattened_ud_buf.size(), flat);
+    }
     auto* direct = stage.uses_direct ? r.buffer_cache.GetDirectMemory() : nullptr;
     // D3's table: page table L1 and zero page, then base, size and valid of each buffer read
     // through it.
@@ -1710,6 +1725,24 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 !impossible && base != 0 && sharp_size != 0 && !r.IsMappedStart(base);
             if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
                 const u64 size = r.memory->ClampRangeSize(base, sharp_size);
+                const auto log_buffer = [&](const char* how) {
+                    if (!log_watched) {
+                        return;
+                    }
+                    std::array<u32, 4> head{};
+                    const bool read = Core::RytyMemory::GuardedCopy(head.data(),
+                                                        reinterpret_cast<const void*>(base),
+                                                        std::min<u64>(size, sizeof(head)));
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-150: native shader {:#x} use {} buffer {} {} {:#x}+{:#x} "
+                                "stride {} records {:#x}: {}; memory {}",
+                                stage.pgm_hash, watched_bind, buffer_index,
+                                desc.is_written ? "write" : "read", base, size, vsharp.GetStride(),
+                                vsharp.num_records, how,
+                                read ? fmt::format("{:08x} {:08x} {:08x} {:08x}", head[0], head[1],
+                                                   head[2], head[3])
+                                     : std::string{"unreadable"});
+                };
                 if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) &&
                     !RegionOver(base, size) && direct->EnsureImported(base, size)) {
                     // D3: read in place through the page table; nothing bound.
@@ -1717,7 +1750,11 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     if (InPlaceSampled()) {
                         in_place.Note(2, base, size); // NAT-142
                     }
+                    log_buffer("in place through the page table (D3)");
                 } else if (const auto found = GuestBuffer(base, size, desc.is_written)) {
+                    log_buffer(last_bound == Bound::Region   ? "region"
+                               : last_bound == Bound::Mirror ? "mirror"
+                                                             : "in place");
                     const u64 aligned = Common::AlignDown(found->second, alignment);
                     const u64 adjust = found->second - aligned;
                     b.push.AddOffset(binding.buffer, static_cast<u32>(adjust));
@@ -1847,7 +1884,12 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         }
         ApplyRewrite(*entry); // NAT-120 (NAT-133: textures too)
         if (!storage && r.FrameDumpCollecting()) {
-            bool gpu_written = !entry->from_cpu;
+            // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
+            static const bool dump_all = [] {
+                const char* env = std::getenv("RYGT_FRAME_DUMP_ALL_TEXTURES");
+                return env && env[0] == '1';
+            }();
+            bool gpu_written = dump_all || !entry->from_cpu;
             if (!gpu_written) {
                 std::scoped_lock lock{entry->sources_mutex};
                 gpu_written = !entry->sources.empty();
@@ -2425,6 +2467,27 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     if (!pipeline) {
         ++stats.no_pipeline;
         return;
+    }
+    // DIAG-152 (RYGT_NATIVE_SKIP_PS=<hex,...>): draws with these pixel shaders are skipped.
+    static const std::vector<u64> skip_ps = [] {
+        std::vector<u64> hashes;
+        if (const char* env = std::getenv("RYGT_NATIVE_SKIP_PS"); env && *env) {
+            const std::string list{env};
+            for (size_t start = 0; start < list.size();) {
+                const size_t end = std::min(list.find(',', start), list.size());
+                hashes.push_back(std::stoull(list.substr(start, end - start), nullptr, 16));
+                start = end + 1;
+            }
+        }
+        return hashes;
+    }();
+    if (!skip_ps.empty()) {
+        const auto& stages = pipeline->GetStages();
+        const Shader::Info* fs = stages[u32(Shader::SwStage::Fragment)];
+        if (fs && std::ranges::find(skip_ps, fs->pgm_hash) != skip_ps.end()) {
+            ++stats.skipped;
+            return;
+        }
     }
     Stream& s = Begin();
     Targets targets;
