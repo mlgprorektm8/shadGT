@@ -2949,6 +2949,44 @@ void Rasterizer::StartFrameDumpNow() {
 }
 
 void Rasterizer::FrameDumpFlip() {
+    // FIX-158 (diagnosis, RYGT_PEEK=<hex address>[,...], RYGT_PEEK_AT=<seconds>): the first
+    // eight floats guest memory holds at each address, at 240 flips from that time on (what the
+    // CPU reads back of GPU results, per frame).
+    static const std::vector<VAddr> peek = [] {
+        std::vector<VAddr> list;
+        const char* env = std::getenv("RYGT_PEEK");
+        for (const char* at = env; at && *at;) {
+            char* end = nullptr;
+            const VAddr address = std::strtoull(at, &end, 16);
+            if (end == at) {
+                break;
+            }
+            list.push_back(address);
+            at = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    if (!peek.empty()) {
+        static const double peek_at = [] {
+            const char* env = std::getenv("RYGT_PEEK_AT");
+            return env ? std::atof(env) : 200.0;
+        }();
+        static const auto peek_start = std::chrono::steady_clock::now();
+        static u32 peeked = 0;
+        const double since =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - peek_start).count();
+        if (since >= peek_at && peeked < 240) {
+            ++peeked;
+            for (const VAddr address : peek) {
+                std::array<float, 8> v{};
+                if (Core::RytyMemory::GuardedCopy(v.data(), reinterpret_cast<const void*>(address),
+                                                  sizeof(v))) {
+                    LOG_WARNING(Render_Vulkan, "FIX-158 peek: flip {} {:#x}: {} {} {} {} {} {} {} {}",
+                                peeked, address, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+                }
+            }
+        }
+    }
     if (ExposureLogOn()) {
         // The brightness grids drawn four or more flips ago, as the CPU reads them now.
         std::scoped_lock lock{exposure_mutex};
