@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <condition_variable>
 #include <cstring>
@@ -53,6 +54,21 @@ extern thread_local u64 g_diag_compiling_hash;
 } // namespace Shader::Optimization
 namespace Vulkan {
 
+namespace {
+std::atomic<u32> g_shader_translations_running{};
+struct TranslationActivity {
+    TranslationActivity() { g_shader_translations_running.fetch_add(1, std::memory_order_relaxed); }
+    ~TranslationActivity() { g_shader_translations_running.fetch_sub(1, std::memory_order_relaxed); }
+    TranslationActivity(const TranslationActivity&) = delete;
+    TranslationActivity& operator=(const TranslationActivity&) = delete;
+};
+} // namespace
+
+bool CompilationInProgress() {
+    return PipelineBuildsRunning() != 0 ||
+           g_shader_translations_running.load(std::memory_order_relaxed) != 0;
+}
+
 class PipelineCache::TranslateWorkers {
 public:
     TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count)
@@ -102,6 +118,7 @@ private:
     }
 
     void Translate(TranslateJob& job, Shader::Pools& pools) {
+        TranslationActivity activity;
         const Shader::ShaderParams params{
             .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{job.user_data},
             .code = job.code,

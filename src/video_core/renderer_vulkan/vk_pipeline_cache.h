@@ -81,6 +81,8 @@ bool PrecompileHoldsGame();
 bool CompileSlowMotion();
 /// FIX-104: pipeline creations in progress.
 u32 PipelineBuildsRunning();
+/// Active shader translation or driver pipeline compilation, independent of guest-clock holds.
+bool CompilationInProgress();
 
 class PipelineCache {
 public:
