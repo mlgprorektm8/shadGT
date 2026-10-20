@@ -100,6 +100,15 @@ public:
     bool from_cpu = false; ///< texture data the CPU wrote; render targets are GPU-only
     std::atomic<bool> needs_upload{false};
     std::atomic<u64> last_use{0};
+    /// FIX-157: the frame it was made (how long a picture has been in use). A picture the GPU
+    /// wrote is `kept` past its idle time while nothing else wrote its memory (its pages are
+    /// watched from then on); `reused` once something does: nothing finds it any more and it
+    /// goes. `foreign_clock`: the renderer's write clock when GPU work last wrote its memory
+    /// other than into the picture.
+    u64 made_frame = 0;
+    std::atomic<bool> kept{false};
+    std::atomic<bool> reused{false};
+    std::atomic<u64> foreign_clock{0};
 
     /// NAT-120: GPU work rewrote the guest memory of this render target from its first byte
     /// (GT Sport clears depth buffers and pictures with a fill shader). Applied at the
@@ -127,9 +136,14 @@ private:
     std::vector<std::pair<ImageViewKey, std::unique_ptr<Rhi::ImageView>>> views;
 };
 
-/// FIX-153 (diagnosis): RYGT_NATIVE_WATCH_TEXTURE=<hex address>: whether [begin, end) holds
-/// that address; what happens there (writes, unmaps, invalidations, uploads) is logged.
+/// FIX-153 (diagnosis): RYGT_NATIVE_WATCH_TEXTURE=<hex address>[,<hex address>...]: whether
+/// [begin, end) holds one of them; what happens there (writes, unmaps, invalidations, uploads)
+/// is logged.
 bool WatchedTexture(VAddr begin, VAddr end);
+/// FIX-156 (diagnosis): the watched addresses.
+const std::vector<VAddr>& WatchedTextures();
+/// FIX-156 (diagnosis): a fill of the watched address asks for a frame dump of the next frame.
+extern std::atomic<bool> g_dump_request;
 /// FIX-153 (diagnosis): the first 400 watched events of a kind, then one in 500.
 bool WatchSample();
 /// FIX-153 (diagnosis): on while a frame dump collects its frames: every watched event logs.
@@ -235,7 +249,12 @@ public:
     /// NAT-108: frees the images last used before frame `before`; `on_evict` sees each one
     /// first (the renderer drops what it keeps about it). The images' memory goes once the GPU
     /// has finished the work recorded so far. Returns how many went.
-    u32 Evict(u64 before, const std::function<void(ImageEntry&)>& on_evict);
+    /// FIX-157: `keep` may keep one past its idle time (asked with no lock held).
+    u32 Evict(u64 before, const std::function<void(ImageEntry&)>& on_evict,
+              const std::function<bool(ImageEntry&)>& keep = {});
+    /// FIX-157: whether guest memory under a picture the GPU wrote still holds what it held
+    /// when the picture was last uploaded from it (its content hash).
+    bool MemoryUnchanged(const ImageEntry& entry);
     u64 Count();
 
     /// Records the uploads queued since the last call (copy from guest memory, untile, copy
@@ -272,6 +291,10 @@ private:
     void LinkTexture(ImageEntry& texture);
     void LinkTarget(ImageEntry& target);
     void MarkStale(ImageEntry& entry, Stale why);
+    /// FIX-157: something else wrote a kept picture's memory.
+    void MarkReused(ImageEntry& entry);
+    /// FIX-157: GPU work wrote part of a picture's memory other than into the picture.
+    void ForeignWrite(ImageEntry& entry, u64 size, bool exact, u64 clock);
 
     // NAT-109: images by the 64 KB granules of guest memory they cover (overlap queries look at
     // the granules of the range instead of every image).

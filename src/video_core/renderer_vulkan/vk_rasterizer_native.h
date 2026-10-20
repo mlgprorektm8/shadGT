@@ -350,6 +350,24 @@ private:
     /// NAT-112: small render targets drawn into are written back to guest memory (GT Sport's
     /// CPU reads its brightness chain there for auto exposure).
     void FlushWritebacks();
+    /// FIX-156 (diagnosis): reads back the pictures at RYGT_NATIVE_WATCH_TEXTURE now and then.
+    void ProbeWatchedPictures();
+    /// FIX-157 (diagnosis): a T# at a watched address and the picture it resolved to.
+    void WatchBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp, bool storage,
+                   bool memo, u64 program);
+    struct Probe {
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        u64 tick;
+        u64 size;
+        u64 frame;
+        u64 version;
+        u32 width, height;
+        bool target;
+        VAddr address;
+    };
+    std::vector<Probe> probes;
+    /// FIX-157: bytes of pictures kept past their idle time.
+    u64 kept_bytes = 0;
     std::vector<Native::ImageEntry*> writebacks;
     std::vector<const Native::ImageEntry*> dump_entries; // NAT-116
     /// NAT-123: GPU-written images the dumped frame sampled, by texture key.

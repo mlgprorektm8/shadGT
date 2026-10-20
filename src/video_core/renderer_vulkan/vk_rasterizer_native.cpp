@@ -1554,15 +1554,45 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                 }
             }
             bool meta_clear = false;
+            bool fresh = false;
             if (htile != 0) {
                 known_meta.insert(htile);
                 meta_clear = cleared_meta.erase(htile) != 0;
+                // FIX-156: a depth buffer with HTILE the GPU never drew into starts out cleared,
+                // as in the old renderer (a new depth image's HTILE counts as cleared). The game
+                // fast-clears the HTILE before the first pass that uses the buffer, while that
+                // memory is not yet known as metadata. GT Sport draws the track from above once
+                // while a race loads, and the cockpit's night lighting reads a map made of that
+                // depth: started from the zeros of fresh memory, every fragment failed the depth
+                // test, the map came out empty, and the cockpit went dark but for the odd frame.
+                if (!meta_clear && desc.info.meta_info.htile_addr != 0 && !entry->from_cpu &&
+                    entry->write_version.load(std::memory_order_relaxed) == 0) {
+                    meta_clear = fresh = true;
+                    ++stats.meta_clears;
+                }
             }
             const auto aspects =
                 DepthStencilClearAspects(regs.depth_buffer, regs.depth_control,
                                          regs.depth_render_control, meta_clear);
             const bool depth_clear = bool(aspects & vk::ImageAspectFlagBits::eDepth);
             const bool stencil_clear = bool(aspects & vk::ImageAspectFlagBits::eStencil);
+            if (Native::WatchedTexture(entry->info.guest_address, entry->info.guest_address + 1) &&
+                Native::WatchSample()) {
+                const auto& dc = regs.depth_control;
+                LOG_WARNING(Render_Vulkan, "FIX-156 watch: depth pass {:#x} {}x{} htile {:#x} "
+                            "(tile surface {}) version {} meta clear {}{} -> depth clear {} ({}) "
+                            "stencil clear {} | test {} write {} func {} stencil {} | render "
+                            "control clear {}/{} (frame {})",
+                            entry->info.guest_address, entry->info.size.width,
+                            entry->info.size.height, htile,
+                            u32(regs.depth_buffer.z_info.tile_surface_enable),
+                            entry->write_version.load(), meta_clear, fresh ? " (fresh)" : "",
+                            depth_clear, regs.depth_clear, stencil_clear, u32(dc.depth_enable),
+                            u32(dc.depth_write_enable), u32(dc.depth_func),
+                            u32(dc.stencil_enable),
+                            u32(regs.depth_render_control.depth_clear_enable),
+                            u32(regs.depth_render_control.stencil_clear_enable), frame);
+            }
             db.image_view = view;
             if (regs.depth_buffer.DepthValid()) {
                 db.clear_value[0] = depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
@@ -1866,6 +1896,10 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 memo->generation == registry->Generation() + unmap_generation) {
                 Native::ImageEntry* entry = memo->entry;
                 entry->last_use.store(frame, std::memory_order_relaxed);
+                if (Native::WatchedTexture(entry->info.guest_address,
+                                           entry->info.guest_address + 1)) {
+                    WatchBind(*entry, tsharp, storage, true, stage.pgm_hash); // FIX-157
+                }
                 ApplyRewrite(*entry); // NAT-120
                 if (!storage && entry->from_cpu) {
                     RefreshSources(*entry); // NAT-104
@@ -1916,6 +1950,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         if (!entry) {
             bind_null(6);
             continue;
+        }
+        if (Native::WatchedTexture(desc.info.guest_address, desc.info.guest_address + 1)) {
+            WatchBind(*entry, tsharp, storage, false, stage.pgm_hash); // FIX-157 (diagnosis)
         }
         ApplyRewrite(*entry); // NAT-120 (NAT-133: textures too)
         if (!storage && r.FrameDumpCollecting()) {
@@ -2231,6 +2268,13 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
     }
     auto* written = const_cast<Native::ImageEntry*>(entry);
     written->write_version.store(at != 0 ? at : ++write_clock, std::memory_order_relaxed);
+    if (Native::WatchedTexture(entry->info.guest_address, entry->info.guest_address + 1) &&
+        Native::WatchSample()) {
+        LOG_WARNING(Render_Vulkan, "FIX-157 watch: {} {:#x} {}x{} layers {} written, version {} "
+                    "(frame {})", entry->from_cpu ? "texture" : "target",
+                    entry->info.guest_address, entry->info.size.width, entry->info.size.height,
+                    entry->info.resources.layers, written->write_version.load(), frame);
+    }
     // NAT-111: the textures made of it copy its picture in before their next read.
     std::scoped_lock lock{written->sources_mutex};
     for (auto* texture : written->dependents) {
@@ -2263,8 +2307,8 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
     const u64 own = texture.write_version.load(std::memory_order_relaxed);
     for (const auto& [source, place] : sources) {
         const u64 version = source->write_version.load(std::memory_order_relaxed);
-        if (version == 0 || !source->image) {
-            continue;
+        if (version == 0 || !source->image || source->reused.load(std::memory_order_relaxed)) {
+            continue; // FIX-157: a reused one is stale
         }
         const u32 key = (u32(place.mip) << 16) | u32(place.layer);
         if (version <= std::max(held[key], own)) {
@@ -3783,6 +3827,9 @@ void NativeRenderer::DispatchDirect() {
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     NoteWrites(nullptr, b);
+    if (Native::g_dump_request.exchange(false)) {
+        r.StartFrameDumpNow(); // FIX-156 (diagnosis): a watched fill
+    }
     s.buffers_written = true; // what the dispatch wrote is seen after the next barrier
     ++stats.dispatches;
     ++s.commands;
@@ -4053,7 +4100,94 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     ++unmap_generation;         // OPT-002
 }
 
+void NativeRenderer::WatchBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp,
+                               bool storage, bool memo, u64 program) {
+    if (!Native::WatchSample()) {
+        return;
+    }
+    u32 sources = 0;
+    {
+        std::scoped_lock lock{const_cast<Native::ImageEntry&>(entry).sources_mutex};
+        sources = static_cast<u32>(entry.sources.size());
+    }
+    LOG_WARNING(Render_Vulkan, "FIX-157 watch: {} {:#x} {}x{} layers {}-{} type {} fmt {}/{}{} "
+                "(program {:#x}) -> {} {}x{} layers {} version {}, {} sources (frame {})",
+                storage ? "store" : "sample", tsharp.Address(), tsharp.width + 1,
+                tsharp.height + 1, u32(tsharp.base_array), u32(tsharp.last_array),
+                u32(tsharp.GetType()), u32(tsharp.GetDataFmt()), u32(tsharp.GetNumberFmt()),
+                memo ? " (memo)" : "", program, entry.from_cpu ? "texture" : "target",
+                entry.info.size.width, entry.info.size.height, entry.info.resources.layers,
+                entry.write_version.load(), sources, frame);
+}
+
+void NativeRenderer::ProbeWatchedPictures() {
+    // FIX-156 (diagnosis, RYGT_NATIVE_WATCH_TEXTURE): what the pictures at the watched address
+    // hold, every half second (read back from the GPU), to see when one loses its content.
+    const auto& watched_list = Native::WatchedTextures();
+    if (watched_list.empty()) {
+        return;
+    }
+    const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    for (auto it = probes.begin(); it != probes.end();) {
+        if (it->tick > done) {
+            ++it;
+            continue;
+        }
+        const u8* bytes = it->buffer->Mapped();
+        const u64 count = it->size / 4;
+        double sum = 0;
+        float lo = std::numeric_limits<float>::max(), hi = std::numeric_limits<float>::lowest();
+        u64 zeros = 0;
+        for (u64 i = 0; i < count; ++i) {
+            float v;
+            std::memcpy(&v, bytes + i * 4, 4);
+            if (!std::isfinite(v)) {
+                continue;
+            }
+            sum += v;
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+            zeros += v == 0.0f ? 1 : 0;
+        }
+        LOG_WARNING(Render_Vulkan, "FIX-156 watch: frame {}: {} {:#x} {}x{} version {} holds "
+                    "mean {:.4f} min {:.4f} max {:.4f}, {} of {} words zero (as 32-bit floats)",
+                    it->frame, it->target ? "target" : "texture", it->address, it->width,
+                    it->height,
+                    it->version, count ? sum / count : 0.0, lo, hi, zeros, count);
+        it = probes.erase(it);
+    }
+    if (frame % 30 != 0 || !probes.empty()) {
+        return;
+    }
+    Begin();
+    for (const VAddr watched : watched_list) {
+        registry->ForEachOverlapping(watched, watched + 1, [&](Native::ImageEntry& entry) {
+            if (entry.info.guest_address != watched || !entry.image ||
+                entry.info.num_samples != 1) {
+                return;
+            }
+            const u64 size = entry.info.guest_size;
+            auto buffer = device->CreateBuffer({.size = size,
+                                                .usage = Native::Rhi::BufferUsageStorage |
+                                                         Native::Rhi::BufferUsageTransferDst,
+                                                .memory = Native::Rhi::MemoryKind::Readback,
+                                                .name = "watch probe"});
+            if (!buffer || !buffer->Mapped()) {
+                return;
+            }
+            GlobalBarrier();
+            if (registry->RecordDownload(*stream.list, entry, *buffer, 0)) {
+                stream.pipeline = vk::Pipeline{};
+                probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
+                                  entry.write_version.load(), entry.info.size.width,
+                                  entry.info.size.height, !entry.from_cpu, watched});
+            }
+        });
+    }
+}
+
 void NativeRenderer::EvictImages() {
+    ProbeWatchedPictures(); // FIX-156 (diagnosis)
     // NAT-108: images not used for two seconds go (GT Sport's scratch pool holds render
     // targets of ever-changing sizes: the UI's blur panels, effects).
     constexpr u64 KeepFrames = 120;
@@ -4067,7 +4201,69 @@ void NativeRenderer::EvictImages() {
     if (frame <= KeepFrames || frame % 30 != 0) {
         return;
     }
+    // FIX-157: a picture the GPU wrote and used for a second or more stays past its idle time
+    // while nothing else writes its memory: its pixels exist nowhere else (the GPU's writes stay
+    // in the picture, not in guest memory). GT Sport bakes its light probes (two cube arrays of
+    // 322 32x32 cubes, at 0x107aee1400 and 0x108626d400) with compute shaders while a race
+    // loads; nothing read them for about three seconds around the start, they were dropped, the
+    // race's textures there uploaded the zeros of guest memory, and the scene's ambient light
+    // went: a dark, blue cockpit and world, with the odd warm frame. It is kept when guest memory
+    // still holds what it held when the picture was made (nothing but the GPU wrote there:
+    // keeping pictures whose memory the CPU had reused drew stale pictures, and writing them
+    // back overwrote shader code the game had loaded there), no newer picture overlaps it, and
+    // GPU work wrote no part of its memory since; from then on its pages are watched, and a CPU
+    // write, an unmap or GPU work there lets it go. Pictures in use for less than a second (the
+    // scratch pool's) go as before; kept ones take at most 256 MB.
+    constexpr u64 KeptBudget = 256ull << 20;
+    u32 newly_kept = 0;
+    const auto keep = [&](Native::ImageEntry& entry) {
+        if (entry.from_cpu || !entry.image || entry.reused.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        const u64 version = entry.write_version.load(std::memory_order_relaxed);
+        if (version == 0 || entry.foreign_clock.load(std::memory_order_relaxed) > version) {
+            return false;
+        }
+        const VAddr address = entry.info.guest_address;
+        const u64 size = std::max<u64>(entry.info.guest_size, 1);
+        bool superseded = false;
+        registry->ForEachOverlapping(address, address + size, [&](Native::ImageEntry& other) {
+            superseded |= &other != &entry && !other.from_cpu &&
+                          !other.reused.load(std::memory_order_relaxed) &&
+                          other.write_version.load(std::memory_order_relaxed) > version;
+        });
+        if (superseded) {
+            return false;
+        }
+        if (entry.kept.load(std::memory_order_relaxed)) {
+            return true;
+        }
+        if (entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60 ||
+            kept_bytes + size > KeptBudget || !registry->MemoryUnchanged(entry)) {
+            return false;
+        }
+        entry.kept.store(true, std::memory_order_relaxed);
+        kept_bytes += size;
+        WatchPages(address, size);
+        ++newly_kept;
+        if (Native::WatchedTexture(address, address + 1)) {
+            LOG_WARNING(Render_Vulkan, "FIX-157 watch: {:#x} kept (version {}, frame {})",
+                        address, version, frame);
+        }
+        return true;
+    };
     registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
+        if (entry.kept.load(std::memory_order_relaxed)) {
+            kept_bytes -= std::min<u64>(kept_bytes, std::max<u64>(entry.info.guest_size, 1));
+        }
+        if (Native::WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
+            LOG_WARNING(Render_Vulkan, "FIX-157 watch: {} {:#x} {}x{} layers {} evicted (last "
+                        "use frame {}, version {}, frame {})",
+                        entry.from_cpu ? "texture" : "target", entry.info.guest_address,
+                        entry.info.size.width, entry.info.size.height,
+                        entry.info.resources.layers, entry.last_use.load(),
+                        entry.write_version.load(), frame);
+        }
         {
             std::scoped_lock lock{views_mutex};
             if (const auto it = views.find(&entry); it != views.end()) {
@@ -4086,7 +4282,14 @@ void NativeRenderer::EvictImages() {
             owners.erase(std::remove(owners.begin(), owners.end(), &entry), owners.end());
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
-    });
+    }, keep);
+    if (newly_kept != 0) {
+        static std::atomic<u32> logged{};
+        if (const u32 n = logged++; n < 20 || n % 100 == 0) {
+            LOG_WARNING(Render_Vulkan, "FIX-157: {} pictures the GPU wrote are kept past their idle "
+                        "time ({:.1f} MB kept in all)", newly_kept, kept_bytes / 1048576.0);
+        }
+    }
 }
 
 void NativeRenderer::WatchPages(VAddr address, u64 size) {

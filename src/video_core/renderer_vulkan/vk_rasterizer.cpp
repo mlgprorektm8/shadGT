@@ -2801,7 +2801,12 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
                              DirectReadsRecently() && !MenuBarShown(); // FIX-125, FIX-127
 #ifdef RYTY_GPU
     // NAT-100: native mode reads all guest memory in place: graphics fences wait for the GPU.
-    direct_hold = direct_hold || (native && !compute_queue);
+    // FIX-158 (diagnosis, RYGT_NATIVE_HOLD_COMPUTE=1): compute-queue fences too.
+    static const bool native_hold_compute = [] {
+        const char* env = std::getenv("RYGT_NATIVE_HOLD_COMPUTE");
+        return env && env[0] == '1';
+    }();
+    direct_hold = direct_hold || (native && (!compute_queue || native_hold_compute));
 #endif
     if (direct_hold && MenuBarShown()) {
         // DIAG-141: fences held while the menu bar is on screen.
@@ -2934,6 +2939,15 @@ void Rasterizer::ExposureLogShader(const Shader::Info& stage, const char* render
                 exposure_flip, std::bit_cast<float>(now[0]), std::bit_cast<float>(now[1]));
 }
 
+void Rasterizer::StartFrameDumpNow() {
+    // FIX-156 (diagnosis): the dump collects from here to the next flip.
+    if (!frame_dump_collecting && !frame_dump_done) {
+        frame_dump_collecting = true;
+        frame_dump_old.clear();
+        FrameDumpEvent("---- dump started here (watched fill) ----");
+    }
+}
+
 void Rasterizer::FrameDumpFlip() {
     if (ExposureLogOn()) {
         // The brightness grids drawn four or more flips ago, as the CPU reads them now.
@@ -2973,10 +2987,25 @@ void Rasterizer::FrameDumpFlip() {
             it = exposure_targets.erase(it);
         }
     }
-    static const double dump_at = [] {
-        const char* env = std::getenv("RYGT_FRAME_DUMP_AT");
-        return env && *env ? std::atof(env) : -1.0;
+    // RYGT_FRAME_DUMP_AT=<seconds>[,<seconds>...]: one dump at each time (FIX-156 diagnosis:
+    // several frames of one run, e.g. a lit and a dark cockpit).
+    static const std::vector<double> dump_times = [] {
+        std::vector<double> times;
+        if (const char* env = std::getenv("RYGT_FRAME_DUMP_AT"); env && *env) {
+            std::string list{env};
+            for (size_t pos = 0; pos < list.size();) {
+                const size_t end = std::min(list.find(',', pos), list.size());
+                times.push_back(std::atof(list.substr(pos, end - pos).c_str()));
+                pos = end + 1;
+            }
+        }
+        return times;
     }();
+    if (frame_dump_done && frame_dump_mem.empty() && frame_dump_index + 1 < dump_times.size()) {
+        ++frame_dump_index;
+        frame_dump_done = false;
+    }
+    const double dump_at = frame_dump_index < dump_times.size() ? dump_times[frame_dump_index] : -1.0;
     static const auto start = std::chrono::steady_clock::now();
     // FIX-153 (diagnosis): ten flips after the dump, the guest memory of the frame's CPU
     // read-back targets as the CPU sees it.
@@ -3003,7 +3032,7 @@ void Rasterizer::FrameDumpFlip() {
         }
         frame_dump_mem.clear();
     }
-    if ((dump_at < 0 && !exposure_dump_requested) || frame_dump_done) {
+    if ((dump_at < 0 && !exposure_dump_requested && !frame_dump_collecting) || frame_dump_done) {
         return;
     }
     const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -3036,7 +3065,7 @@ void Rasterizer::FrameDumpFlip() {
 #endif
     const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
                      fmt::format("dump-{}-{}", native ? "native" : "old",
-                                 dump_at >= 0 ? fmt::format("{}", u32(dump_at))
+                                 dump_at >= 0 ? fmt::format("{:g}", dump_at)
                                               : std::string{"exp"});
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);

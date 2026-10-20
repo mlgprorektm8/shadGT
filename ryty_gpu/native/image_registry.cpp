@@ -98,12 +98,35 @@ Rhi::ImageDesc DescOf(const VideoCore::ImageInfo& info, bool render_target, bool
 
 } // namespace
 
-bool WatchedTexture(VAddr begin, VAddr end) {
-    static const VAddr watched = [] {
+std::atomic<bool> g_dump_request{false};
+
+const std::vector<VAddr>& WatchedTextures() {
+    static const std::vector<VAddr> watched = [] {
+        std::vector<VAddr> list;
         const char* env = std::getenv("RYGT_NATIVE_WATCH_TEXTURE");
-        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0};
+        for (const char* at = env; at && *at;) {
+            char* end = nullptr;
+            const VAddr address = std::strtoull(at, &end, 16);
+            if (end == at) {
+                break;
+            }
+            if (address != 0) {
+                list.push_back(address);
+            }
+            at = *end == ',' ? end + 1 : end;
+        }
+        return list;
     }();
-    return watched != 0 && begin <= watched && watched < std::max(end, begin + 1);
+    return watched;
+}
+
+bool WatchedTexture(VAddr begin, VAddr end) {
+    for (const VAddr watched : WatchedTextures()) {
+        if (begin <= watched && watched < std::max(end, begin + 1)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::atomic<bool> g_watch_window{false};
@@ -179,6 +202,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         const auto [first, last] = shard.images.equal_range(info.guest_address);
         ImageEntry* exact = nullptr;
         for (auto it = first; it != last; ++it) {
+            if (it->second->reused.load(std::memory_order_relaxed)) {
+                continue; // FIX-157: stale
+            }
             if (SameLayout(it->second->info, info)) {
                 exact = it->second.get();
                 if (render_target || !exact->from_cpu) {
@@ -198,11 +224,17 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             // layer inside a larger one of the same format (scratch-pool reuse with other
             // formats or samples broke the race minimaps).
             ImageEntry* largest = nullptr;
-            const bool plain = info.num_samples == 1 && !info.props.is_depth &&
+            // RYGT_NATIVE_SHARED_TARGETS=0 turns it off (diagnosis).
+            static const bool shared_targets = [] {
+                const char* env = std::getenv("RYGT_NATIVE_SHARED_TARGETS");
+                return !(env && env[0] == '0');
+            }();
+            const bool plain = shared_targets && info.num_samples == 1 && !info.props.is_depth &&
                                info.resources.levels == 1 && info.resources.layers == 1;
             for (auto it = first; plain && it != last; ++it) {
                 const auto& c = it->second->info;
-                if (!it->second->from_cpu && it->second->image && c.pitch == info.pitch &&
+                if (!it->second->from_cpu && it->second->image &&
+                    !it->second->reused.load(std::memory_order_relaxed) && c.pitch == info.pitch &&
                     c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
                     c.num_samples == 1 && !c.props.is_depth && c.type == info.type &&
                     c.pixel_format == info.pixel_format && c.resources.levels == 1 &&
@@ -239,6 +271,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             for (auto it = first; it != last; ++it) {
                 const auto& cached = it->second->info;
                 if (cached.props.is_depth && cached.num_bits == info.num_bits &&
+                    !it->second->reused.load(std::memory_order_relaxed) &&
                     cached.resources.layers >= info.resources.layers &&
                     ((cached.size.width == info.size.width &&
                       cached.size.height == info.size.height) ||
@@ -263,7 +296,8 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             ImageEntry* best = nullptr;
             for (auto it = first; it != last; ++it) {
                 const auto& c = it->second->info;
-                if (!it->second->from_cpu && it->second->image && c.pitch == info.pitch &&
+                if (!it->second->from_cpu && it->second->image &&
+                    !it->second->reused.load(std::memory_order_relaxed) && c.pitch == info.pitch &&
                     c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
                     c.num_samples == info.num_samples && c.props.is_depth == info.props.is_depth &&
                     c.props.has_stencil == info.props.has_stencil && c.type == info.type &&
@@ -290,6 +324,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
     auto entry = std::make_unique<ImageEntry>();
     entry->info = info;
     entry->from_cpu = !render_target;
+    entry->made_frame = frame; // FIX-157
     if (image_factory) {
         MadeImage made = image_factory(info, render_target);
         entry->image = std::move(made.image);
@@ -319,7 +354,8 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         // Another thread may have made it meanwhile.
         const auto [first, last] = shard.images.equal_range(info.guest_address);
         for (auto it = first; it != last; ++it) {
-            if (SameLayout(it->second->info, info)) {
+            if (SameLayout(it->second->info, info) &&
+                !it->second->reused.load(std::memory_order_relaxed)) {
                 ++stats.hits;
                 return it->second.get();
             }
@@ -404,7 +440,7 @@ ImageEntry* ImageRegistry::FindExisting(VAddr address,
     ImageEntry* best = nullptr;
     for (auto it = first; it != last; ++it) {
         // The most recently used one, when several layouts live at the address.
-        if (accept(*it->second) &&
+        if (!it->second->reused.load(std::memory_order_relaxed) && accept(*it->second) &&
             (!best || it->second->last_use.load(std::memory_order_relaxed) >
                           best->last_use.load(std::memory_order_relaxed))) {
             best = it->second.get();
@@ -490,7 +526,15 @@ void ImageRegistry::LinkTarget(ImageEntry& target) {
         if (!entry.from_cpu) {
             return;
         }
-        if (const auto place = PlaceOf(target.info, entry.info); place.mip >= 0) {
+        const auto place = PlaceOf(target.info, entry.info);
+        if (WatchedTexture(begin, end)) {
+            LOG_WARNING(Render_Vulkan, "FIX-157 watch: new target {:#x} {}x{} layers {} over "
+                        "texture {:#x} {}x{} layers {}: {}", begin, target.info.size.width,
+                        target.info.size.height, target.info.resources.layers,
+                        entry.info.guest_address, entry.info.size.width, entry.info.size.height,
+                        entry.info.resources.layers, place.mip >= 0 ? "linked" : "no place");
+        }
+        if (place.mip >= 0) {
             {
                 std::scoped_lock sources_lock{entry.sources_mutex};
                 entry.sources.push_back({&target, place});
@@ -511,10 +555,19 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
     ForEachOverlapping(begin, end, [&](ImageEntry& other) {
         const ImageEntry* entry = &other;
         {
-            if (entry->from_cpu) {
+            if (entry->from_cpu || entry->reused.load(std::memory_order_relaxed)) {
                 return;
             }
-            if (const auto place = PlaceOf(entry->info, texture.info); place.mip >= 0) {
+            const auto place = PlaceOf(entry->info, texture.info);
+            if (WatchedTexture(begin, end)) {
+                LOG_WARNING(Render_Vulkan, "FIX-157 watch: new texture {:#x} {}x{} layers {} "
+                            "over target {:#x} {}x{} layers {}: {}", begin,
+                            texture.info.size.width, texture.info.size.height,
+                            texture.info.resources.layers, entry->info.guest_address,
+                            entry->info.size.width, entry->info.size.height,
+                            entry->info.resources.layers, place.mip >= 0 ? "linked" : "no place");
+            }
+            if (place.mip >= 0) {
                 {
                     std::scoped_lock sources_lock{texture.sources_mutex};
                     texture.sources.push_back({&other, place});
@@ -601,14 +654,22 @@ u64 ImageRegistry::Count() {
     return count;
 }
 
-u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_evict) {
+u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_evict,
+                         const std::function<bool(ImageEntry&)>& keep) {
     std::unordered_set<const ImageEntry*> gone;
+    std::vector<ImageEntry*> candidates;
     for (Shard& shard : shards) {
         std::shared_lock lock{shard.mutex};
         for (const auto& [base, entry] : shard.images) {
             if (entry->last_use.load(std::memory_order_relaxed) < before) {
-                gone.insert(entry.get());
+                candidates.push_back(entry.get());
             }
+        }
+    }
+    // FIX-157: pictures the caller keeps stay (asked with no lock held: it looks around).
+    for (ImageEntry* entry : candidates) {
+        if (!keep || !keep(*entry)) {
+            gone.insert(entry);
         }
     }
     if (gone.empty()) {
@@ -701,13 +762,59 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (entry.from_cpu) {
             MarkStale(entry, why);
+        } else if (entry.kept.load(std::memory_order_relaxed)) {
+            MarkReused(entry); // FIX-157
         }
     });
+}
+
+void ImageRegistry::MarkReused(ImageEntry& entry) {
+    if (entry.reused.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    // What Find returned for the range may change (OPT-002 memos look again).
+    const std::pair<VAddr, VAddr> range{entry.info.guest_address,
+                                        entry.info.guest_address +
+                                            std::max<u64>(entry.info.guest_size, 1)};
+    NoteChanges({&range, 1});
+    if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
+        LOG_WARNING(Render_Vulkan, "FIX-157 watch: kept {:#x} reused", entry.info.guest_address);
+    }
+}
+
+void ImageRegistry::ForeignWrite(ImageEntry& entry, u64 size, bool exact, u64 clock) {
+    // NAT-129: a storage buffer much larger than the picture is the scratch pool GT Sport
+    // binds whole: what it wrote is unknown, and it doesn't count.
+    if (!exact && size > 2 * std::max<u64>(entry.info.guest_size, 1)) {
+        return;
+    }
+    u64 seen = entry.foreign_clock.load(std::memory_order_relaxed);
+    while (seen < clock &&
+           !entry.foreign_clock.compare_exchange_weak(seen, clock, std::memory_order_relaxed)) {
+    }
+    if (entry.kept.load(std::memory_order_relaxed)) {
+        MarkReused(entry);
+    }
+}
+
+bool ImageRegistry::MemoryUnchanged(const ImageEntry& entry) {
+    const u64 size = entry.info.guest_size;
+    if (entry.content_hash == 0 || size == 0 || !memory_clamp ||
+        memory_clamp(entry.info.guest_address, size) != size) {
+        return false;
+    }
+    const u64 hash =
+        XXH3_64bits(reinterpret_cast<const void*>(entry.info.guest_address), size) | 1;
+    return hash == entry.content_hash;
 }
 
 void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
                              bool exact, u64 clock) {
     if (WatchedTexture(address, address + std::max<u64>(size, 1)) && WatchSample()) {
+        static const bool dump_on_fill = std::getenv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
+        if (pattern && dump_on_fill) {
+            g_dump_request = true; // FIX-156 (diagnosis): dump the next frame
+        }
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: GPU {} {:#x}+{:#x} pattern {:#x} {:#x}",
                     pattern ? "fill" : exact ? "copy" : "storage write", address, size,
                     pattern ? (*pattern)[0] : 0u, pattern ? (*pattern)[1] : 0u);
@@ -758,6 +865,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
         const bool covered = pattern && address <= entry.info.guest_address &&
                              address + size >= entry.info.guest_address + entry.info.guest_size;
         if (entry.info.guest_address != address && !covered) {
+            ForeignWrite(entry, size, exact, clock); // FIX-157
             return;
         }
         if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1) &&
@@ -792,6 +900,8 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                             entry.info.size.height, entry.info.guest_size,
                             exact ? "copy" : "storage buffer", address, size, n + 1);
             }
+        } else {
+            ForeignWrite(entry, size, exact, clock); // FIX-157
         }
     });
 }
@@ -805,6 +915,9 @@ void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
     const VAddr written_end = address + (exact != 0 ? exact : size);
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (!entry.from_cpu) {
+            if (entry.kept.load(std::memory_order_relaxed)) {
+                MarkReused(entry); // FIX-157
+            }
             return;
         }
         const VAddr base = entry.info.guest_address;
@@ -933,7 +1046,9 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
         // is not uploaded again; GPU writes to its memory always upload.
         constexpr u64 HashedSize = 4ull << 20;
         const bool forced = entry->force_upload.exchange(false);
-        if (size <= HashedSize && memory_clamp && memory_clamp(info.guest_address, size) == size) {
+        // FIX-157: render targets of any size (what their memory held when made).
+        if ((size <= HashedSize || !entry->from_cpu) && memory_clamp &&
+            memory_clamp(info.guest_address, size) == size) {
             const u64 hash =
                 XXH3_64bits(reinterpret_cast<const void*>(info.guest_address), size) | 1;
             if (!forced && hash == entry->content_hash) {

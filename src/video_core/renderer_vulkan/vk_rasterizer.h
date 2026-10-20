@@ -320,6 +320,8 @@ public:
     /// the next frame draws into is saved to user\log\dump-<old|native>-<seconds>\ at the flip
     /// after it (raw texels; tools: dump2png.py). Called by the presenter at each flip.
     void FrameDumpFlip();
+    /// FIX-156 (diagnosis): starts collecting the frame dump now (finished at the next flip).
+    void StartFrameDumpNow();
     /// NAT-116: whether the frame being drawn is dumped (render targets are noted).
     bool FrameDumpCollecting() const noexcept {
         return frame_dump_collecting;
@@ -622,6 +624,7 @@ private:
     std::filesystem::path frame_dump_dir;
     /// FIX-153 (diagnosis): render targets of the dumped frame the CPU reads back (from
     /// 0xf000000000 up), and how many flips to wait before their guest memory is saved.
+    u32 frame_dump_index{}; ///< FIX-156 (diagnosis): which RYGT_FRAME_DUMP_AT time is next
     std::vector<VAddr> frame_dump_mem;
     std::filesystem::path frame_dump_mem_dir;
     u32 frame_dump_mem_wait{};
