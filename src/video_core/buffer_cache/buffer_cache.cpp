@@ -1276,8 +1276,12 @@ bool BufferCache::CpuRewroteReadbackRange(VAddr start, VAddr end) {
         }
         const VAddr s = std::max(start, page);
         const VAddr e = std::min<VAddr>(end, page + 4_KB);
-        if (std::memcmp(std::bit_cast<const void*>(s), it->second->data() + (s - page), e - s) !=
-            0) {
+        // Page tracking can protect the guest view while GPU data is pending.
+        // Match RefreshReadbackPageHashes: read through the sparse/alias copy path
+        // instead of faulting in memcmp while the recorder holds cache locks.
+        std::array<u8, 4096> current;
+        memory->CopySparseMemory(s, current.data(), e - s);
+        if (std::memcmp(current.data(), it->second->data() + (s - page), e - s) != 0) {
             return true;
         }
     }
