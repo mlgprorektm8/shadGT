@@ -3,6 +3,7 @@
 
 #include <map>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <boost/container/small_vector.hpp>
 #include <atomic>
@@ -31,6 +32,7 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include <vk_mem_alloc.h>
 
 namespace VideoCore {
 
@@ -1680,7 +1682,50 @@ void TextureCache::GarbageCollectUnusedImages() {
     }
 }
 
+void TextureCache::ReportMemoryBreakdown() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_VRAM_DIAGNOSTICS");
+        return value && value[0] == '1';
+    }();
+    if (!enabled) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - memory_report_last < std::chrono::seconds{5}) return;
+    memory_report_last = now;
+    u64 textures = 0, gpu_written = 0, images = 0;
+    image_lru_cache.ForEachItemBelow(gc_tick, [&](Image& image) {
+        ++images;
+        for (const auto& backing : image.backing_images) {
+            textures += backing.image.size_bytes;
+            if (True(image.flags & ImageFlagBits::GpuModified))
+                gpu_written += backing.image.size_bytes;
+        }
+    });
+    VmaBudget heaps[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(instance.GetAllocator(), heaps);
+    const auto& props = instance.GetMemoryProperties();
+    u64 allocations = 0, blocks = 0, usage = 0, budget = 0;
+    for (u32 i = 0; i < props.memoryHeapCount; ++i) {
+        if (!(props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) continue;
+        allocations += heaps[i].statistics.allocationBytes;
+        blocks += heaps[i].statistics.blockBytes;
+        usage += heaps[i].usage;
+        budget += heaps[i].budget;
+    }
+    const u64 sparse = buffer_cache.SparseResidentBytes();
+    const auto* direct = buffer_cache.GetDirectMemory();
+    LOG_DEBUG(Render_Vulkan,
+              "VRAM snapshot MiB: heap_usage={} budget={} sparse={} textures={} "
+              "gpu_written_textures={} recycled={} vma_alloc={} vma_blocks={} "
+              "vma_slack={} unattributed={} imported_host={} images={}",
+              usage >> 20, budget >> 20, sparse >> 20, textures >> 20, gpu_written >> 20,
+              RecycledImageBytes() >> 20, allocations >> 20, blocks >> 20,
+              (blocks > allocations ? blocks - allocations : 0) >> 20,
+              (usage > blocks + sparse ? usage - blocks - sparse : 0) >> 20,
+              direct ? direct->ImportedHostBytes() >> 20 : 0, images);
+}
+
 void TextureCache::RunGarbageCollector() {
+    ReportMemoryBreakdown();
     GarbageCollectUnusedImages();
     GarbageCollectImages();
     GarbageCollectSamplers();

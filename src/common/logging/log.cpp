@@ -73,6 +73,15 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
 #ifdef RYTY_GPU
     // Fatal assertion reports must survive the diagnostic stdout gate.
     const bool fatal_report = level == Level::Critical && Common::RecoverableDepth() == 0;
+    // Optional investigation mode: retain fatal reports and only the periodic
+    // memory snapshots, avoiding a full Debug diagnostic flood. The normal
+    // Debug/Trace stdout threshold still applies to those snapshots.
+    static const bool memory_only = [] {
+        const char* value = std::getenv("RYGT_VRAM_DIAGNOSTICS");
+        return value && value[0] == '1';
+    }();
+    if (memory_only && !fatal_report &&
+        !std::string_view(format.data(), format.size()).starts_with("VRAM snapshot")) return;
     // RyGT exposes a single Error level for error and critical diagnostics.
     if (level == Level::Critical) level = Level::Error;
 #endif

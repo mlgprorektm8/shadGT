@@ -323,6 +323,13 @@ BufferCache::~BufferCache() {
     prehasher.reset();
 }
 
+u64 BufferCache::SparseResidentBytes() {
+    std::scoped_lock buffer_lock{mutex};
+    u64 bytes = 0;
+    for (const auto& range : resident_ranges) bytes += (range.end - range.start) << block_shift;
+    return bytes;
+}
+
 void BufferCache::TickFrame() {
     std::scoped_lock buffer_lock{mutex}; // PERF-067
     if (std::exchange(fault_process_pending, false)) {

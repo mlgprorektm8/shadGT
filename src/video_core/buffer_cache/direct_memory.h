@@ -45,6 +45,7 @@ public:
 
     explicit DirectMemory(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler);
     ~DirectMemory();
+    u64 ImportedHostBytes() const { return imported_bytes.load(std::memory_order_relaxed); }
 
     /// Whether the model is on (SHADGT_DIRECT=1 and the driver can import host memory).
     static bool Enabled();

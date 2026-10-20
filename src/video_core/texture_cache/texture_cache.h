@@ -401,6 +401,8 @@ private:
 
     void GarbageCollectImages();
     void GarbageCollectUnusedImages();
+    void ReportMemoryBreakdown();
+    std::chrono::steady_clock::time_point memory_report_last{};
     /// DIAG-117: why images are freed (call line), with a sample image, every 2 s.
     void NoteImageFree(ImageId image_id, u32 line);
     void GarbageCollectSamplers();

@@ -33,6 +33,7 @@ namespace VideoCore {
 
 /// Release GPU-completed recycled images unused for at least 30 seconds.
 void TrimUnusedRecycledImages(VmaAllocator allocator);
+u64 RecycledImageBytes();
 
 enum ImageFlagBits : u32 {
     Empty = 0,

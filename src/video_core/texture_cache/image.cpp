@@ -315,6 +315,11 @@ std::optional<RecycledImage> TakeRecycled(const vk::ImageCreateInfo& ci) {
 }
 } // namespace
 
+u64 RecycledImageBytes() {
+    std::scoped_lock lk{g_recycle_mutex};
+    return g_recycled_bytes;
+}
+
 void TrimUnusedRecycledImages(VmaAllocator allocator) {
     const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{30};
     std::scoped_lock lk{g_recycle_mutex};
