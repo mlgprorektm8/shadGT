@@ -893,8 +893,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
 
-    // Capture the guest output before any host-side scaling (FSR/PP) is applied.
-    if (capture_game_only_count > 0 || FlashWatchEnabled()) {
+    // Capture the guest output before any host-side scaling (FSR/PP) is applied. (Not of an
+    // empty picture: a 0-byte readback buffer stopped the game with "Failed allocating buffer".)
+    if ((capture_game_only_count > 0 || FlashWatchEnabled()) && image_size.width != 0 &&
+        image_size.height != 0) {
         const bool hdr_encoded =
             attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
         auto& readback = pending_screenshot.emplace(
@@ -1346,7 +1348,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
         ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
 
-        if (capture_with_overlays_count > 0 || FlashWatchScreen()) {
+        // Not of a minimized window (a 0x0 swapchain: a 0-byte readback buffer stopped the game).
+        if ((capture_with_overlays_count > 0 || FlashWatchScreen()) && extent.width != 0 &&
+            extent.height != 0) {
             auto& readback = pending_screenshot.emplace(
                 instance, ScreenshotKind::WithOverlays,
                 BuildScreenshotPaths(ScreenshotKind::WithOverlays, capture_with_overlays_count),
