@@ -546,6 +546,8 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
+    if (empty_block_trim_after == std::chrono::steady_clock::time_point{})
+        empty_block_trim_after = std::chrono::steady_clock::now() + std::chrono::seconds{30};
     SmallVector<ImageId, 16> deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
@@ -1667,6 +1669,10 @@ void TextureCache::GarbageCollectUnusedImages() {
     if (now - idle_gc_last_scan < seconds{1}) return;
     idle_gc_last_scan = now;
     TrimUnusedRecycledImages(instance.GetAllocator());
+    if (empty_block_trim_after != steady_clock::time_point{} && now >= empty_block_trim_after) {
+        Vulkan::TrimEmptyVmaBlocks(instance.GetAllocator());
+        empty_block_trim_after = {};
+    }
     if (idle_gc_cutoff_tick == 0) return;
 
     u32 freed = 0;
@@ -1716,12 +1722,13 @@ void TextureCache::ReportMemoryBreakdown() {
     LOG_DEBUG(Render_Vulkan,
               "VRAM snapshot MiB: heap_usage={} budget={} sparse={} textures={} "
               "gpu_written_textures={} recycled={} vma_alloc={} vma_blocks={} "
-              "vma_slack={} unattributed={} imported_host={} images={}",
+              "vma_slack={} unattributed={} imported_host={} images={} sparse_freed_total={} empty_blocks_freed_total={}",
               usage >> 20, budget >> 20, sparse >> 20, textures >> 20, gpu_written >> 20,
               RecycledImageBytes() >> 20, allocations >> 20, blocks >> 20,
               (blocks > allocations ? blocks - allocations : 0) >> 20,
               (usage > blocks + sparse ? usage - blocks - sparse : 0) >> 20,
-              direct ? direct->ImportedHostBytes() >> 20 : 0, images);
+              direct ? direct->ImportedHostBytes() >> 20 : 0, images,
+              buffer_cache.SparseFreedBytes() >> 20, Vulkan::EmptyVmaBytesFreed() >> 20);
 }
 
 void TextureCache::RunGarbageCollector() {

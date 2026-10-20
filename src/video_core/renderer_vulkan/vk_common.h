@@ -21,3 +21,9 @@
 
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
+
+VK_DEFINE_HANDLE(VmaAllocator)
+namespace Vulkan {
+vk::DeviceSize TrimEmptyVmaBlocks(VmaAllocator allocator);
+vk::DeviceSize EmptyVmaBytesFreed();
+}

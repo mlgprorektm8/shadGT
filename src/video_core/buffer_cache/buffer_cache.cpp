@@ -20,6 +20,7 @@
 #include <xxhash.h>
 
 #include "common/alignment.h"
+#include "common/unmapped_allocations.h"
 #include "common/io_file.h"
 #include "common/perf_monitor.h"
 #include "core/emulator_settings.h"
@@ -328,6 +329,17 @@ u64 BufferCache::SparseResidentBytes() {
     u64 bytes = 0;
     for (const auto& range : resident_ranges) bytes += (range.end - range.start) << block_shift;
     return bytes;
+}
+
+u64 BufferCache::SparseFreedBytes() {
+    std::scoped_lock buffer_lock{mutex};
+    return sparse_freed_bytes;
+}
+
+void BufferCache::NoteArenaMapping(VAddr address, u64 size) {
+    if (!size || address > ~u64{0} - size) return;
+    std::scoped_lock lock{arena_unmap_mutex};
+    unmapped_arena_bytes.Subtract(address, size);
 }
 
 void BufferCache::TickFrame() {
@@ -2331,6 +2343,8 @@ void BufferCache::SynchronizeDmaBuffers() {
 }
 
 const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
+    // Conservatively cancel retirement if a range is used again through any obtain path.
+    NoteArenaMapping(first_block << block_shift, (last_block - first_block + 1) << block_shift);
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
     ASSERT_MSG(last_page - first_page <= 1,
@@ -3794,32 +3808,39 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
 void BufferCache::ReleaseUnmappedArenaMemory(VAddr address, u64 size) {
     if (size == 0 || address > ~u64{0} - size) return;
     std::scoped_lock buffer_lock{mutex};
-    const u64 first = Common::AlignUp(address, u64{block_size}) >> block_shift;
-    const u64 end = (address + size) >> block_shift;
-    if (first >= end) return;
-
-    // One VkDeviceMemory allocation can back several disjoint resident ranges.
-    // Release it only if ALL of its ranges are inside this explicit guest unmap.
-    std::map<vk::DeviceMemory, bool> whole;
-    bool overlaps = false;
-    for (const auto& range : resident_ranges) {
-        const bool covered = range.start >= first && range.end <= end;
-        auto [it, inserted] = whole.try_emplace(range.memory, true);
-        it->second &= covered;
-        overlaps |= covered;
+    {
+        std::scoped_lock lock{arena_unmap_mutex};
+        // Preserve byte coverage: several 16 KiB guest unmaps can retire a larger
+        // Vulkan sparse page. Remember only ranges actually backed by this cache.
+        resident_ranges.ForEachInRange(address >> block_shift,
+            ((address + size - 1) >> block_shift) + 1, [&](const Backing& range) {
+                const u64 begin = std::max(address, range.start << block_shift);
+                const u64 end = std::min(address + size, range.end << block_shift);
+                if (begin < end) unmapped_arena_bytes.Add(begin, end - begin);
+            });
     }
-    if (!overlaps) return;
+    std::map<vk::DeviceMemory, bool> whole;
     std::vector<Backing> released;
     IntervalList<Backing> retained;
-    for (const auto& range : resident_ranges) {
-        if (whole[range.memory]) released.push_back(range);
-        else retained.Add(range);
-    }
-    if (released.empty()) return;
-
-    // The recorder owns this call. Finish prior commands and their sparse binds
-    // before removing backing memory; unload synchronization is intentionally rare.
+    const auto collect = [&] {
+        std::scoped_lock lock{arena_unmap_mutex};
+        whole = Common::FullyUnmappedAllocations(resident_ranges, [&](const Backing& range) {
+            return unmapped_arena_bytes.Contains(range.start << block_shift,
+                                                (range.end - range.start) << block_shift);
+        });
+        released.clear();
+        retained.Clear();
+        for (const auto& range : resident_ranges) {
+            if (whole[range.memory]) released.push_back(range);
+            else retained.Add(range);
+        }
+        return !released.empty();
+    };
+    if (!collect()) return;
+    // No marker lock across GPU submission/wait: map callbacks hold the guest registry.
     scheduler.Finish();
+    // Submission callbacks may have changed cache residency; revalidate after finishing.
+    if (!collect()) return;
     std::vector<ArenaBinds> unbinds;
     unbinds.reserve(arenas.size());
     for (const auto& arena : arenas) {
@@ -3862,6 +3883,7 @@ void BufferCache::ReleaseUnmappedArenaMemory(VAddr address, u64 size) {
         const VAddr start = range.start << block_shift;
         const u64 bytes = (range.end - range.start) << block_shift;
         freed_bytes += bytes;
+        NoteArenaMapping(start, bytes);
         runtime.FillBuffer(bda_pagetable_buffer.get(), range.start * sizeof(vk::DeviceAddress),
                            (range.end - range.start) * sizeof(vk::DeviceAddress), 0u);
         gpu_modified_ranges.Subtract(start, bytes);
@@ -3876,6 +3898,7 @@ void BufferCache::ReleaseUnmappedArenaMemory(VAddr address, u64 size) {
     for (const auto& [allocation, complete] : whole) {
         if (complete) device.freeMemory(allocation);
     }
+    sparse_freed_bytes += freed_bytes;
     LOG_DEBUG(Render_Vulkan, "Released {} MiB of unmapped sparse buffer backing", freed_bytes >> 20);
 }
 

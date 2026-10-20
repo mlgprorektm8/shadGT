@@ -75,6 +75,8 @@ public:
                          TextureCache& texture_cache, PageManager& tracker);
     ~BufferCache();
     u64 SparseResidentBytes();
+    u64 SparseFreedBytes();
+    void NoteArenaMapping(VAddr address, u64 size);
 
     /// Returns a pointer to GDS device local buffer.
     [[nodiscard]] const Buffer* GetGdsBuffer() const noexcept {
@@ -651,6 +653,10 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    // Map callbacks hold the guest registry: never take the buffer lock there.
+    std::mutex arena_unmap_mutex;
+    RangeSet unmapped_arena_bytes;
+    u64 sparse_freed_bytes = 0;
 
     u32 arena_memory_type_index{};
     u32 block_size{};

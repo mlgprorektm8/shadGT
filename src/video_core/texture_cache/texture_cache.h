@@ -445,6 +445,7 @@ private:
     std::chrono::steady_clock::time_point idle_gc_last_scan{};
     u64 idle_gc_previous_tick = 0;
     u64 idle_gc_cutoff_tick = 0;
+    std::chrono::steady_clock::time_point empty_block_trim_after{};
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
     /// A recorded image readback waiting for the GPU before its guest write.
