@@ -1,0 +1,2 @@
+# ryGT: patches applied with git apply keep LF line endings on every checkout.
+*.patch text eol=lf

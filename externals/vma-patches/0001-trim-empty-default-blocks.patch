@@ -1,0 +1,46 @@
+--- a/include/vk_mem_alloc.h
++++ b/include/vk_mem_alloc.h
+@@ -9842,6 +9842,8 @@
+         VmaAllocation* pAllocations);
+ 
+     void Free(VmaAllocation hAllocation);
++    // ryGT: trim only completely empty default-pool blocks after an unload grace period.
++    VkDeviceSize TrimEmptyBlocks();
+ 
+ #if VMA_STATS_STRING_ENABLED
+     void PrintDetailedMap(class VmaJsonWriter& json);
+@@ -11682,6 +11684,34 @@
+     }
+ }
+ 
++VkDeviceSize VmaBlockVector::TrimEmptyBlocks()
++{
++    VkDeviceSize freed = 0;
++    for (;;)
++    {
++        VmaDeviceMemoryBlock* drop = VMA_NULL;
++        {
++            VmaMutexLockWrite lock(m_Mutex, m_hAllocator->m_UseMutex);
++            if (m_Blocks.size() <= m_MinBlockCount) break;
++            for (size_t i = m_Blocks.size(); i--; )
++            {
++                if (m_Blocks[i]->m_pMetadata->IsEmpty())
++                {
++                    drop = m_Blocks[i];
++                    freed += drop->m_pMetadata->GetSize();
++                    Remove(drop);
++                    break;
++                }
++            }
++        }
++        if (drop == VMA_NULL) break;
++        // Match Free(): destruction outside the vector lock.
++        drop->Destroy(m_hAllocator);
++        vma_delete(m_hAllocator, drop);
++    }
++    return freed;
++}
++
+ VkDeviceSize VmaBlockVector::CalcMaxBlockSize() const
+ {
+     VkDeviceSize result = 0;

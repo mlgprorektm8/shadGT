@@ -92,6 +92,22 @@ endif()
 
 # VMA
 if (NOT TARGET GPUOpen::VulkanMemoryAllocator)
+    # ryGT: patches to VMA (vma-patches/*.patch, e.g. trimming empty default-pool blocks, which
+    # the renderer's unmap handling calls) are applied to the submodule's checkout when missing.
+    file(GLOB VMA_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/vma-patches/*.patch")
+    foreach(VMA_PATCH ${VMA_PATCHES})
+        execute_process(COMMAND git apply --reverse --check "${VMA_PATCH}"
+                        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/vma"
+                        RESULT_VARIABLE VMA_PATCH_PRESENT OUTPUT_QUIET ERROR_QUIET)
+        if (NOT VMA_PATCH_PRESENT EQUAL 0)
+            execute_process(COMMAND git apply "${VMA_PATCH}"
+                            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/vma"
+                            RESULT_VARIABLE VMA_PATCH_APPLIED)
+            if (NOT VMA_PATCH_APPLIED EQUAL 0)
+                message(FATAL_ERROR "Could not apply ${VMA_PATCH} to externals/vma")
+            endif()
+        endif()
+    endforeach()
     add_subdirectory(vma)
 endif()
 
