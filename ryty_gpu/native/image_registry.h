@@ -165,7 +165,13 @@ public:
     /// The image for this layout: one already at the address with the same layout (whatever
     /// its colour format, if the texel size matches), or a new one. A texture found nowhere is
     /// queued for upload from guest memory; a render target is not. Thread-safe.
-    ImageEntry* Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame);
+    /// OPT-010: `create` false: none when there is none yet (game job threads look ahead).
+    ImageEntry* Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame,
+                     bool create = true);
+
+    /// OPT-010: whether no picture was made or dropped over any of the ranges since generation
+    /// `since` (false when the log of changes no longer reaches back that far).
+    bool Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges);
 
     /// OPT-002: changes whenever a picture is made or dropped (what Find returns may change).
     u64 Generation() const {
@@ -272,6 +278,17 @@ private:
     std::mutex upload_mutex;
     std::vector<ImageEntry*> pending_uploads;
     std::atomic<u64> generation{0}; ///< OPT-002
+    /// OPT-010: the ranges of the pictures made or dropped, by the generation they made.
+    struct Change {
+        u64 generation = 0;
+        VAddr begin = 0;
+        VAddr end = 0;
+    };
+    std::mutex changes_mutex;
+    std::array<Change, 1024> changes{};
+    u64 change_count = 0;
+    /// Logs the ranges, then moves the generation on.
+    void NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges);
     std::unique_ptr<Rhi::PipelineLayout> untile_layout;
     std::mutex untile_mutex;
     std::unordered_map<u64, std::unique_ptr<Rhi::Pipeline>> untile_pipelines;

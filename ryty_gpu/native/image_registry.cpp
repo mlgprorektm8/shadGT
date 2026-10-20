@@ -139,7 +139,8 @@ ImageRegistry::ImageRegistry(Rhi::Device& device) : device{device} {
 
 ImageRegistry::~ImageRegistry() = default;
 
-ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame) {
+ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame,
+                                bool create) {
     ++stats.lookups;
     Shard& shard = ShardOf(info.guest_address);
     {
@@ -216,6 +217,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             }
         }
     }
+    if (!create) {
+        return nullptr; // OPT-010
+    }
     auto entry = std::make_unique<ImageEntry>();
     entry->info = info;
     entry->from_cpu = !render_target;
@@ -255,7 +259,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         }
         result = entry.get();
         shard.images.emplace(info.guest_address, std::move(entry));
-        generation.fetch_add(1, std::memory_order_acq_rel); // OPT-002
+        const std::pair<VAddr, VAddr> range{info.guest_address,
+                                            info.guest_address + std::max<u64>(info.guest_size, 1)};
+        NoteChanges({&range, 1}); // OPT-002, OPT-010
     }
     IndexEntry(*result);
     if (render_target) {
@@ -279,6 +285,36 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         pending_uploads.push_back(result);
     }
     return result;
+}
+
+void ImageRegistry::NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges) {
+    std::scoped_lock lock{changes_mutex};
+    const u64 next = generation.load(std::memory_order_relaxed) + 1;
+    for (const auto& [begin, end] : ranges) {
+        changes[change_count++ % changes.size()] = {next, begin, end};
+    }
+    generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool ImageRegistry::Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges) {
+    if (generation.load(std::memory_order_acquire) == since) {
+        return true;
+    }
+    std::scoped_lock lock{changes_mutex};
+    const u64 kept = std::min<u64>(change_count, changes.size());
+    for (u64 i = 0; i < kept; ++i) {
+        const Change& change = changes[(change_count - 1 - i) % changes.size()];
+        if (change.generation <= since) {
+            return true;
+        }
+        for (const auto& [begin, end] : ranges) {
+            if (change.begin < end && change.end > begin) {
+                return false;
+            }
+        }
+    }
+    // Every change kept is newer: the log reaches back far enough only if none was lost.
+    return change_count <= changes.size();
 }
 
 bool ImageRegistry::HasImageAt(VAddr address) {
@@ -511,13 +547,19 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     for (Shard& shard : shards) {
         std::unique_lock lock{shard.mutex};
         for (auto it = shard.images.begin(); it != shard.images.end();) {
-            if (gone.contains(it->second.get())) {
+            // OPT-010: one a job thread found since the scan stays.
+            if (gone.contains(it->second.get()) &&
+                it->second->last_use.load(std::memory_order_relaxed) < before) {
                 taken.push_back(std::move(it->second));
                 it = shard.images.erase(it);
             } else {
                 ++it;
             }
         }
+    }
+    gone.clear();
+    for (const auto& entry : taken) {
+        gone.insert(entry.get());
     }
     {
         std::unique_lock lock{granule_mutex};
@@ -530,7 +572,13 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
         std::erase_if(pending_uploads, [&](ImageEntry* entry) { return gone.contains(entry); });
     }
     if (!taken.empty()) {
-        generation.fetch_add(1, std::memory_order_acq_rel); // OPT-002
+        std::vector<std::pair<VAddr, VAddr>> ranges;
+        ranges.reserve(taken.size());
+        for (const auto& entry : taken) {
+            ranges.emplace_back(entry->info.guest_address,
+                                entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
+        }
+        NoteChanges(ranges); // OPT-002, OPT-010
     }
     // The links between textures and targets that went (NAT-111: both directions).
     for (const auto& entry : taken) {

@@ -761,7 +761,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                            : rasterizer->SelectPipelineAhead();
     }
 #ifdef RYTY_GPU
-    if (!compute && Native::ShadowEnabled()) {
+    if (!compute && Native::ShadowComparing()) {
         // NAT-030: the pipeline the draw's job looked up on its thread, against this selection.
         Native::ShadowCheckPipeline(selected ? selected->pipeline : nullptr, selected.has_value());
     }
@@ -1890,7 +1890,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
 #ifdef RYTY_GPU
-                if (Native::ShadowEnabled()) {
+                if (Native::ShadowComparing()) {
                     Native::ShadowCheckDraw(header, regs); // NAT-003
                 }
 #endif
@@ -1926,7 +1926,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
 #ifdef RYTY_GPU
-                if (Native::ShadowEnabled()) {
+                if (Native::ShadowComparing()) {
                     Native::ShadowCheckDraw(header, regs); // NAT-003
                 }
 #endif
@@ -1960,7 +1960,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
 #ifdef RYTY_GPU
-                if (Native::ShadowEnabled()) {
+                if (Native::ShadowComparing()) {
                     Native::ShadowCheckDraw(header, regs); // NAT-003
                 }
 #endif

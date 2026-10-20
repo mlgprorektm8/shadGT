@@ -863,16 +863,20 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     VAddr begin = Common::AlignDown(address, 4096);
     VAddr end = Common::AlignUp(address + size, 4096);
     std::vector<Region> merged;
-    for (auto it = regions.begin(); it != regions.end();) {
-        if (it->second.begin < end && it->second.end > begin) {
-            begin = std::min(begin, it->second.begin);
-            end = std::max(end, it->second.end);
-            merged.push_back(std::move(it->second));
-            it = regions.erase(it);
-        } else {
-            ++it;
+    {
+        std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
+        for (auto it = regions.begin(); it != regions.end();) {
+            if (it->second.begin < end && it->second.end > begin) {
+                begin = std::min(begin, it->second.begin);
+                end = std::max(end, it->second.end);
+                merged.push_back(std::move(it->second));
+                it = regions.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
+    buffer_log.Note(begin, end); // OPT-010
     if (!direct || end - begin > 1_GB || !direct->EnsureImported(begin, end - begin)) {
         return nullptr;
     }
@@ -916,6 +920,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     ++stats.regions_made;
     LOG_INFO(Render_Vulkan, "NAT-114: region {:#x}+{:#x} on the GPU ({} taken in)", begin,
              end - begin, merged.size());
+    std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
     auto [it, inserted] = regions.emplace(begin, std::move(region));
     return &it->second;
 }
@@ -958,6 +963,8 @@ void NativeRenderer::SortRegionWrites() {
                 mirror_bytes -= mirror.end - mirror.begin;
                 ++stats.mirrors_dropped;
                 ++buffer_generation; // OPT-003
+                buffer_log.Note(mirror.begin, mirror.end); // OPT-010
+                std::unique_lock map_lock{buffer_map_mutex};
                 it = mirrors.erase(it); // freed once the GPU is done with it
                 continue;
             }
@@ -1130,11 +1137,13 @@ void NativeRenderer::MakePendingMirrors() {
         if (mirror_bytes - taken + (end - begin) > budget && !evicted) {
             // Mirrors unused for two seconds go first.
             evicted = true;
+            std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
             for (auto it = mirrors.begin(); it != mirrors.end();) {
                 if (it->second.used_frame + 120 < frame &&
                     !(it->second.begin < end && it->second.end > begin)) {
                     mirror_bytes -= it->second.end - it->second.begin;
                     ++stats.mirrors_evicted;
+                    buffer_log.Note(it->second.begin, it->second.end);
                     it = mirrors.erase(it);
                 } else {
                     ++it;
@@ -1159,10 +1168,14 @@ void NativeRenderer::MakePendingMirrors() {
         if (!buffer) {
             continue;
         }
-        for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;) {
-            mirror_bytes -= it->second.end - it->second.begin;
-            it = mirrors.erase(it); // freed once the GPU is done with it
+        {
+            std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
+            for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;) {
+                mirror_bytes -= it->second.end - it->second.begin;
+                it = mirrors.erase(it); // freed once the GPU is done with it
+            }
         }
+        buffer_log.Note(begin, end); // OPT-010
         const vk::Buffer dst{Handle<VkBuffer_T>(buffer->NativeHandle())};
         direct->ForEachPart(begin, end - begin,
                             [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
@@ -1177,6 +1190,7 @@ void NativeRenderer::MakePendingMirrors() {
         mirror_bytes += end - begin;
         ++stats.mirrors_made;
         stats.mirror_made_bytes += end - begin;
+        std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         mirrors.emplace(begin, Mirror{.begin = begin,
                                       .end = end,
                                       .buffer = std::move(buffer),
@@ -1193,6 +1207,8 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size) {
     for (auto it = FirstMirror(address); it != mirrors.end() && it->second.begin < address + size;) {
         mirror_bytes -= it->second.end - it->second.begin;
         ++buffer_generation; // OPT-003
+        buffer_log.Note(it->second.begin, it->second.end); // OPT-010
+        std::unique_lock map_lock{buffer_map_mutex};
         it = mirrors.erase(it); // freed once the GPU is done with it
     }
 }
@@ -1948,21 +1964,6 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     }
 }
 
-/// A draw's vertex and index buffers: looked up before its pass starts (a lookup may gather on
-/// the GPU, outside rendering) and bound inside it.
-struct NativeRenderer::VertexIndexState {
-    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
-    VertexInputs<vk::VertexInputBindingDescription2EXT> input_bindings;
-    VertexInputs<vk::Buffer> buffers;
-    VertexInputs<vk::DeviceSize> offsets;
-    VertexInputs<vk::DeviceSize> sizes;
-    VertexInputs<vk::DeviceSize> strides;
-    vk::Buffer index_buffer{};
-    u64 index_offset = 0;
-    vk::IndexType index_type = vk::IndexType::eUint32;
-    u32 index_count = 0;
-};
-
 void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
                                           const AmdGpu::Regs& regs, VertexIndexState& v) {
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
@@ -2401,22 +2402,52 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     if (r.FrameDumpActive()) {
         r.FrameDumpPass(regs, targets.state, pipeline); // NAT-117
     }
-    DrawBindings& b = bindings;
-    b.Clear();
-    b.push = UserData(regs);
-    BindStages(pipeline->GetStages(), regs, false, b);
+    // OPT-010: the bindings a game job thread worked out ahead, when they hold.
+    static const bool prepare = PrepareEnabled();
+    PreparedDraw* prepared = nullptr;
+    if (prepare && !r.FrameDumpCollecting()) {
+        prepared = TakePrepared(Rasterizer::t_draw_packet);
+        stats.prepared_missing += prepared ? 0 : 1;
+    }
+    struct GiveBack {
+        NativeRenderer& n;
+        PreparedDraw* p;
+        ~GiveBack() {
+            if (p) {
+                n.FreePrepared(p);
+            }
+        }
+    } give_back{*this, prepared};
+    bool from_prepared = false;
+    if (prepared) {
+        PhaseClock clock{stats.phase_ns[2]};
+        from_prepared = CommitPrepared(*prepared, *pipeline, regs);
+    }
+    DrawBindings& b = from_prepared ? prepared->bindings : bindings;
+    if (!from_prepared) {
+        b.Clear();
+        b.push = UserData(regs);
+        BindStages(pipeline->GetStages(), regs, false, b);
+    }
     if (b.failed) {
         ++stats.skipped;
         return;
     }
     static thread_local VertexIndexState vertex_index;
+    const VertexIndexState* vi = &vertex_index;
     {
         PhaseClock clock{stats.phase_ns[5]};
-        vertex_index = {};
-        ResolveVertexBuffers(*pipeline, regs, vertex_index);
-        if (!ResolveIndices(regs, is_indexed, index_offset, quad_triangles, vertex_index)) {
-            ++stats.skipped;
-            return;
+        if (from_prepared && prepared->has_vertices &&
+            CommitPreparedVertices(*prepared, *pipeline, regs, is_indexed, index_offset,
+                                   quad_triangles)) {
+            vi = prepared->vertex_index.get(); // OPT-011
+        } else {
+            vertex_index = {};
+            ResolveVertexBuffers(*pipeline, regs, vertex_index);
+            if (!ResolveIndices(regs, is_indexed, index_offset, quad_triangles, vertex_index)) {
+                ++stats.skipped;
+                return;
+            }
         }
     }
     {
@@ -2425,6 +2456,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     }
     PhaseClock record_clock{stats.phase_ns[7]};
     {
+        PhaseClock part{stats.record_ns[0]}; // OPT-011
         // NAT-140: a full barrier only when the draw reads what was written since the last
         // one, or draws into what was read since; a pass that draws into pictures earlier
         // passes drew waits for their attachment writes only; other passes don't wait.
@@ -2456,10 +2488,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             ++stats.passes_unblocked;
         }
     }
-    BeginRendering(targets.state);
+    {
+        PhaseClock part{stats.record_ns[1]};
+        BeginRendering(targets.state);
+    }
 
     // The renderer's dynamic state code, filling this list's state.
     {
+        PhaseClock part{stats.record_ns[2]};
         DynamicState* const saved = Rasterizer::t_dynamic_state;
         Rasterizer::t_dynamic_state = &s.dynamic;
         r.ctx->attachment_feedback_loop = {};
@@ -2471,32 +2507,767 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
         Rasterizer::t_dynamic_state = saved;
     }
-    RecordVertexIndex(vertex_index);
-    const u32 index_count = vertex_index.index_count;
+    {
+        PhaseClock part{stats.record_ns[3]};
+        RecordVertexIndex(*vi);
+    }
+    const u32 index_count = vi->index_count;
     const CmdBuf cmdbuf{s.cmd};
-    if (s.pipeline != pipeline->Handle()) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-        s.pipeline = pipeline->Handle();
-    }
-    PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
-    const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
-    const auto [vertex_offset, instance_offset] =
-        DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
-    const u32 instances = regs.num_instances.NumInstances();
-    if (quad_triangles) {
-        if (index_count != 0) {
-            cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset), instance_offset);
+    {
+        PhaseClock part{stats.record_ns[4]};
+        if (s.pipeline != pipeline->Handle()) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+            s.pipeline = pipeline->Handle();
         }
-    } else if (is_indexed) {
-        cmdbuf.drawIndexed(regs.num_indices, instances, 0, s32(vertex_offset), instance_offset);
-    } else {
-        cmdbuf.draw(regs.num_indices, instances, vertex_offset, instance_offset);
     }
-    NoteWrites(&targets, b);
+    {
+        PhaseClock part{stats.record_ns[5]};
+        PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+    }
+    {
+        PhaseClock part{stats.record_ns[6]};
+        const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+        const auto [vertex_offset, instance_offset] =
+            DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
+        const u32 instances = regs.num_instances.NumInstances();
+        if (quad_triangles) {
+            if (index_count != 0) {
+                cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset),
+                                   instance_offset);
+            }
+        } else if (is_indexed) {
+            cmdbuf.drawIndexed(regs.num_indices, instances, 0, s32(vertex_offset),
+                               instance_offset);
+        } else {
+            cmdbuf.draw(regs.num_indices, instances, vertex_offset, instance_offset);
+        }
+    }
+    {
+        PhaseClock part{stats.record_ns[7]};
+        NoteWrites(&targets, b);
+    }
     ++stats.draws;
     ++s.commands;
     ChunkFlushCheck();
     Report();
+}
+
+bool NativeRenderer::PrepareEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_PREPARE");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+void NativeRenderer::PreparedDraw::Reset() {
+    packet = nullptr;
+    epoch = 0;
+    pipeline = nullptr;
+    stage_hashes = {};
+    bindings.Clear();
+    regions.clear();
+    image_ranges.clear();
+    buffer_ranges.clear();
+    upload_bytes.clear();
+    uploads.clear();
+    null_images = 0;
+    has_vertices = false;
+    vertex_hash = 0;
+    indexed = false;
+    index_offset = 0;
+    index_address = 0;
+    mirrors.clear();
+    in_place.clear();
+}
+
+void NativeRenderer::ChangeLog::Note(VAddr begin, VAddr end) {
+    const u64 next = seq.load(std::memory_order_relaxed) + 1;
+    entries[next % entries.size()] = {next, begin, end};
+    seq.store(next, std::memory_order_release);
+}
+
+bool NativeRenderer::ChangeLog::Untouched(u64 since,
+                                          std::span<const std::pair<VAddr, VAddr>> ranges) const {
+    const u64 now = seq.load(std::memory_order_acquire);
+    if (now == since) {
+        return true;
+    }
+    if (now - since > entries.size()) {
+        return false;
+    }
+    for (u64 at = since + 1; at <= now; ++at) {
+        const Entry& entry = entries[at % entries.size()];
+        for (const auto& [begin, end] : ranges) {
+            if (entry.begin < end && entry.end > begin) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+NativeRenderer::PreparedDraw* NativeRenderer::NewPrepared() {
+    std::scoped_lock lock{prepared_pool_mutex};
+    if (!prepared_free.empty()) {
+        PreparedDraw* draw = prepared_free.back();
+        prepared_free.pop_back();
+        return draw;
+    }
+    prepared_all.push_back(std::make_unique<PreparedDraw>());
+    return prepared_all.back().get();
+}
+
+void NativeRenderer::FreePrepared(PreparedDraw* draw) {
+    draw->Reset();
+    std::scoped_lock lock{prepared_pool_mutex};
+    prepared_free.push_back(draw);
+}
+
+NativeRenderer::PreparedDraw* NativeRenderer::TakePrepared(const void* packet) {
+    if (!packet) {
+        return nullptr;
+    }
+    PreparedShard& shard = ShardFor(packet);
+    std::scoped_lock lock{shard.mutex};
+    const auto it = shard.draws.find(packet);
+    if (it == shard.draws.end()) {
+        return nullptr;
+    }
+    PreparedDraw* draw = it->second;
+    shard.draws.erase(it);
+    return draw;
+}
+
+u64 NativeRenderer::StageHash(const Shader::Info& info) {
+    // What the bindings were worked out from: the stage's sharps (the user data registers the
+    // program doesn't read hold whatever earlier work left, which a job and the command
+    // processor need not agree on).
+    static thread_local std::vector<u32> words;
+    words.clear();
+    const auto add = [](const auto& sharp) {
+        const auto* data = reinterpret_cast<const u32*>(&sharp);
+        words.insert(words.end(), data, data + sizeof(sharp) / sizeof(u32));
+    };
+    for (const auto& desc : info.buffers) {
+        if (!desc.IsSpecial()) {
+            add(desc.GetSharp(info));
+        }
+    }
+    for (const auto& desc : info.images) {
+        add(desc.GetSharp(info));
+    }
+    for (const auto& desc : info.samplers) {
+        add(desc.GetSharp(info));
+    }
+    return XXH3_64bits_withSeed(words.data(), words.size() * sizeof(u32), info.pgm_base);
+}
+
+void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu::Regs& regs,
+                                    const GraphicsPipeline& pipeline,
+                                    std::span<const Shader::Info* const> stages, bool is_indexed,
+                                    u32 index_offset) {
+    const auto start = std::chrono::steady_clock::now();
+    PreparedDraw* p = NewPrepared();
+    p->packet = packet;
+    p->epoch = epoch;
+    p->pipeline = &pipeline;
+    // What the lookups depend on, read before them.
+    p->image_generation = registry->Generation();
+    p->buffer_seq = buffer_log.Seq();
+    p->unmap_gen = unmap_generation.load(std::memory_order_acquire);
+    p->bindings.push = UserData(regs);
+    const u32 count = std::min<u32>(static_cast<u32>(stages.size()), Shader::MaxStageTypes - 1);
+    std::array<StageResourceBindings, Shader::MaxStageTypes> plans{};
+    bool ok = true;
+    size_t total = 0;
+    for (u32 i = 0; i < count; ++i) {
+        if (const auto* stage = stages[i]) {
+            total += stage->buffers.size() + stage->images.size() + stage->samplers.size();
+        }
+    }
+    p->bindings.writes.reserve(total);
+    for (u32 i = 0; ok && i < count; ++i) {
+        const auto* stage = stages[i];
+        p->stage_hashes[i] = stage ? StageHash(*stage) : 0;
+        if (!stage) {
+            continue;
+        }
+        plans[i] = PlanStageResourceBindings(*stage,
+                                             Shader::Backend::StageStart(u32(stage->sw_stage)));
+        auto buffer_binding = plans[i].buffers;
+        ok = PrepareBuffers(*stage, regs, buffer_binding, *p);
+    }
+    for (u32 i = 0; ok && i < count; ++i) {
+        if (const auto* stage = stages[i]) {
+            auto texture_binding = plans[i].textures;
+            ok = PrepareTextures(*stage, regs, texture_binding, *p);
+        }
+    }
+    if (!ok) {
+        ++prepare_stats.failed;
+        FreePrepared(p);
+        return;
+    }
+    // OPT-011: the vertex and index buffers too, when they need nothing ordered.
+    constexpr u32 VertexStage = static_cast<u32>(Shader::SwStage::Vertex);
+    if (VertexStage < count && stages[VertexStage]) {
+        p->has_vertices =
+            PrepareVertices(*p, regs, pipeline, *stages[VertexStage], is_indexed, index_offset);
+    }
+    std::vector<PreparedDraw*> dropped;
+    {
+        PreparedShard& shard = ShardFor(packet);
+        std::scoped_lock lock{shard.mutex};
+        if (shard.draws.size() > 1024) {
+            // Draws the recorder never took (not submitted, or filtered): from a few
+            // submissions ago, they go.
+            for (auto it = shard.draws.begin(); it != shard.draws.end();) {
+                if (epoch - it->second->epoch > 4) {
+                    dropped.push_back(it->second);
+                    it = shard.draws.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        const auto [it, inserted] = shard.draws.try_emplace(packet, p);
+        if (!inserted) {
+            dropped.push_back(it->second);
+            it->second = p;
+            ++prepare_stats.replaced;
+        }
+    }
+    prepare_stats.stale += dropped.size();
+    for (PreparedDraw* draw : dropped) {
+        FreePrepared(draw);
+    }
+    ++prepare_stats.made;
+    prepare_stats.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+}
+
+std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr address, u64 size,
+                                                                         bool write,
+                                                                         PreparedDraw& p) {
+    {
+        std::shared_lock map_lock{buffer_map_mutex};
+        if (Region* region = RegionOver(address, size)) {
+            if (address < region->begin || address + size > region->end) {
+                return std::nullopt; // the region grows over it first
+            }
+            p.regions.push_back(region);
+            return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
+                             u64{address - region->begin}};
+        }
+    }
+    if (write) {
+        return std::nullopt; // a region is made for it (NAT-144), or mirrors dropped
+    }
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    if (direct && direct->EnsureImported(address, size)) {
+        if (const auto found = direct->FindBuffer(address, size)) {
+            return std::pair{found->first->Handle(), found->second};
+        }
+    }
+    return std::nullopt; // gathered or copied, in GPU order
+}
+
+bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs,
+                                    Shader::Backend::Bindings& binding, PreparedDraw& p) {
+    // As BindBuffers, without its side effects.
+    DrawBindings& b = p.bindings;
+    const u64 alignment = r.instance.StorageMinAlignment();
+    auto* direct = stage.uses_direct ? r.buffer_cache.GetDirectMemory() : nullptr;
+    static thread_local std::vector<std::array<u32, 4>> direct_entries;
+    direct_entries.assign(stage.buffers.size(), {});
+    constexpr u64 GpuAddressLimit = 1ULL << 40;
+    const auto upload = [&](const void* data, u32 size) {
+        const u32 offset = static_cast<u32>(p.upload_bytes.size());
+        const auto* bytes = static_cast<const u8*>(data);
+        p.upload_bytes.insert(p.upload_bytes.end(), bytes, bytes + size);
+        p.uploads.push_back({static_cast<u32>(b.buffers.size()), offset, size});
+        return vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, size};
+    };
+    u32 index = 0;
+    for (const auto& desc : stage.buffers) {
+        const u32 buffer_index = index++;
+        vk::DescriptorBufferInfo info{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
+        if (desc.IsSpecial()) {
+            switch (desc.buffer_type) {
+            case Shader::BufferType::GdsBuffer:
+                info = {Handle<VkBuffer_T>(gds->NativeHandle()), 0, gds->Size()};
+                break;
+            case Shader::BufferType::Flatbuf: {
+                // The recorder's own copy of the stage's user data (the registers the program
+                // doesn't read may differ here), uploaded at commit.
+                const u32 size = static_cast<u32>(stage.flattened_ud_buf.size() * sizeof(u32));
+                if (size != 0) {
+                    p.uploads.push_back({static_cast<u32>(b.buffers.size()), 0, size,
+                                         static_cast<s32>(stage.sw_stage)});
+                    info = vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, size};
+                }
+                break;
+            }
+            case Shader::BufferType::ClipPlanes:
+                if (regs.clipper_control.user_clip_plane_enable != 0) {
+                    std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+                    for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+                        const auto& plane = regs.clip_user_data[i];
+                        planes[i * 4 + 0] = std::bit_cast<float>(plane.data_x);
+                        planes[i * 4 + 1] = std::bit_cast<float>(plane.data_y);
+                        planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
+                        planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
+                    }
+                    info = upload(planes.data(), sizeof(planes));
+                }
+                break;
+            case Shader::BufferType::DirectTable: {
+                const u32 words = static_cast<u32>(4 + stage.buffers.size() * 4);
+                static thread_local std::vector<u32> table;
+                table.assign(words, 0);
+                if (auto* memory = r.buffer_cache.GetDirectMemory()) {
+                    const u64 l1 = memory->L1Address();
+                    const u64 zero = memory->ZeroPageAddress();
+                    table[0] = u32(l1);
+                    table[1] = u32(l1 >> 32);
+                    table[2] = u32(zero);
+                    table[3] = u32(zero >> 32);
+                    for (size_t i = 0; i < stage.buffers.size(); ++i) {
+                        std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
+                    }
+                }
+                info = upload(table.data(), words * sizeof(u32));
+                break;
+            }
+            default:
+                return false; // compute-only kinds and the unsupported ones: the recorder
+            }
+        } else {
+            const auto vsharp = desc.GetSharp(stage);
+            const u64 base = vsharp.base_address;
+            const u64 sharp_size = vsharp.GetSize();
+            const bool impossible =
+                vsharp.num_records != UINT32_MAX &&
+                (sharp_size >= GpuAddressLimit || base + sharp_size > GpuAddressLimit ||
+                 (sharp_size >= 1_GB && base != 0 && !r.memory->IsValidMapping(base)));
+            const bool unmapped =
+                !impossible && base != 0 && sharp_size != 0 && !r.IsMappedStart(base);
+            if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
+                const u64 size = r.memory->ClampRangeSize(base, sharp_size);
+                bool region_over;
+                {
+                    std::shared_lock map_lock{buffer_map_mutex};
+                    region_over = RegionOver(base, size) != nullptr;
+                }
+                p.buffer_ranges.emplace_back(base, base + size);
+                if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) && !region_over &&
+                    direct->EnsureImported(base, size)) {
+                    direct_entries[buffer_index] = {u32(base), u32(base >> 32), u32(size), 1u};
+                } else if (const auto found = JobGuestBuffer(base, size, desc.is_written, p)) {
+                    const u64 aligned = Common::AlignDown(found->second, alignment);
+                    const u64 adjust = found->second - aligned;
+                    b.push.AddOffset(binding.buffer, static_cast<u32>(adjust));
+                    info = {found->first, aligned, size + adjust};
+                    b.writes_buffers |= desc.is_written;
+                    if (desc.is_written) {
+                        b.gpu_writes.emplace_back(base, size); // NAT-119
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+        b.buffers.push_back(info);
+        b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
+        b.writes.push_back(vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = binding.unified++,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &b.buffers.back(),
+        });
+        ++binding.buffer;
+    }
+    return true;
+}
+
+bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
+                                     Shader::Backend::Bindings& binding, PreparedDraw& p) {
+    // As BindTextures, without its side effects: pictures that exist only, no rewrites or
+    // copies of sources (the recorder does them).
+    DrawBindings& b = p.bindings;
+    const u64 now_frame = shared_frame.load(std::memory_order_relaxed);
+    static thread_local std::array<TextureMemo, 4096> memos{};
+    for (const auto& image_desc : stage.images) {
+        const auto tsharp = image_desc.GetSharp(stage);
+        const u32 num_bindings = image_desc.NumBindings(stage);
+        const u32 first = static_cast<u32>(b.images.size());
+        const bool storage = image_desc.is_written;
+        const auto add_write = [&] {
+            b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
+            b.writes.push_back(vk::WriteDescriptorSet{
+                .dstSet = VK_NULL_HANDLE,
+                .dstBinding = binding.unified,
+                .dstArrayElement = 0,
+                .descriptorCount = num_bindings,
+                .descriptorType =
+                    storage ? vk::DescriptorType::eStorageImage : vk::DescriptorType::eSampledImage,
+                .pImageInfo = &b.images[first],
+            });
+            binding.unified += num_bindings;
+        };
+        const auto bind_null = [&] {
+            for (u32 i = 0; i < num_bindings; ++i) {
+                b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
+            }
+            ++p.null_images;
+            add_write();
+        };
+        std::array<u64, 4> raw_sharp{};
+        static_assert(sizeof(tsharp) == sizeof(raw_sharp));
+        std::memcpy(raw_sharp.data(), &tsharp, sizeof(raw_sharp));
+        const u32 memo_flags = u32(storage) | (u32(image_desc.is_array) << 1) |
+                               (u32(image_desc.is_depth) << 2) |
+                               (u32(image_desc.mip_fallback_mode) << 3) |
+                               ((image_desc.constant_mip_index & 0xff) << 6) |
+                               (num_bindings << 16);
+        if (num_bindings > 4 || stage.pgm_hash == 0xaa3822a3) {
+            return false; // the recorder (FIX-081's grass shader, long arrays)
+        }
+        const u64 memo_generation = p.image_generation + p.unmap_gen;
+        TextureMemo& memo = memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
+                                                       memo_flags) &
+                                  (memos.size() - 1)];
+        const VAddr address = tsharp.Address();
+        if (memo.entry && memo.flags == memo_flags && memo.sharp == raw_sharp &&
+            memo.generation == memo_generation) {
+            Native::ImageEntry* entry = memo.entry;
+            entry->last_use.store(now_frame, std::memory_order_relaxed);
+            for (u32 i = 0; i < num_bindings; ++i) {
+                b.images.push_back({VK_NULL_HANDLE, memo.views[i], vk::ImageLayout::eGeneral});
+            }
+            (storage ? b.stored : b.sampled).push_back(entry);
+            p.image_ranges.emplace_back(address, address + std::max<u64>(entry->info.guest_size, 1));
+            add_write();
+            continue;
+        }
+        const auto data_fmt = tsharp.GetDataFmt();
+        const auto num_fmt = tsharp.GetNumberFmt();
+        if (address == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid ||
+            !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt) ||
+            !r.memory->IsValidGpuMapping(address, 0) ||
+            LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt) == vk::Format::eUndefined ||
+            VideoCore::CheckImageDescriptorGeometry(tsharp, r.instance.GetImageLimits()) !=
+                VideoCore::ImageDescriptorGeometryError::None) {
+            bind_null();
+            continue;
+        }
+        const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        if (!r.IsMappedStart(desc.info.guest_address)) {
+            bind_null();
+            continue;
+        }
+        Native::ImageEntry* entry = registry->Find(desc.info, storage, now_frame, false);
+        if (!entry) {
+            return false; // made by the recorder, in GPU order
+        }
+        const auto fallback = image_desc.mip_fallback_mode;
+        for (u32 i = 0; i < num_bindings; ++i) {
+            auto view_info = desc.view_info;
+            if (fallback == Shader::MipStorageFallbackMode::ConstantIndex) {
+                view_info.range.base.level += image_desc.constant_mip_index;
+                view_info.range.extent.levels = 1;
+            } else if (fallback == Shader::MipStorageFallbackMode::DynamicIndex) {
+                view_info.range.base.level += i;
+                view_info.range.extent.levels = 1;
+            }
+            const vk::ImageView view =
+                View(*entry, view_info, storage ? ViewUse::Storage : ViewUse::Sampled);
+            b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
+        }
+        memo.sharp = raw_sharp;
+        memo.flags = memo_flags;
+        memo.entry = entry;
+        for (u32 i = 0; i < num_bindings; ++i) {
+            memo.views[i] = b.images[first + i].imageView;
+        }
+        memo.generation = memo_generation;
+        (storage ? b.stored : b.sampled).push_back(entry);
+        p.image_ranges.emplace_back(desc.info.guest_address,
+                                    desc.info.guest_address +
+                                        std::max<u64>(desc.info.guest_size, 1));
+        add_write();
+    }
+    for (const auto& sampler : stage.samplers) {
+        auto ssharp = sampler.GetSharp(stage);
+        if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                                regs.ta_bc_base.Address() == 0)) {
+            ssharp = AmdGpu::Sampler{};
+        }
+        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
+                            vk::ImageLayout::eGeneral});
+        b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
+        b.writes.push_back(vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = binding.unified++,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eSampler,
+            .pImageInfo = &b.images.back(),
+        });
+    }
+    return true;
+}
+
+u64 NativeRenderer::VertexHash(const GraphicsPipeline& pipeline, const Shader::Info& vs,
+                                u32 step_rate_0, u32 step_rate_1) {
+    // The V#s the fetch shader reads (what the vertex buffers were worked out from).
+    const auto& fetch = pipeline.GetFetchShader();
+    std::array<u32, 2 + 4 * MaxVertexBufferCount> words{step_rate_0, step_rate_1};
+    u32 count = 2;
+    if (!fetch.Empty()) {
+        for (const auto& attrib : fetch.attributes) {
+            if (count + 4 > words.size()) {
+                break;
+            }
+            const auto sharp = attrib.GetSharp(vs);
+            static_assert(sizeof(sharp) == 4 * sizeof(u32));
+            std::memcpy(&words[count], &sharp, sizeof(sharp));
+            count += 4;
+        }
+    }
+    return XXH3_64bits(words.data(), count * sizeof(u32));
+}
+
+std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr address, u64 size,
+                                                                          PreparedDraw& p,
+                                                                          Mirror** mirror_out) {
+    // As GuestBufferLookup for vertices and indices (a region, else a mirror, else in place).
+    // The caller holds buffer_map_mutex shared.
+    *mirror_out = nullptr;
+    {
+        if (Region* region = RegionOver(address, size)) {
+            if (address < region->begin || address + size > region->end) {
+                return std::nullopt;
+            }
+            if (p.regions.empty() || p.regions.back() != region) {
+                p.regions.push_back(region);
+            }
+            return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
+                             u64{address - region->begin}};
+        }
+        static const bool mirrors_on = [] {
+            const char* env = std::getenv("RYGT_NATIVE_MIRRORS");
+            return !(env && env[0] == '0');
+        }();
+        if (mirrors_on && size <= 64_MB) {
+            if (Mirror* mirror = MirrorHolding(address, size)) {
+                if (std::ranges::find(p.mirrors, mirror) == p.mirrors.end()) {
+                    p.mirrors.push_back(mirror);
+                }
+                *mirror_out = mirror;
+                return std::pair{vk::Buffer{Handle<VkBuffer_T>(mirror->buffer->NativeHandle())},
+                                 u64{address - mirror->begin}};
+            }
+        }
+    }
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    if (direct && direct->EnsureImported(address, size)) {
+        if (const auto found = direct->FindBuffer(address, size)) {
+            p.in_place.emplace_back(address, size);
+            return std::pair{found->first->Handle(), found->second};
+        }
+    }
+    return std::nullopt;
+}
+
+bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
+                                     const GraphicsPipeline& pipeline, const Shader::Info& vs,
+                                     bool is_indexed, u32 index_offset) {
+    if (regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
+        return false; // the recorder makes their triangles
+    }
+    if (!p.vertex_index) {
+        p.vertex_index = std::make_unique<VertexIndexState>();
+    }
+    VertexIndexState& v = *p.vertex_index;
+    v = {};
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    VertexInputs<AmdGpu::Buffer> guest_buffers;
+    pipeline.GetVertexInputs(v.attributes, v.input_bindings, divisors, guest_buffers,
+                             regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1, vs);
+    p.vertex_hash = VertexHash(pipeline, vs, regs.vgt_instance_step_rate_0,
+                               regs.vgt_instance_step_rate_1);
+    // Regions and mirrors stay put while this thread reads them.
+    std::shared_lock map_lock{buffer_map_mutex};
+    Mirror* near = nullptr;
+    for (const auto& guest : guest_buffers) {
+        std::optional<std::pair<vk::Buffer, u64>> found;
+        u64 size = 0;
+        const VAddr base = guest.base_address;
+        const u64 sharp_size = guest.GetSize();
+        if (near && base != 0 && sharp_size > 0 && base >= near->begin &&
+            base + sharp_size <= near->end) {
+            size = sharp_size; // OPT-004 on this thread
+            found = std::pair{vk::Buffer{Handle<VkBuffer_T>(near->buffer->NativeHandle())},
+                              u64{base - near->begin}};
+        } else if (base != 0 && sharp_size > 0 && r.memory->MappedAreaEnd(base, base + 1) != 0) {
+            size = r.memory->ClampRangeSize(base, sharp_size);
+            found = JobVertexBuffer(base, size, p, &near);
+            if (!found) {
+                return false;
+            }
+        }
+        if (size != 0) {
+            p.buffer_ranges.emplace_back(base, base + size);
+        }
+        v.buffers.push_back(found ? found->first : vk::Buffer{});
+        v.offsets.push_back(found ? found->second : 0);
+        v.sizes.push_back(found ? size : 0);
+        v.strides.push_back(guest.GetStride());
+    }
+    p.indexed = is_indexed;
+    p.index_offset = index_offset;
+    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+    v.index_type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
+    v.index_count = regs.num_indices;
+    if (is_indexed) {
+        const VAddr address =
+            regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+        const u64 bytes = u64(regs.num_indices) * index_size;
+        if (bytes == 0) {
+            return false;
+        }
+        Mirror* unused = nullptr;
+        const auto found = JobVertexBuffer(address, bytes, p, &unused);
+        if (!found) {
+            return false;
+        }
+        p.buffer_ranges.emplace_back(address, address + bytes);
+        p.index_address = address;
+        v.index_buffer = found->first;
+        v.index_offset = found->second;
+    }
+    return true;
+}
+
+bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipeline& pipeline,
+                                            const AmdGpu::Regs& regs, bool is_indexed,
+                                            u32 index_offset, bool quad_triangles) {
+    // (The ranges were checked with the bindings'.)
+    const auto reject = [&] {
+        ++stats.prepared_vertices_rejected;
+        return false;
+    };
+    if (quad_triangles || p.indexed != is_indexed || p.index_offset != index_offset) {
+        return reject();
+    }
+    if (VertexHash(pipeline, pipeline.GetStage(Shader::SwStage::Vertex),
+                   regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1) != p.vertex_hash) {
+        return reject();
+    }
+    const auto& v = *p.vertex_index;
+    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    if (v.index_count != regs.num_indices ||
+        v.index_type != (is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32)) {
+        return reject();
+    }
+    if (is_indexed) {
+        const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+        if (p.index_address !=
+            regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size) {
+            return reject();
+        }
+    }
+    // The ordered part: pages the CPU wrote into the mirrors, and the ranges read in place
+    // (noted as mirror candidates).
+    for (Mirror* mirror : p.mirrors) {
+        RefreshMirror(*mirror);
+        mirror->used_frame = frame;
+        ++stats.mirror_binds;
+    }
+    for (const auto& [address, size] : p.in_place) {
+        MirrorBuffer(address, size);
+    }
+    ++stats.prepared_vertices;
+    return true;
+}
+
+bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pipeline,
+                                    const AmdGpu::Regs& regs) {
+    const auto reject = [&](u32 why) {
+        ++stats.prepared_rejected[why];
+        return false;
+    };
+    if (p.pipeline != &pipeline) {
+        return reject(0);
+    }
+    const auto stages = pipeline.GetStages();
+    for (u32 i = 0; i < stages.size() && i < p.stage_hashes.size(); ++i) {
+        if ((stages[i] ? StageHash(*stages[i]) : 0) != p.stage_hashes[i]) {
+            return reject(1);
+        }
+    }
+    for (const auto& upload : p.uploads) {
+        if (upload.flat_stage >= 0) {
+            const Shader::Info* stage = stages[upload.flat_stage];
+            if (!stage || stage->flattened_ud_buf.size() * sizeof(u32) != upload.size) {
+                return reject(1);
+            }
+        }
+    }
+    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) {
+        return reject(2);
+    }
+    if (!registry->Untouched(p.image_generation, p.image_ranges)) {
+        return reject(3);
+    }
+    SortRegionWrites(); // CPU writes since (may drop mirrors)
+    if (!buffer_log.Untouched(p.buffer_seq, p.buffer_ranges)) {
+        return reject(4);
+    }
+    // The ordered part, as BindBuffers and BindTextures do it.
+    for (Region* region : p.regions) {
+        RefreshRegion(*region);
+        ++stats.region_binds;
+    }
+    const u64 alignment = r.instance.StorageMinAlignment();
+    for (const auto& upload : p.uploads) {
+        const u8* source = p.upload_bytes.data() + upload.offset;
+        u32 size = upload.size;
+        if (upload.flat_stage >= 0) {
+            source = reinterpret_cast<const u8*>(stages[upload.flat_stage]->flattened_ud_buf.data());
+        }
+        const auto [buffer, offset, data] = Allocate(size, alignment);
+        std::memcpy(data, source, size);
+        p.bindings.buffers[upload.info] = vk::DescriptorBufferInfo{buffer, offset, size};
+    }
+    for (const auto* stored : p.bindings.stored) {
+        auto& entry = *const_cast<Native::ImageEntry*>(stored);
+        entry.last_use.store(frame, std::memory_order_relaxed);
+        ApplyRewrite(entry); // NAT-120
+    }
+    for (const auto* sampled : p.bindings.sampled) {
+        auto& entry = *const_cast<Native::ImageEntry*>(sampled);
+        entry.last_use.store(frame, std::memory_order_relaxed);
+        ApplyRewrite(entry); // NAT-120, NAT-133
+        if (entry.from_cpu) {
+            RefreshSources(entry); // NAT-104
+        }
+    }
+    // The viewport transform the shaders get, from the registers as recorded.
+    const Shader::PushData fresh = UserData(regs);
+    p.bindings.push.xoffset = fresh.xoffset;
+    p.bindings.push.xscale = fresh.xscale;
+    p.bindings.push.yoffset = fresh.yoffset;
+    p.bindings.push.yscale = fresh.yscale;
+    stats.null_images += p.null_images;
+    ++stats.prepared_used;
+    return true;
 }
 
 void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
@@ -3069,11 +3840,15 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     // NAT-146: regions over unmapped memory go (the device frees their buffers once the GPU is
     // done with them).
     std::scoped_lock lock{mutex};
-    for (auto it = regions.begin(); it != regions.end();) {
-        if (it->second.begin < address + size && it->second.end > address) {
-            it = regions.erase(it);
-        } else {
-            ++it;
+    {
+        std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
+        for (auto it = regions.begin(); it != regions.end();) {
+            if (it->second.begin < address + size && it->second.end > address) {
+                buffer_log.Note(it->second.begin, it->second.end);
+                it = regions.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
     DropMirrors(address, size); // NAT-150
@@ -3226,6 +4001,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         ++in_place.frames;
     }
     ++frame;
+    shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
     // The game's render target there (its layout from the CB registers may differ in details
     // from the video out description), else an image of the display layout.
     Native::ImageEntry* entry =
@@ -3425,6 +4201,10 @@ void NativeRenderer::Report() {
              "place), "
              "memo hits textures {}/{} buffers {} (OPT-002/003), vertex ranges in the "
              "previous one's mirror {} (OPT-004), vertex records skipped {} (OPT-005), "
+             "prepared draws (OPT-010): {} used, {} without one, rejected (pipeline/user "
+             "data/unmap/images/buffers) {}, made on job threads {} ({:.2f} us each, {} could "
+             "not, {} replaced, {} stale), vertices from them {} ({} not), record parts "
+             "barrier/begin/dynamic/vertex/pipeline/bindings/draw/notes {}, "
              "fill shaders {}, targets rewritten by clears/uploads/partial clears/fills "
              "{}/{}/{}/{} (NAT-120/124/132), "
              "on the GPU ({:.1f} MB), uploads from guest memory on the GPU/CPU {}/{}; images so far: "
@@ -3454,7 +4234,23 @@ void NativeRenderer::Report() {
              stats.mirrors_dropped, stats.mirrors_evicted, stats.mirror_over_budget,
              stats.mirror_refresh_pages, dynamic_granules.size(), stats.texture_memo_hits,
              stats.texture_lookups, stats.buffer_memo_hits, stats.vertex_near,
-             stats.vertex_skipped,
+             stats.vertex_skipped, stats.prepared_used, stats.prepared_missing,
+             fmt::join(stats.prepared_rejected, "/"), prepare_stats.made.load(),
+             prepare_stats.made.load() ? prepare_stats.ns.load() / 1000.0 / prepare_stats.made.load()
+                                       : 0.0,
+             prepare_stats.failed.load(), prepare_stats.replaced.load(),
+             prepare_stats.stale.load(), stats.prepared_vertices,
+             stats.prepared_vertices_rejected,
+             [&] {
+                 std::string text;
+                 for (u32 i = 0; i < stats.record_ns.size(); ++i) {
+                     text += fmt::format("{}{:.2f}", i == 0 ? "" : "/",
+                                         stats.timed_draws
+                                             ? stats.record_ns[i] / 1000.0 / stats.timed_draws
+                                             : 0.0);
+                 }
+                 return text;
+             }(),
              stats.fill_shaders, stats.rewrite_clears, stats.rewrite_uploads,
              stats.rewrite_partial, stats.rewrite_fills,
              stats.gathered_bytes / 1048576.0,
@@ -3493,6 +4289,15 @@ void NativeRenderer::Report() {
     stats.timed_draws = 0;
     stats.texture_memo_hits = stats.texture_lookups = stats.buffer_memo_hits = 0;
     stats.vertex_near = stats.vertex_skipped = 0;
+    stats.prepared_used = stats.prepared_missing = 0;
+    stats.prepared_rejected = {};
+    stats.prepared_vertices = stats.prepared_vertices_rejected = 0;
+    stats.record_ns = {};
+    prepare_stats.made = 0;
+    prepare_stats.failed = 0;
+    prepare_stats.replaced = 0;
+    prepare_stats.stale = 0;
+    prepare_stats.ns = 0;
     stats.gathers = stats.gathered_bytes = stats.writebacks = 0;
     stats.region_binds = stats.regions_made = stats.region_refreshes = 0;
     stats.fill_shaders = stats.rewrite_clears = stats.rewrite_uploads = 0;

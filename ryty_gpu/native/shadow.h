@@ -19,7 +19,11 @@ union Regs;
 
 namespace Native {
 
+/// Whether render jobs are walked on their threads (shadow mode, or OPT-010 native prepare mode:
+/// RYGT_NATIVE_PREPARE=1).
 bool ShadowEnabled();
+/// Whether the command processor compares its state with the jobs' (RYGT_NATIVE_SHADOW=1).
+bool ShadowComparing();
 
 /// A render job began on this thread; `dcb` is its Gnm DrawCommandBuffer (fresh command chunk).
 void ShadowJobBegin(const u8* dcb);

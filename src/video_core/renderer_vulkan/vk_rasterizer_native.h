@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <span>
 #include <tuple>
 #include <unordered_map>
@@ -103,6 +105,16 @@ public:
 
     /// NAT-116: saves the render targets noted while the rasterizer collected a frame.
     void DumpFrame(const std::filesystem::path& dir);
+
+    /// OPT-010 (RYGT_NATIVE_PREPARE=1): whether game job threads prepare draws.
+    static bool PrepareEnabled();
+    /// OPT-010: on a game job thread whose walk reached a draw (`regs` its state there) and
+    /// found its built pipeline, the stage infos holding the draw's user data: the draw's
+    /// bindings worked out ahead for the recorder (see PreparedDraw).
+    void PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu::Regs& regs,
+                        const GraphicsPipeline& pipeline,
+                        std::span<const Shader::Info* const> stages, bool is_indexed,
+                        u32 index_offset);
 
 private:
     enum class ViewUse : u8 { Sampled, Storage, Attachment };
@@ -288,7 +300,7 @@ private:
         std::array<vk::ImageView, 4> views{};
     };
     std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
-    u64 unmap_generation = 0;
+    std::atomic<u64> unmap_generation{0}; ///< (OPT-010: read by job threads)
     /// NAT-107: a guest range gathered on the GPU from the imported views holding it, into a
     /// buffer of the list (none when part of it is not imported).
     std::optional<std::pair<vk::Buffer, u64>> GatherOnGpu(VAddr address, u64 size);
@@ -307,7 +319,20 @@ private:
                       Shader::Backend::Bindings& binding, DrawBindings& b);
     void PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                       DrawBindings& b);
-    struct VertexIndexState;
+    /// A draw's vertex and index buffers: looked up before its pass starts (a lookup may gather
+    /// on the GPU, outside rendering) and bound inside it.
+    struct VertexIndexState {
+        boost::container::static_vector<vk::VertexInputAttributeDescription2EXT, 32> attributes;
+        boost::container::static_vector<vk::VertexInputBindingDescription2EXT, 32> input_bindings;
+        boost::container::static_vector<vk::Buffer, 32> buffers;
+        boost::container::static_vector<vk::DeviceSize, 32> offsets;
+        boost::container::static_vector<vk::DeviceSize, 32> sizes;
+        boost::container::static_vector<vk::DeviceSize, 32> strides;
+        vk::Buffer index_buffer{};
+        u64 index_offset = 0;
+        vk::IndexType index_type = vk::IndexType::eUint32;
+        u32 index_count = 0;
+    };
     void ResolveVertexBuffers(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
                               VertexIndexState& v);
     bool ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
@@ -350,6 +375,123 @@ private:
     void ResolveDraw(const AmdGpu::Regs& regs);
     bool MetaClearDispatch(const Shader::Info& cs);
     void Report();
+
+    /// OPT-010: a draw's bindings worked out on the game job thread that recorded it, before
+    /// the command processor reaches it: BindStages' lookups (buffers bound from regions or
+    /// guest memory, textures from existing pictures and their views, samplers) with nothing
+    /// done that must happen in GPU order (no picture or region made, nothing copied, uploaded
+    /// or rewritten; upload memory is filled later). The recorder takes it by the draw packet's
+    /// address and uses it when it was made for the same pipeline and user data and no
+    /// picture, region or mirror over what it binds was made or dropped since (and no memory
+    /// unmapped); then it does the ordered part (pending rewrites, copies in, upload memory).
+    struct PreparedDraw {
+        const void* packet = nullptr;
+        u32 epoch = 0;
+        const GraphicsPipeline* pipeline = nullptr;
+        std::array<u64, Shader::MaxStageTypes> stage_hashes{};
+        u64 image_generation = 0;
+        u64 buffer_seq = 0;
+        u64 unmap_gen = 0;
+        DrawBindings bindings;
+        boost::container::small_vector<Region*, 4> regions;
+        std::vector<std::pair<VAddr, VAddr>> image_ranges;
+        std::vector<std::pair<VAddr, VAddr>> buffer_ranges;
+        /// Upload memory (flattened user data, clip planes, D3 tables): bytes copied at commit
+        /// into the list's upload memory, and the buffer info that binds them.
+        struct Upload {
+            u32 info = 0;
+            u32 offset = 0;
+            u32 size = 0;
+            s32 flat_stage = -1; ///< >= 0: that stage's flattened user data, the recorder's
+        };
+        std::vector<u8> upload_bytes;
+        boost::container::small_vector<Upload, 4> uploads;
+        u32 null_images = 0;
+        /// OPT-011: vertex inputs and buffers and the index buffer (not for quad lists), as
+        /// ResolveVertexBuffers and ResolveIndices work them out; the V#s they came from (a
+        /// hash), the mirrors bound (copied in at commit) and the ranges read in place (mirror
+        /// candidates, noted at commit).
+        bool has_vertices = false;
+        std::unique_ptr<VertexIndexState> vertex_index;
+        u64 vertex_hash = 0;
+        bool indexed = false;
+        u32 index_offset = 0;
+        VAddr index_address = 0;
+        boost::container::small_vector<Mirror*, 4> mirrors;
+        boost::container::small_vector<std::pair<VAddr, u64>, 4> in_place;
+        void Reset();
+    };
+    /// OPT-010: the guest ranges whose region or mirror was made or dropped, by sequence number
+    /// (written and checked by the recorder; job threads read the sequence before looking up).
+    class ChangeLog {
+    public:
+        void Note(VAddr begin, VAddr end);
+        /// Whether none of the ranges changed after `since` (false when the log no longer
+        /// reaches back that far).
+        bool Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges) const;
+        u64 Seq() const {
+            return seq.load(std::memory_order_acquire);
+        }
+
+    private:
+        struct Entry {
+            u64 seq = 0;
+            VAddr begin = 0;
+            VAddr end = 0;
+        };
+        std::array<Entry, 1024> entries{};
+        std::atomic<u64> seq{0};
+    };
+    ChangeLog buffer_log;
+    /// OPT-010: regions and mirrors are added and removed under it (exclusive); job threads
+    /// look regions up under it (shared).
+    std::shared_mutex buffer_map_mutex;
+    struct PreparedShard {
+        std::mutex mutex;
+        std::unordered_map<const void*, PreparedDraw*> draws;
+    };
+    std::array<PreparedShard, 64> prepared_shards;
+    PreparedShard& ShardFor(const void* packet) {
+        return prepared_shards[(reinterpret_cast<u64>(packet) * 0x9E3779B97F4A7C15ULL) >> 58];
+    }
+    std::mutex prepared_pool_mutex;
+    std::vector<std::unique_ptr<PreparedDraw>> prepared_all;
+    std::vector<PreparedDraw*> prepared_free;
+    PreparedDraw* NewPrepared();
+    void FreePrepared(PreparedDraw* draw);
+    /// The prepared draw for the packet, taken out of the table (none if there is none).
+    PreparedDraw* TakePrepared(const void* packet);
+    bool PrepareBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs,
+                        Shader::Backend::Bindings& binding, PreparedDraw& p);
+    bool PrepareTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
+                         Shader::Backend::Bindings& binding, PreparedDraw& p);
+    bool PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
+                         const GraphicsPipeline& pipeline, const Shader::Info& vs,
+                         bool is_indexed, u32 index_offset);
+    /// A vertex or index range from a region, a mirror or guest memory read in place (none
+    /// when it would need ordered work).
+    std::optional<std::pair<vk::Buffer, u64>> JobVertexBuffer(VAddr address, u64 size,
+                                                              PreparedDraw& p,
+                                                              Mirror** mirror_out);
+    bool CommitPreparedVertices(PreparedDraw& p, const GraphicsPipeline& pipeline,
+                                const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
+                                bool quad_triangles);
+    static u64 VertexHash(const GraphicsPipeline& pipeline, const Shader::Info& vs,
+                          u32 step_rate_0, u32 step_rate_1);
+    /// GuestBufferLookup's lookups without its side effects: none when it would make a region,
+    /// gather or copy.
+    std::optional<std::pair<vk::Buffer, u64>> JobGuestBuffer(VAddr address, u64 size, bool write,
+                                                             PreparedDraw& p);
+    /// Recorder: whether the prepared draw holds for the draw being recorded (its ordered part
+    /// is then done).
+    bool CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pipeline,
+                        const AmdGpu::Regs& regs);
+    static u64 StageHash(const Shader::Info& info);
+    std::atomic<u64> shared_frame{0}; ///< OPT-010: `frame`, for job threads
+    std::atomic<u32> recorder_epoch{0};
+    struct PrepareStats {
+        std::atomic<u64> made{0}, failed{0}, replaced{0}, stale{0}, ns{0};
+    } prepare_stats;
 
     Rasterizer& r;
     std::unique_ptr<Native::Rhi::Device> device;
@@ -433,6 +575,14 @@ private:
         u64 timed_draws = 0;     ///< OPT-001
         u64 vertex_near = 0;     ///< OPT-004
         u64 vertex_skipped = 0;  ///< OPT-005
+        /// OPT-010: draws bound from a prepared draw, without one, and prepared draws not used:
+        /// another pipeline, other user data, memory unmapped, pictures or buffers changed.
+        u64 prepared_used = 0, prepared_missing = 0;
+        std::array<u64, 5> prepared_rejected{};
+        u64 prepared_vertices = 0, prepared_vertices_rejected = 0; ///< OPT-011
+        /// OPT-011: the record phase's parts: barrier choice, pass begin, dynamic state, vertex
+        /// and index binds, pipeline bind, descriptors and push constants, the draw, write notes.
+        std::array<u64, 8> record_ns{};
         u64 texture_memo_hits = 0, texture_lookups = 0; ///< OPT-002
         u64 buffer_memo_hits = 0;                        ///< OPT-003
         u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,

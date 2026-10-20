@@ -108,7 +108,16 @@ public:
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
                          VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
                          VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
-                         u32 step_rate_1) const;
+                         u32 step_rate_1) const {
+        GetVertexInputs(attributes, bindings, divisors, guest_buffers, step_rate_0, step_rate_1,
+                        GetStage(Shader::SwStage::Vertex));
+    }
+    /// OPT-011: the same with the vertex stage's info given (a game job thread's copy).
+    template <typename Attribute, typename Binding>
+    void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
+                         VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+                         VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
+                         u32 step_rate_1, const Shader::Info& vs_info) const;
 
 private:
     void BuildDescSetLayout(bool preloading);
