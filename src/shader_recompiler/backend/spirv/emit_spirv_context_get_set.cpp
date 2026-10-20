@@ -224,9 +224,13 @@ Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
         return ctx.OpLoad(ctx.U32[1], ctx.local_invocation_index);
     case IR::Attribute::SampleIndex:
         return ctx.OpLoad(ctx.U32[1], ctx.sample_index);
-    case IR::Attribute::SampleMask:
-        return ctx.OpLoad(ctx.U32[1],
-                          ctx.OpAccessChain(ctx.input_u32, ctx.sample_mask_in, ctx.u32_zero_value));
+    case IR::Attribute::SampleMask: {
+        const Id mask = ctx.OpLoad(
+            ctx.U32[1], ctx.OpAccessChain(ctx.input_u32, ctx.sample_mask_in, ctx.u32_zero_value));
+        return ctx.runtime_info.hw.fs.quad_sample_mask
+                   ? ctx.OpBitwiseAnd(ctx.U32[1], mask, ctx.quad_sample_mask)
+                   : mask;
+    }
     case IR::Attribute::RenderTargetIndex:
         return ctx.OpLoad(ctx.U32[1], ctx.output_layer);
     case IR::Attribute::PrimitiveId:
@@ -320,6 +324,12 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
     case IR::Attribute::Depth:
         return op_store(ctx.frag_depth);
     case IR::Attribute::SampleMask:
+        if (ctx.runtime_info.hw.fs.quad_sample_mask) {
+            ctx.OpStore(ctx.OpAccessChain(ctx.output_u32, ctx.sample_mask, ctx.u32_zero_value),
+                        ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpBitcast(ctx.U32[1], value),
+                                         ctx.quad_sample_mask));
+            return;
+        }
         return op_store(ctx.OpAccessChain(ctx.output_u32, ctx.sample_mask, ctx.u32_zero_value));
     case IR::Attribute::StencilRef:
         if (ctx.profile.supports_shader_stencil_export) {

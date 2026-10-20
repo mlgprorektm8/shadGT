@@ -11,6 +11,23 @@ namespace Shader::Backend::SPIRV {
 void EmitPrologue(EmitContext& ctx) {
     if (ctx.hw_stage == HwStage::Fragment) {
         ctx.DefineAmdPerVertexAttribs();
+        if (ctx.runtime_info.hw.fs.quad_sample_mask) {
+            const Id coordinates =
+                ctx.OpConvertFToU(ctx.U32[4], ctx.OpLoad(ctx.F32[4], ctx.frag_coord));
+            const Id x = ctx.OpBitwiseAnd(
+                ctx.U32[1], ctx.OpCompositeExtract(ctx.U32[1], coordinates, 0u), ctx.u32_one_value);
+            const Id y = ctx.OpBitwiseAnd(
+                ctx.U32[1], ctx.OpCompositeExtract(ctx.U32[1], coordinates, 1u), ctx.u32_one_value);
+            const Id row_ptr = ctx.OpAccessChain(
+                ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]), ctx.push_data_block,
+                ctx.ConstU32(PushData::QuadSampleMaskIndex), y);
+            const Id row = ctx.OpLoad(ctx.U32[1], row_ptr);
+            const Id shift = ctx.OpShiftLeftLogical(ctx.U32[1], x, ctx.ConstU32(4u));
+            ctx.quad_sample_mask = ctx.OpBitwiseAnd(
+                ctx.U32[1], ctx.OpShiftRightLogical(ctx.U32[1], row, shift), ctx.ConstU32(0xffffu));
+            ctx.OpStore(ctx.OpAccessChain(ctx.output_u32, ctx.sample_mask, ctx.u32_zero_value),
+                        ctx.quad_sample_mask);
+        }
     }
     if (ctx.info.loads.Get(IR::Attribute::WorkgroupIndex)) {
         ctx.DefineWorkgroupIndex();

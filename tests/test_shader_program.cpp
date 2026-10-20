@@ -64,6 +64,24 @@ TEST(ShaderProgram, KeepsDistinctResourceLayoutsAndStableMetadataForPermutations
     EXPECT_EQ(flatbuf_end.buffer, 1);
 }
 
+TEST(ShaderProgram, DoesNotReuseOpaqueShaderPermutationForQuadMaskedDraw) {
+    Vulkan::Program program;
+    auto opaque = MakeFragmentInfo(false);
+    auto opaque_spec = MakeSpec(*opaque);
+    program.AddPermut({}, std::move(opaque_spec), std::move(opaque));
+
+    auto masked = MakeFragmentInfo(false);
+    auto masked_spec = MakeSpec(*masked);
+    masked_spec.runtime_info.hw.fs.quad_sample_mask = true;
+    EXPECT_FALSE(program.modules[0].spec == masked_spec);
+    program.AddPermut({}, std::move(masked_spec), std::move(masked));
+
+    auto next_draw = MakeSpec(*program.modules[1].info);
+    next_draw.runtime_info.hw.fs.quad_sample_mask = true;
+    EXPECT_FALSE(program.modules[0].spec == next_draw);
+    EXPECT_TRUE(program.modules[1].spec == next_draw);
+}
+
 TEST(ShaderProgram, RetainsEachPreloadedPermutationsMetadataAtItsOriginalIndex) {
     Vulkan::Program program;
     auto flatbuf = MakeFragmentInfo(true);

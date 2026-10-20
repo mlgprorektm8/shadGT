@@ -260,6 +260,7 @@ public:
     Id frag_depth{};
     Id stencil_ref{};
     Id sample_mask{};
+    Id quad_sample_mask{};
     Id sample_mask_in{};
     Id helper_invocation{};
     Id sample_index{};

@@ -19,6 +19,9 @@ namespace Serialization {
 // Synthetic dual-source exports change the fragment shader interface. Version 13 adds the
 // general swizzled factor blend, which also changes the runtime color-buffer layout.
 static constexpr u32 ShaderBinaryVersion = 15u;
+static constexpr u32 ShaderBinaryVersionQuadSampleMask = 16u;
+static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::RuntimeInfo) == 312,
+              "Legacy metadata compatibility requires the runtime-info layout to stay unchanged");
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
 // Version 13: stored SRT walker code also records flattened source addresses.
 // Version 14: stored specializations no longer include compile-time runtime-info changes.
@@ -93,7 +96,8 @@ bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx) {
     }
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion) {
+    if (binary_version != Serialization::ShaderBinaryVersion &&
+        binary_version != Serialization::ShaderBinaryVersionQuadSampleMask) {
         return false;
     }
     u64 perm_hash{};
@@ -253,7 +257,10 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
-    meta.Write(Serialization::ShaderBinaryVersion);
+    const bool masked_fragment = spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
+                                 spec.runtime_info.hw.fs.quad_sample_mask;
+    meta.Write(masked_fragment ? Serialization::ShaderBinaryVersionQuadSampleMask
+                               : Serialization::ShaderBinaryVersion);
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -290,7 +297,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion) {
+    if (binary_version != Serialization::ShaderBinaryVersion &&
+        binary_version != Serialization::ShaderBinaryVersionQuadSampleMask) {
         return false;
     }
 
@@ -299,6 +307,10 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
+    if (binary_version == Serialization::ShaderBinaryVersion &&
+        spec.runtime_info.hw_stage == Shader::HwStage::Fragment) {
+        spec.runtime_info.hw.fs.quad_sample_mask = false;
+    }
     info.Deserialize(ar, perm_hash_ar,
                      meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags);
     info.resource_usage_known = false;

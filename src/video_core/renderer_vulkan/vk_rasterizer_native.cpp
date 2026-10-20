@@ -102,6 +102,7 @@ Shader::PushData UserData(const AmdGpu::Regs& regs) {
     push_data.xscale = regs.viewport_control.xscale_enable ? regs.viewports[0].xscale : 1.f;
     push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
     push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
+    push_data.quad_sample_mask = {regs.reg_array[0xa30e], regs.reg_array[0xa30f]}; // PA_SC_AA_MASK
     return push_data;
 }
 
@@ -3504,6 +3505,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     p.bindings.push.xscale = fresh.xscale;
     p.bindings.push.yoffset = fresh.yoffset;
     p.bindings.push.yscale = fresh.yscale;
+    p.bindings.push.quad_sample_mask = fresh.quad_sample_mask;
     stats.null_images += p.null_images;
     ++stats.prepared_used;
     return true;
