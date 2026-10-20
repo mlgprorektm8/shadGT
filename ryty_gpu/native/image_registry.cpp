@@ -194,17 +194,20 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             // the whole 1920x1080 picture: drawn into a picture of its own, that corner kept the
             // last frame's blurred result, the brightness the game measured there fell as the
             // interior's exposure rose, and the exposure ran away (black car screens).
+            // Only plain pictures of one format: a single-sample colour target of one mip and
+            // layer inside a larger one of the same format (scratch-pool reuse with other
+            // formats or samples broke the race minimaps).
             ImageEntry* largest = nullptr;
-            for (auto it = first; it != last; ++it) {
+            const bool plain = info.num_samples == 1 && !info.props.is_depth &&
+                               info.resources.levels == 1 && info.resources.layers == 1;
+            for (auto it = first; plain && it != last; ++it) {
                 const auto& c = it->second->info;
                 if (!it->second->from_cpu && it->second->image && c.pitch == info.pitch &&
                     c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
-                    c.num_samples == info.num_samples && c.props.is_depth == info.props.is_depth &&
-                    c.props.has_stencil == info.props.has_stencil && c.type == info.type &&
-                    c.resources.levels >= info.resources.levels &&
-                    c.resources.layers >= info.resources.layers &&
-                    c.size.width >= info.size.width && c.size.height >= info.size.height &&
-                    (!info.props.is_depth || c.pixel_format == info.pixel_format) &&
+                    c.num_samples == 1 && !c.props.is_depth && c.type == info.type &&
+                    c.pixel_format == info.pixel_format && c.resources.levels == 1 &&
+                    c.resources.layers == 1 && c.size.width >= info.size.width &&
+                    c.size.height >= info.size.height &&
                     (!largest || u64(c.size.width) * c.size.height >
                                      u64(largest->info.size.width) * largest->info.size.height)) {
                     largest = it->second.get();

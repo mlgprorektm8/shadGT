@@ -1513,9 +1513,13 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                         desc.view_info.range.extent.layers, desc.view_info.range.base.level);
         }
         out.colors[cb] = entry;
+        // FIX-154: the draw covers the target it names, not the larger picture it may share
+        // (a clear of the small one must leave the rest alone).
         const u32 mip = desc.view_info.range.base.level;
-        width = std::min<u32>(width, std::max(entry->info.size.width >> mip, 1u));
-        height = std::min<u32>(height, std::max(entry->info.size.height >> mip, 1u));
+        width = std::min<u32>(width, std::max(std::min(entry->info.size.width,
+                                                       desc.info.size.width) >> mip, 1u));
+        height = std::min<u32>(height, std::max(std::min(entry->info.size.height,
+                                                         desc.info.size.height) >> mip, 1u));
         num_layers = std::min<u32>(num_layers, desc.view_info.range.extent.layers);
         const VAddr cmask = col_buf.CmaskAddress();
         bool is_clear = false;
@@ -1570,8 +1574,9 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                 db.has_stencil = true;
                 db.stencil_clear = stencil_clear;
             }
-            width = std::min<u32>(width, entry->info.size.width);
-            height = std::min<u32>(height, entry->info.size.height);
+            width = std::min<u32>(width, std::min(entry->info.size.width, desc.info.size.width));
+            height =
+                std::min<u32>(height, std::min(entry->info.size.height, desc.info.size.height));
             num_layers = std::min<u32>(num_layers, desc.view_info.range.extent.layers);
             out.depth = entry;
         } else {
@@ -3864,8 +3869,12 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
                         .mipLevel = 0,
                         .baseArrayLayer = dst_desc.view_info.range.base.layer,
                         .layerCount = layers},
-        .extent{std::min(src->info.size.width, dst->info.size.width),
-                std::min(src->info.size.height, dst->info.size.height), 1},
+        // FIX-154: the targets the resolve names (they may share larger pictures).
+        .extent{std::min({src->info.size.width, dst->info.size.width, src_desc.info.size.width,
+                          dst_desc.info.size.width}),
+                std::min({src->info.size.height, dst->info.size.height,
+                          src_desc.info.size.height, dst_desc.info.size.height}),
+                1},
     };
     const vk::Image src_image{Handle<VkImage_T>(src->image->NativeHandle())};
     const vk::Image dst_image{Handle<VkImage_T>(dst->image->NativeHandle())};
