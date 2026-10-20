@@ -28,6 +28,7 @@
 #include "common/perf_monitor.h"
 #include "common/types.h"
 #include "core/debug_state.h"
+#include "core/memory.h"
 #include "input/trigger_feedback.h"
 
 namespace Vulkan {
@@ -1019,6 +1020,90 @@ void InstallTriggerTelemetry(u8* base) {
 }
 } // namespace
 
+namespace {
+// DIAG-161: GT Sport's fatal-error routine (eboot 0x1796f70: source file, line, message) throws the
+// error that ends the game: a script's System.ErrorAbort, a failed native assert. The game shows
+// the message nowhere and then shuts down as if the player quit (a player's window closed right
+// after the boot screen with nothing in the logs). Its entry now prints the message to stderr
+// first. The message is the game's string: an 8-byte header, then the text inline (capacity under
+// 16) or a pointer to it, the size at +0x18 and the capacity at +0x20.
+constexpr u64 kFatalError = 0x1796f70;
+constexpr u8 kFatalErrorPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                      0x56, 0x41, 0x55, 0x41, 0x54, 0x53};
+
+void PS4_SYSV_ABI FatalErrorHook(const char* file, s32 line, const u8* message) {
+    static std::atomic<u32> reported{0};
+    if (reported++ >= 20) {
+        return;
+    }
+    char where[256] = "?";
+    if (file) {
+        for (size_t i = 0; i + 1 < sizeof(where) && Core::RytyMemory::GuardedCopy(where + i, file + i, 1); ++i) {
+            if (where[i] == 0) {
+                break;
+            }
+            where[i + 1] = 0;
+        }
+    }
+    char text[2048] = "";
+    u64 header[5] = {};
+    if (message && Core::RytyMemory::GuardedCopy(header, message, sizeof(header))) {
+        const u64 size = std::min<u64>(header[3], sizeof(text) - 1);
+        const char* data = header[4] >= 0x10 ? reinterpret_cast<const char*>(header[1])
+                                             : reinterpret_cast<const char*>(message + 8);
+        if (size != 0 && Core::RytyMemory::GuardedCopy(text, data, size)) {
+            text[size] = 0;
+        }
+    }
+    std::fprintf(stderr, "[game] fatal error at %s(%d): %s\n", where, line, text);
+    std::fflush(stderr);
+}
+
+void InstallFatalErrorDiag(u8* base) {
+    u8* entry = base + kFatalError + kTextRvaShift;
+    if (std::memcmp(entry, kFatalErrorPrologue, sizeof(kFatalErrorPrologue)) != 0) {
+        std::fprintf(stderr, "[patch] DIAG-161: original bytes differ, not applied\n");
+        return;
+    }
+    u8* stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] DIAG-161: no memory near the game's code\n");
+        return;
+    }
+    // Saves the argument registers, calls the hook with the stack aligned, restores them, runs the
+    // 13 prologue bytes the jump replaced and jumps back after them.
+    std::vector<u8> code = {0x57, 0x56, 0x52, 0x51, 0x41, 0x50, 0x41, 0x51, // push rdi..r9
+                            0x48, 0x83, 0xec, 0x08,                         // sub rsp, 8
+                            0x48, 0xb8};                                    // mov rax, imm64
+    const u64 hook = reinterpret_cast<u64>(&FatalErrorHook);
+    code.insert(code.end(), reinterpret_cast<const u8*>(&hook), reinterpret_cast<const u8*>(&hook) + 8);
+    code.insert(code.end(), {0xff, 0xd0,                                    // call rax
+                             0x48, 0x83, 0xc4, 0x08,                        // add rsp, 8
+                             0x41, 0x59, 0x41, 0x58, 0x59, 0x5a, 0x5e, 0x5f}); // pop r9..rdi
+    code.insert(code.end(), std::begin(kFatalErrorPrologue), std::end(kFatalErrorPrologue));
+    code.insert(code.end(), {0xff, 0x25, 0, 0, 0, 0});                      // jmp [rip]
+    const u64 back = reinterpret_cast<u64>(entry + sizeof(kFatalErrorPrologue));
+    code.insert(code.end(), reinterpret_cast<const u8*>(&back), reinterpret_cast<const u8*>(&back) + 8);
+    std::memcpy(stub, code.data(), code.size());
+    FlushInstructionCache(GetCurrentProcess(), stub, code.size());
+    u8 jump[sizeof(kFatalErrorPrologue)];
+    std::memset(jump, 0x90, sizeof(jump));
+    jump[0] = 0xe9;
+    const s32 rel = static_cast<s32>(stub - (entry + 5));
+    std::memcpy(jump + 1, &rel, 4);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(entry, sizeof(jump), PAGE_EXECUTE_READWRITE, &old_protect)) {
+        return;
+    }
+    std::memcpy(entry, jump, sizeof(jump));
+    DWORD ignored = 0;
+    VirtualProtect(entry, sizeof(jump), old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(jump));
+    std::fprintf(stderr, "[patch] DIAG-161 fatal-error message applied at %#llx\n",
+                 static_cast<unsigned long long>(kFatalError));
+}
+} // namespace
+
 void RytyApplyGamePatches() {
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
@@ -1031,6 +1116,7 @@ void RytyApplyGamePatches() {
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallFatalErrorDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!(std::getenv("RYGT_DECALS") && std::getenv("RYGT_DECALS")[0] == '0')) {
         SyncDecals();
     }
