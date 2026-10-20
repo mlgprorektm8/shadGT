@@ -1969,7 +1969,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     {
         PhaseTimer t{Phase::Descriptors};
-        pipeline->BindResources(ctx->set_writes, ctx->push_data);
+        pipeline->BindResources(ctx->set_writes, ctx->set_write_sets, ctx->push_data);
     }
     {
         PhaseTimer t{Phase::DynamicState};
@@ -2267,7 +2267,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         runtime.FlushBarriers();
     }
 
-    pipeline->BindResources(ctx->set_writes, ctx->push_data);
+    pipeline->BindResources(ctx->set_writes, ctx->set_write_sets, ctx->push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
@@ -2342,7 +2342,7 @@ void Rasterizer::DispatchDirect() {
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(ctx->set_writes, ctx->push_data);
+    pipeline->BindResources(ctx->set_writes, ctx->set_write_sets, ctx->push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -2390,7 +2390,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(ctx->set_writes, ctx->push_data);
+    pipeline->BindResources(ctx->set_writes, ctx->set_write_sets, ctx->push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -3330,6 +3330,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 #endif
     ctx->set_write_index = 0;
     ctx->set_writes.clear();
+    ctx->set_write_sets.clear(); // SHD-002
     ctx->buffer_infos.clear();
     ctx->image_infos.clear();
     ctx->bound_textures.clear();
@@ -3355,7 +3356,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         ctx->set_writes.resize(ctx->set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
-        stage_bindings[i] = PlanStageResourceBindings(*stage, binding);
+        ctx->set_write_sets.resize(ctx->set_writes.size()); // SHD-002
+        // SHD-002: each stage binds in its own set, from its own start.
+        stage_bindings[i] =
+            PlanStageResourceBindings(*stage, Shader::Backend::StageStart(u32(stage->sw_stage)));
         auto buffer_binding = stage_bindings[i].buffers;
         Common::PhaseTimer t{Common::Phase::Buffers};
         BindBuffers(*stage, buffer_binding, ctx->push_data);
@@ -4388,6 +4392,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         }
 
+        ctx->set_write_sets[ctx->set_write_index] =
+            u8(Shader::Backend::StageSet(u32(stage.sw_stage))); // SHD-002
         auto& set_write = ctx->set_writes[ctx->set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified++;
@@ -4957,6 +4963,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (u32 array_size : image_descriptor_array_sizes) {
         const auto& [_, desc] = ctx->image_bindings[image_binding_idx];
         const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        ctx->set_write_sets[ctx->set_write_index] =
+            u8(Shader::Backend::StageSet(u32(stage.sw_stage))); // SHD-002
         auto& set_write = ctx->set_writes[ctx->set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified;
@@ -4991,6 +4999,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto vk_sampler =
             texture_cache.GetSampler(ssharp, liverpool->DrawRegs().ta_bc_base, sampler.is_depth);
         ctx->image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+        ctx->set_write_sets[ctx->set_write_index] =
+            u8(Shader::Backend::StageSet(u32(stage.sw_stage))); // SHD-002
         auto& set_write = ctx->set_writes[ctx->set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified++;

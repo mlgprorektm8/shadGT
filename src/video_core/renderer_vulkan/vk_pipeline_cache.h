@@ -433,7 +433,13 @@ private:
         u64 deferred{};
         u64 installed{};
         u64 skipped_draws{};
+        u64 skipped_translating{}; ///< SHD-005
     } async_stats;
+    /// SHD-005: a draw of a race skipped while its new shader translates on a worker, instead of
+    /// the command thread waiting for the translation.
+    bool SkipTranslationWait(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
+    tsl::robin_map<u64, bool> code_writes_memory; ///< by program hash
+    bool translation_skipped{};
     struct PrewarmStats {
         u64 installed{};
         u64 skipped{};

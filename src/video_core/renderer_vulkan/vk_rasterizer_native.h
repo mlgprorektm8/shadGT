@@ -122,6 +122,7 @@ private:
     /// The bindings of one draw or dispatch.
     struct DrawBindings {
         Pipeline::DescriptorWrites writes;
+        Pipeline::WriteSets write_sets; ///< SHD-002: the set of each write
         boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffers;
         boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> images;
         Shader::PushData push{};

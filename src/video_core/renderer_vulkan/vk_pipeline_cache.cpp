@@ -406,6 +406,47 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     return num_outputs;
 }
 
+/// SHD-004: a color target as far as a pixel shader's translation reads it: the export format,
+/// the number class of the output, the conversion, which source channel each channel takes (a
+/// constant channel, as formats without alpha have, takes its own, as the translation does) and
+/// the blend emulation. A target the draw doesn't bind is translated as a float target with the
+/// usual packed export (its writes go nowhere: the pass has no attachment there), so a pixel
+/// shader translates the same into passes with one target or two and into float targets of other
+/// formats (two in five of GT Sport's pixel shader translations differed only in that).
+static Shader::PsColorBuffer TranslationColorBuffer(const Shader::PsColorBuffer& cb,
+                                                    bool unorm_fixup) {
+    if (unorm_fixup || cb.blend_self_scale || cb.blend_swizzled_alpha ||
+        cb.blend_swizzled_factors) {
+        return cb; // these read the target's format too
+    }
+    Shader::PsColorBuffer out{};
+    out.data_format = AmdGpu::DataFormat::Format16_16_16_16;
+    if (cb.data_format == AmdGpu::DataFormat::FormatInvalid) {
+        out.num_format = AmdGpu::NumberFormat::Float;
+        out.export_format = AmdGpu::ShaderExportFormat::ABGR_FP16;
+        out.swizzle = AmdGpu::IdentityMapping;
+        return out;
+    }
+    switch (AmdGpu::GetNumberClass(cb.num_format)) {
+    case AmdGpu::NumberClass::Uint:
+        out.num_format = AmdGpu::NumberFormat::Uint;
+        break;
+    case AmdGpu::NumberClass::Sint:
+        out.num_format = AmdGpu::NumberFormat::Sint;
+        break;
+    default:
+        out.num_format = AmdGpu::NumberFormat::Float;
+        break;
+    }
+    out.num_conversion = cb.num_conversion;
+    out.export_format = cb.export_format;
+    for (u32 i = 0; i < 4; ++i) {
+        out.swizzle.array[i] =
+            AmdGpu::CompSwizzle(u32(AmdGpu::CompSwizzle::Red) + cb.swizzle.Map(i));
+    }
+    return out;
+}
+
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = S().runtime_infos[u32(l_stage)];
     const auto& regs = Regs();
@@ -526,7 +567,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             };
         }
         for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
-            info.hw.fs.color_buffers[i] = S().graphics_key.color_buffers[i];
+            info.hw.fs.color_buffers[i] = TranslationColorBuffer(
+                S().graphics_key.color_buffers[i], profile.needs_unorm_fixup); // SHD-004
         }
         // Lowered user clip planes ride the same emulation path as guest-exported distances, so
         // the fragment side arms whenever the hardware vertex stage lowers them, keeping its input
@@ -667,7 +709,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             use_stored_shaders = true;
             // D10: the old renderer's translations stand in while the new renderer's are built.
             // SHADGT_LEGACY_FALLBACK=0 turns it off.
-            if (profile.direct_buffers) {
+            // SHD-002: not with stage descriptor sets: the old translations bind everything
+            // in set 0.
+            if (profile.direct_buffers && false) {
                 const char* fallback_env = std::getenv("SHADGT_LEGACY_FALLBACK");
                 if (!fallback_env || fallback_env[0] != '0') {
                     Storage::DataBase::Legacy().OpenLegacy();
@@ -1677,6 +1721,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     defer_misses = AsyncTranslation();
     deferred_miss = false;
     fallback_miss = false;
+    translation_skipped = false; // SHD-005
     bool key_valid = RefreshGraphicsKey();
     // D10: a new translation this draw needs is being made; the old renderer's draw it.
     if (!key_valid && fallback_miss) {
@@ -1711,8 +1756,19 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         deferred_miss = false;
         key_valid = RefreshGraphicsKey();
+        if (!key_valid && translation_skipped) {
+            break; // SHD-005
+        }
     }
     defer_misses = false;
+    if (!key_valid && translation_skipped) {
+        // SHD-005: skipped while its shaders translate; a later draw takes them.
+        deferred_miss = false;
+        translation_skipped = false;
+        ++async_stats.skipped_translating;
+        NoteSkippedDraw();
+        return nullptr;
+    }
     if (!key_valid && deferred_miss) {
         deferred_miss = false;
         key_valid = RefreshGraphicsKey();
@@ -2996,12 +3052,16 @@ void PipelineCache::ReportPrewarm(std::chrono::steady_clock::time_point now) {
     if (now - stats.since < std::chrono::seconds{2}) {
         return;
     }
-    if (async_stats.deferred + async_stats.installed + async_stats.skipped_draws != 0) {
+    if (async_stats.deferred + async_stats.installed + async_stats.skipped_draws +
+            async_stats.skipped_translating !=
+        0) {
         LOG_WARNING(Render_Vulkan,
                     "PERF-076 background pipelines in {:.1f} s: {} new ones built without a wait, "
-                    "{} ready and installed, {} draws skipped meanwhile",
+                    "{} ready and installed, {} draws skipped meanwhile; SHD-005: {} draws "
+                    "skipped while their shaders translated",
                     std::chrono::duration<double>(now - stats.since).count(),
-                    async_stats.deferred, async_stats.installed, async_stats.skipped_draws);
+                    async_stats.deferred, async_stats.installed, async_stats.skipped_draws,
+                    async_stats.skipped_translating);
         async_stats = {};
     }
     const u64 built = prewarm_built.load();
@@ -3433,6 +3493,24 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
     return sane;
 }
 
+bool PipelineCache::SkipTranslationWait(SwStage sw_stage, const Shader::ShaderParams& params) {
+    // SHD-005: as a race's draws are skipped while their new pipeline builds (PERF-076), a draw
+    // whose new shader still translates on a worker is skipped too, instead of the command thread
+    // waiting for it (GT Sport's first race on a track stopped for 100-300 ms whenever a few
+    // dozen new shaders came at once). Not compute, and not a shader that writes memory (later
+    // work reads what it writes). -DisablePerf 171 waits as before.
+    static const bool enabled = Common::PerfFeatureEnabled(171);
+    if (!enabled || regs_override != nullptr || sw_stage == SwStage::Compute ||
+        !AsyncTranslation() || !AsyncPipelines() || MenusWait()) {
+        return false;
+    }
+    auto [it, inserted] = code_writes_memory.try_emplace(params.hash, false);
+    if (inserted) {
+        it.value() = Shader::HasMemoryWrites(params.code);
+    }
+    return !it->second;
+}
+
 bool PipelineCache::AsyncTranslation() const {
     // FIX-078: -DisablePerf 102 translates on the command thread as before. Dumped, collected or
     // patched shaders need their permutation index while they are translated.
@@ -3749,6 +3827,9 @@ PipelineCache::Result PipelineCache::GetProgramForJob(HwStage hw_stage,
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
+    // SHD-002: a stage's bindings start where its own descriptor set does, whatever the stages
+    // before it bound.
+    binding = Shader::Backend::StageStart(u32(sw_stage));
     auto runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
     if (t_lookup_only) {
         return GetProgramForJob(hw_stage, params, runtime_info, binding); // NAT-031
@@ -3815,7 +3896,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     // first waits for any still running, as one of them is likely the permutation it needs.
     // D10: with the fallback a draw does not wait for translations in progress (the old
     // translations draw meanwhile); only when there are none (fallback_nested).
-    HarvestTranslations(params.hash, regs_override == nullptr && !force_legacy &&
+    const bool skip_wait = SkipTranslationWait(sw_stage, params); // SHD-005
+    HarvestTranslations(params.hash, regs_override == nullptr && !force_legacy && !skip_wait &&
                                          (!legacy_fallback || fallback_nested));
     // D10: a key is made of new translations only, or (forced) of old ones only.
     if (force_legacy) {
@@ -3979,16 +4061,19 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             fallback_miss = true;
             return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
         }
-        if (read_ahead || defer_misses) {
+        if (read_ahead || defer_misses || skip_wait) {
             // A shader an upcoming draw needs (or this draw, which looks again once the next
             // draws' shaders are queued too); translated on a worker while this thread reads
-            // on. No key without it: the state is skipped for now.
-            if (!S().stage_deferred) {
+            // on. No key without it: the state is skipped for now. SHD-005: a stage's bindings
+            // no longer follow from the stages before it, so a race queues every missing stage
+            // of the draw at once and skips it.
+            if (!S().stage_deferred || skip_wait) {
                 S().stage_deferred = true;
                 QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding);
             }
             if (!read_ahead) {
                 deferred_miss = true;
+                translation_skipped |= skip_wait;
             }
             return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
         }

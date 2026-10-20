@@ -69,10 +69,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .size = sizeof(Shader::PushData),
     };
 
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
-    const auto flags = uses_push_descriptors
-                           ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-                           : vk::DescriptorSetLayoutCreateFlagBits{};
+    const bool push = binding < instance.MaxPushDescriptors();
+    push_set = push ? 0u : NoPushSet;
+    const auto flags = push ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+                            : vk::DescriptorSetLayoutCreateFlagBits{};
     const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
         .flags = flags,
         .bindingCount = static_cast<u32>(bindings.size()),
@@ -84,9 +84,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     ASSERT_MSG(descriptor_set_result == vk::Result::eSuccess,
                "Failed to create compute descriptor set layout: {}",
                vk::to_string(descriptor_set_result));
-    desc_layout = std::move(descriptor_set);
+    desc_layouts[0] = std::move(descriptor_set);
+    set_layouts[0] = *desc_layouts[0];
 
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
+    const vk::DescriptorSetLayout set_layout = set_layouts[0];
     const vk::PipelineLayoutCreateInfo layout_info = {
         .setLayoutCount = 1U,
         .pSetLayouts = &set_layout,

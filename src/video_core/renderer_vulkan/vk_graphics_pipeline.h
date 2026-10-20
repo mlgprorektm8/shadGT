@@ -132,9 +132,12 @@ private:
         std::array<vk::UniquePipeline, 2> owned_libraries;
         std::future<void> optimized;
     };
-    /// PERF-018: hash of the descriptor set layout's bindings, so shader libraries are shared
-    /// only between pipelines with identically defined layouts.
-    u64 desc_layout_hash{};
+    /// PERF-018 / SHD-002: hashes of the stage set layouts' bindings, so a shader library is
+    /// shared between pipelines whose sets for its stages are identically defined.
+    std::array<u64, Shader::Backend::MaxDescriptorSets> set_layout_hashes{};
+    /// SHD-002: the layout of sets between stage sets (no bindings).
+    vk::UniqueDescriptorSetLayout empty_set_layout;
+    u32 num_sets = 0;
     std::unique_ptr<LibraryLink> library_link;
 
     GraphicsPipelineKey key;

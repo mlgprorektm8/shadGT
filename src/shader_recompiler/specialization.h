@@ -177,7 +177,11 @@ struct StageSpecialization {
                 }
                 spec.num_conversion = sharp.GetNumberConversion();
                 spec.num_bindings = desc.NumBindings(*info);
-            });
+            },
+            // SHD-003: an empty slot records the null image translation saw (a 2D float image),
+            // so a texture bound there later that translates the same way matches instead of
+            // getting a new translation (one in 16 pixel shader translations was such a copy).
+            true);
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.width = sharp.width;

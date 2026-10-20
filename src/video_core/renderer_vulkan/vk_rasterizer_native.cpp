@@ -253,6 +253,7 @@ bool NativeModeRequested() {
 
 void NativeRenderer::DrawBindings::Clear() {
     writes.clear();
+    write_sets.clear();
     buffers.clear();
     images.clear();
     push = {};
@@ -1486,7 +1487,9 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
         if (!stage) {
             continue;
         }
-        plans[i] = PlanStageResourceBindings(*stage, binding);
+        // SHD-002: each stage binds in its own set, from its own start.
+        plans[i] = PlanStageResourceBindings(*stage,
+                                             Shader::Backend::StageStart(u32(stage->sw_stage)));
         auto buffer_binding = plans[i].buffers;
         PhaseClock clock{stats.phase_ns[2]};
         BindBuffers(*stage, regs, compute, buffer_binding, b);
@@ -1628,6 +1631,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             }
         }
         b.buffers.push_back(info);
+        b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{
             .dstSet = VK_NULL_HANDLE,
             .dstBinding = binding.unified++,
@@ -1649,6 +1653,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         const u32 first = static_cast<u32>(b.images.size());
         const bool storage = image_desc.is_written;
         const auto add_write = [&] {
+            b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
             b.writes.push_back(vk::WriteDescriptorSet{
                 .dstSet = VK_NULL_HANDLE,
                 .dstBinding = binding.unified,
@@ -1754,6 +1759,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         }
         b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
                             vk::ImageLayout::eGeneral});
+        b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{
             .dstSet = VK_NULL_HANDLE,
             .dstBinding = binding.unified++,
@@ -1775,40 +1781,54 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     if (b.writes.empty()) {
         return;
     }
-    if (pipeline.UsesPushDescriptors()) {
-        cmdbuf.pushDescriptorSetKHR(bind_point, pipeline.GetLayout(), 0, b.writes);
-        return;
+    // SHD-002: each stage's writes go to its own set; one set may be pushed.
+    std::array<boost::container::small_vector<vk::WriteDescriptorSet, 32>,
+               Shader::Backend::MaxDescriptorSets>
+        by_set;
+    for (size_t i = 0; i < b.writes.size(); ++i) {
+        by_set[i < b.write_sets.size() ? b.write_sets[i] : 0].push_back(b.writes[i]);
     }
     const vk::Device vk_device = r.instance.GetDevice();
-    const vk::DescriptorSetLayout layout = pipeline.DescriptorSetLayout();
-    vk::DescriptorSet set{};
-    for (u32 attempt = 0; attempt < 2 && !set; ++attempt) {
-        if (s.pools.empty() || attempt == 1) {
-            s.pools.push_back(TakeDescriptorPool());
+    for (u32 index = 0; index < by_set.size(); ++index) {
+        auto& writes = by_set[index];
+        if (writes.empty()) {
+            continue;
         }
-        vk::DescriptorSetAllocateInfo alloc{
-            .descriptorPool = s.pools.back(),
-            .descriptorSetCount = 1,
-            .pSetLayouts = &layout,
-        };
-        VkDescriptorSet raw{};
-        if (vk_device.allocateDescriptorSets(&alloc, reinterpret_cast<vk::DescriptorSet*>(&raw)) ==
-            vk::Result::eSuccess) {
-            set = raw;
+        if (index == pipeline.PushSet()) {
+            cmdbuf.pushDescriptorSetKHR(bind_point, pipeline.GetLayout(), index, writes);
+            continue;
         }
-    }
-    if (!set) {
-        static std::atomic<u32> logged{};
-        if (Sample(logged)) {
-            LOG_ERROR(Render_Vulkan, "NAT-100: no descriptor set for a draw");
+        const vk::DescriptorSetLayout layout = pipeline.SetLayout(index);
+        vk::DescriptorSet set{};
+        for (u32 attempt = 0; attempt < 2 && !set; ++attempt) {
+            if (s.pools.empty() || attempt == 1) {
+                s.pools.push_back(TakeDescriptorPool());
+            }
+            vk::DescriptorSetAllocateInfo alloc{
+                .descriptorPool = s.pools.back(),
+                .descriptorSetCount = 1,
+                .pSetLayouts = &layout,
+            };
+            VkDescriptorSet raw{};
+            if (vk_device.allocateDescriptorSets(&alloc,
+                                                 reinterpret_cast<vk::DescriptorSet*>(&raw)) ==
+                vk::Result::eSuccess) {
+                set = raw;
+            }
         }
-        return;
+        if (!set) {
+            static std::atomic<u32> logged{};
+            if (Sample(logged)) {
+                LOG_ERROR(Render_Vulkan, "NAT-100: no descriptor set for a draw");
+            }
+            continue;
+        }
+        for (auto& write : writes) {
+            write.dstSet = set;
+        }
+        vk_device.updateDescriptorSets(writes, {});
+        cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, set, {});
     }
-    for (auto& write : b.writes) {
-        write.dstSet = set;
-    }
-    vk_device.updateDescriptorSets(b.writes, {});
-    cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), 0, set, {});
 }
 
 /// A draw's vertex and index buffers: looked up before its pass starts (a lookup may gather on

@@ -115,7 +115,8 @@ void DataBase::Open() {
         cache_path = GetUserPath(PathType::CacheDir) / game_info.GameSerial();
         // D2: direct-memory shaders differ from the stored ones, which load unchecked.
         if (VideoCore::DirectMemory::Enabled()) {
-            cache_path += "-direct";
+            // SHD-002: stage descriptor sets: translations of their own.
+            cache_path += "-direct-sets";
         }
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);

@@ -568,6 +568,7 @@ private:
         boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> diag_storage_images;
         u32 set_write_index{};
         Pipeline::DescriptorWrites set_writes;
+        Pipeline::WriteSets set_write_sets; // SHD-002
         Shader::PushData push_data;
         vk::ImageAspectFlags attachment_feedback_loop{};
         bool needs_barrier{};

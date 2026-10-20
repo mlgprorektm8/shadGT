@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 
 #include "shader_recompiler/resource.h"
@@ -19,7 +20,7 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
 
 Pipeline::~Pipeline() = default;
 
-void Pipeline::BindResources(DescriptorWrites& set_writes,
+void Pipeline::BindResources(DescriptorWrites& set_writes, const WriteSets& write_sets,
                              const Shader::PushData& push_data) const {
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
@@ -33,17 +34,29 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         return;
     }
 
-    if (uses_push_descriptors) {
-        cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
-        return;
+    // SHD-002: each stage's writes go to its own set.
+    std::array<boost::container::small_vector<vk::WriteDescriptorSet, 32>,
+               Shader::Backend::MaxDescriptorSets>
+        by_set;
+    for (size_t i = 0; i < set_writes.size(); ++i) {
+        by_set[i < write_sets.size() ? write_sets[i] : 0].push_back(set_writes[i]);
     }
-
-    const auto desc_set = desc_heap.Commit(*desc_layout);
-    for (auto& set_write : set_writes) {
-        set_write.dstSet = desc_set;
+    for (u32 set = 0; set < by_set.size(); ++set) {
+        auto& writes = by_set[set];
+        if (writes.empty()) {
+            continue;
+        }
+        if (set == push_set) {
+            cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, set, writes);
+            continue;
+        }
+        const auto desc_set = desc_heap.Commit(set_layouts[set]);
+        for (auto& set_write : writes) {
+            set_write.dstSet = desc_set;
+        }
+        instance.GetDevice().updateDescriptorSets(writes, {});
+        cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, set, desc_set, {});
     }
-    instance.GetDevice().updateDescriptorSets(set_writes, {});
-    cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, 0, desc_set, {});
 }
 
 std::string Pipeline::GetDebugString() const {

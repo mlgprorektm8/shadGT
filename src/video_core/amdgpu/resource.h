@@ -320,6 +320,17 @@ struct Image {
         if (base_type == ImageType::Color2DArray && !is_array) {
             return ImageType::Color2D;
         }
+        // SHD-003: a 1D or 2D image read by an array instruction (DA) is viewed as an array of
+        // one layer, as an array image would be, so the shader's translation doesn't depend on
+        // which of the two the game binds (GT Sport binds both to the same slots; one in five
+        // pixel shader translations was such a copy). The hardware ignores the slice of a 2D
+        // image; the one-layer view clamps it to that layer.
+        if (base_type == ImageType::Color1D && is_array) {
+            return ImageType::Color1DArray;
+        }
+        if (base_type == ImageType::Color2D && is_array) {
+            return ImageType::Color2DArray;
+        }
         if (base_type == ImageType::Color2DMsaaArray && !is_array) {
             return ImageType::Color2DMsaa;
         }
