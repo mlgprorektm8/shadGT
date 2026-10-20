@@ -620,6 +620,45 @@ void NoteProjectScript(const u8* data, s64 read) {
     }
 }
 
+// DIAG-163: the first 60 scripts the game loads, with their source path and the time since the
+// first one, so a boot that ends early shows how far its scripts got. RYGT_LOG_BOOT=0 turns it off.
+void NoteBootScript(const u8* data, s64 read) {
+    static const bool off = std::getenv("RYGT_LOG_BOOT") && std::getenv("RYGT_LOG_BOOT")[0] == '0';
+    static std::atomic<int> count{0};
+    static const auto first = std::chrono::steady_clock::now();
+    if (off || read < 16 || std::memcmp(data, "ADCH012", 8) != 0) {
+        return;
+    }
+    const int number = ++count;
+    if (number > 60) {
+        return;
+    }
+    // After the header: the symbol count (one byte, plus one more per leading 1 bit of the first,
+    // as ScriptKey reads it), then length-prefixed names; the first is the compiled unit
+    // (_build/.works/gt7sp/network/network.adl, out/.work/projects/gt7sp/gallery/_tmp_gallery.adi).
+    size_t at = 9;
+    for (u8 b = data[8]; b & 0x80; b <<= 1) {
+        ++at;
+    }
+    std::string name = "?";
+    if (at < size_t(read) && !(data[at] & 0x80) && at + 1 + data[at] <= size_t(read)) {
+        name.assign(reinterpret_cast<const char*>(data + at + 1), data[at]);
+    }
+    for (const std::string_view prefix : {"_build/.works/", "out/.work/"}) {
+        if (name.starts_with(prefix)) {
+            name.erase(0, prefix.size());
+        }
+    }
+    for (char& c : name) {
+        c = (c >= 32 && c < 127) ? c : '.';
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - first)
+                        .count();
+    std::fprintf(stderr, "[boot] script %d (+%lld ms): %s\n", number, static_cast<long long>(ms),
+                 name.c_str());
+}
+
 s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     const s64 read = g_file_read(file, iov);
     if (read <= 0 || !iov || !iov->base) {
@@ -630,6 +669,7 @@ s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     if (!g_script_replacements.empty()) {
         ServeReplacement(file, begin, read);
     }
+    NoteBootScript(begin, read); // DIAG-163
     NoteProjectScript(begin, read); // FIX-110
     static const bool log_scripts = std::getenv("RYGT_LOG_SCRIPTS") != nullptr;
     if (log_scripts) {
