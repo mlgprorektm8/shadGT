@@ -249,6 +249,8 @@ public:
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
+    /// Release whole sparse allocations covered by an explicit guest unmap, on the recorder.
+    void ReleaseUnmappedArenaMemory(VAddr address, u64 size);
 
     /// FIX-017: before a quad-list draw's uploads, compares its vertex pages with the guest
     /// bytes they were last uploaded from and uploads again the ones that changed unnoticed.

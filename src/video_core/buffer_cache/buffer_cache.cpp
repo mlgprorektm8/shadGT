@@ -3784,6 +3784,94 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     return true;
 }
 
+void BufferCache::ReleaseUnmappedArenaMemory(VAddr address, u64 size) {
+    if (size == 0 || address > ~u64{0} - size) return;
+    std::scoped_lock buffer_lock{mutex};
+    const u64 first = Common::AlignUp(address, u64{block_size}) >> block_shift;
+    const u64 end = (address + size) >> block_shift;
+    if (first >= end) return;
+
+    // One VkDeviceMemory allocation can back several disjoint resident ranges.
+    // Release it only if ALL of its ranges are inside this explicit guest unmap.
+    std::map<vk::DeviceMemory, bool> whole;
+    bool overlaps = false;
+    for (const auto& range : resident_ranges) {
+        const bool covered = range.start >= first && range.end <= end;
+        auto [it, inserted] = whole.try_emplace(range.memory, true);
+        it->second &= covered;
+        overlaps |= covered;
+    }
+    if (!overlaps) return;
+    std::vector<Backing> released;
+    IntervalList<Backing> retained;
+    for (const auto& range : resident_ranges) {
+        if (whole[range.memory]) released.push_back(range);
+        else retained.Add(range);
+    }
+    if (released.empty()) return;
+
+    // The recorder owns this call. Finish prior commands and their sparse binds
+    // before removing backing memory; unload synchronization is intentionally rare.
+    scheduler.Finish();
+    std::vector<ArenaBinds> unbinds;
+    unbinds.reserve(arenas.size());
+    for (const auto& arena : arenas) {
+        ArenaBinds item{&arena};
+        for (const auto& range : released) {
+            const u64 begin_addr = std::max(range.start << block_shift, arena.cpu_addr);
+            const u64 end_addr = std::min(range.end << block_shift,
+                                         arena.cpu_addr + arena.size_bytes);
+            if (begin_addr < end_addr) {
+                item.binds.push_back(vk::SparseMemoryBind{
+                    .resourceOffset = begin_addr - arena.cpu_addr,
+                    .size = end_addr - begin_addr,
+                    .memory = {},
+                });
+            }
+        }
+        if (!item.binds.empty()) unbinds.push_back(std::move(item));
+    }
+    std::vector<vk::SparseBufferMemoryBindInfo> infos;
+    for (const auto& item : unbinds) {
+        infos.push_back({item.arena->Handle(), static_cast<u32>(item.binds.size()), item.binds.data()});
+    }
+    const auto device = instance.GetDevice();
+    const auto fence = Vulkan::Check(device.createFence({}));
+    const vk::BindSparseInfo sparse_info{
+        .bufferBindCount = static_cast<u32>(infos.size()),
+        .pBufferBinds = infos.data(),
+    };
+    {
+        std::scoped_lock queue_lock{Vulkan::Scheduler::submit_mutex};
+        const auto result = instance.GetGraphicsQueue().bindSparse(sparse_info, fence);
+        ASSERT_MSG(result == vk::Result::eSuccess, "Sparse unbind failed: {}", vk::to_string(result));
+    }
+    const auto waited = device.waitForFences(fence, true, ~u64{0});
+    ASSERT_MSG(waited == vk::Result::eSuccess, "Sparse unbind wait failed: {}", vk::to_string(waited));
+    device.destroyFence(fence);
+    resident_ranges = std::move(retained);
+    u64 freed_bytes = 0;
+    for (const auto& range : released) {
+        const VAddr start = range.start << block_shift;
+        const u64 bytes = (range.end - range.start) << block_shift;
+        freed_bytes += bytes;
+        runtime.FillBuffer(bda_pagetable_buffer.get(), range.start * sizeof(vk::DeviceAddress),
+                           (range.end - range.start) * sizeof(vk::DeviceAddress), 0u);
+        gpu_modified_ranges.Subtract(start, bytes);
+        memory_tracker->UnmarkRegionAsGpuModified(start, bytes, false);
+        memory_tracker->MarkRegionAsCpuModified(start, bytes);
+        std::scoped_lock uploaded_lock{uploaded_pages_mutex};
+        for (VAddr page = start; page < start + bytes; page += 4_KB) {
+            uploaded_page_contents.Forget(page);
+        }
+    }
+    for (auto& memo : arena_memos) memo = {};
+    for (const auto& [allocation, complete] : whole) {
+        if (complete) device.freeMemory(allocation);
+    }
+    LOG_DEBUG(Render_Vulkan, "Released {} MiB of unmapped sparse buffer backing", freed_bytes >> 20);
+}
+
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     std::scoped_lock buffer_lock{mutex}; // PERF-067
     if (pending_binds.empty()) {

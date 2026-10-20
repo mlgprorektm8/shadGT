@@ -5141,9 +5141,13 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     // as CPU fault flushes already do. -DisablePerf 35 frees them here.
     static const bool unmap_on_gpu_thread = Common::PerfFeatureEnabled(35);
     if (unmap_on_gpu_thread && !IsGpuThread()) {
-        liverpool->SendCommand<true>([&] { texture_cache.UnmapMemory(addr, size); });
+        liverpool->SendCommand<true>([&] {
+            texture_cache.UnmapMemory(addr, size);
+            buffer_cache.ReleaseUnmappedArenaMemory(addr, size);
+        });
     } else {
         texture_cache.UnmapMemory(addr, size);
+        buffer_cache.ReleaseUnmappedArenaMemory(addr, size);
     }
     {
         std::scoped_lock lock{mapped_ranges_mutex};
