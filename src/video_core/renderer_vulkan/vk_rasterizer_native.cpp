@@ -27,6 +27,10 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
+#include "common/ryty_config.h"
+// (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
+#undef near
+#undef far
 #include "core/memory.h"
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/job_walker.h"
@@ -51,11 +55,6 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 
 namespace Vulkan {
 namespace {
-
-bool EnvFlag(const char* name) {
-    const char* env = std::getenv(name);
-    return env && env[0] == '1';
-}
 
 /// Logs the first few times and then every 1000th.
 bool Sample(std::atomic<u32>& counter) {
@@ -257,7 +256,15 @@ constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and sub
 } // namespace
 
 bool NativeModeRequested() {
-    static const bool requested = EnvFlag("RYGT_NATIVE");
+    // NAT-160: the launcher's renderer choice (GPU.native_renderer in the game's settings, so
+    // GTSport.exe started on its own follows it too); RYGT_NATIVE=1 or =0 overrides it.
+    static const bool requested = [] {
+        if (const char* env = std::getenv("RYGT_NATIVE"); env && *env) {
+            return env[0] == '1';
+        }
+        const auto value = Common::RytyGameConfigValue("native_renderer");
+        return value && *value == "true";
+    }();
     return requested;
 }
 
