@@ -108,7 +108,16 @@ public:
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
                          VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
                          VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
-                         u32 step_rate_1) const;
+                         u32 step_rate_1) const {
+        GetVertexInputs(attributes, bindings, divisors, guest_buffers, step_rate_0, step_rate_1,
+                        GetStage(Shader::SwStage::Vertex));
+    }
+    /// OPT-011: the same with the vertex stage's info given (a game job thread's copy).
+    template <typename Attribute, typename Binding>
+    void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
+                         VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+                         VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
+                         u32 step_rate_1, const Shader::Info& vs_info) const;
 
 private:
     void BuildDescSetLayout(bool preloading);
@@ -132,9 +141,12 @@ private:
         std::array<vk::UniquePipeline, 2> owned_libraries;
         std::future<void> optimized;
     };
-    /// PERF-018: hash of the descriptor set layout's bindings, so shader libraries are shared
-    /// only between pipelines with identically defined layouts.
-    u64 desc_layout_hash{};
+    /// PERF-018 / SHD-002: hashes of the stage set layouts' bindings, so a shader library is
+    /// shared between pipelines whose sets for its stages are identically defined.
+    std::array<u64, Shader::Backend::MaxDescriptorSets> set_layout_hashes{};
+    /// SHD-002: the layout of sets between stage sets (no bindings).
+    vk::UniqueDescriptorSetLayout empty_set_layout;
+    u32 num_sets = 0;
     std::unique_ptr<LibraryLink> library_link;
 
     GraphicsPipelineKey key;

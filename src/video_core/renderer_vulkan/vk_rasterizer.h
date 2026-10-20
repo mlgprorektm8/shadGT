@@ -35,6 +35,7 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+class NativeRenderer;
 
 class Rasterizer {
 public:
@@ -90,6 +91,16 @@ public:
     std::optional<SelectedPipeline> SelectPipelineAhead();
     /// PERF-055: the same for a direct dispatch it is decoding (-DisablePerf 66: none).
     std::optional<SelectedPipeline> SelectComputePipelineAhead();
+    /// NAT-030: on a game job thread whose registers Liverpool::SetThreadDrawState installed,
+    /// the built pipeline of its draw, or nullptr (special draws, quad lists, not built yet).
+    const GraphicsPipeline* LookupJobPipeline(const char** miss = nullptr);
+    /// NAT-032: a hash of the resource descriptors (V#, T#, S#) the stages read for a draw.
+    static u64 SharpsHash(std::span<const Shader::Info* const> stages);
+    /// NAT-032: right after LookupJobPipeline found a pipeline, the sharps its draw reads, as
+    /// the job thread sees them.
+    static u64 JobSharpsHash();
+    /// NAT-032 (shadow mode): the guest packet of the draw this thread records now.
+    static inline thread_local const void* t_draw_packet = nullptr;
     /// PERF-062 (command thread): hashes the pages of the selected draw's read-only buffers for
     /// the upload epoch it is decoded in.
     void HashDrawPagesAhead(const SelectedPipeline& selected, u32 epoch);
@@ -296,6 +307,50 @@ public:
         }
     }
 
+#ifdef RYTY_GPU
+    /// NAT-100: native mode's renderer (RYGT_NATIVE=1), or nullptr.
+    NativeRenderer* Native() const noexcept {
+        return native.get();
+    }
+    /// NAT-100: WRITE_DATA written on the GPU in command order (native mode); false when it
+    /// can't be (the caller writes it as before).
+    bool NativeInlineWrite(VAddr address, std::span<const u8> data);
+#endif
+    /// NAT-116 (RYGT_FRAME_DUMP_AT=<seconds>): at a flip after that time, every render target
+    /// the next frame draws into is saved to user\log\dump-<old|native>-<seconds>\ at the flip
+    /// after it (raw texels; tools: dump2png.py). Called by the presenter at each flip.
+    void FrameDumpFlip();
+    /// FIX-156 (diagnosis): starts collecting the frame dump now (finished at the next flip).
+    void StartFrameDumpNow();
+    /// NAT-116: whether the frame being drawn is dumped (render targets are noted).
+    bool FrameDumpCollecting() const noexcept {
+        return frame_dump_collecting;
+    }
+    /// NAT-130 (RYGT_TRACE_RANGE=<hex lo>-<hex hi>): passes, dispatches, copies and fills that
+    /// touch guest memory in [lo, hi) are logged all run long (NAT-130 lines), as the frame dump's
+    /// events. The hooks run when this or the dump wants them.
+    static std::pair<VAddr, VAddr> TraceRange();
+    bool FrameDumpActive() const noexcept {
+        return frame_dump_collecting || TraceRange().first != TraceRange().second;
+    }
+    /// NAT-130: whether [address, address + size) meets the traced range.
+    static bool Traced(VAddr address, u64 size) {
+        const auto [lo, hi] = TraceRange();
+        return lo != hi && address < hi && address + std::max<u64>(size, 1) > lo;
+    }
+    /// NAT-117: the dumped frame's work in GPU order (passes with the targets the registers name
+    /// and whether they start cleared, fills, metadata clears), written as events.txt next to
+    /// the dump. Consecutive draws into the same targets are one line.
+    void FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& state,
+                       const GraphicsPipeline* pipeline);
+    void FrameDumpEvent(std::string text);
+    /// NAT-123: the name a sampled texture is dumped under (its T#: address, size, mips,
+    /// layers, format), the same in both renderers.
+    static std::string FrameDumpTextureKey(const VideoCore::ImageInfo& info);
+    /// NAT-118: a dispatch of the dumped frame with what it writes (buffers, storage images).
+    void FrameDumpDispatch(const Shader::Info& cs, const AmdGpu::ComputeProgram& program,
+                           bool indirect);
+
     std::thread::id GetGpuCommandProcessorThread();
     /// The command processor thread or the draw pipe's recorder thread (PERF-031).
     bool IsGpuThread() const;
@@ -309,6 +364,14 @@ public:
 #endif
 
 private:
+    friend class NativeRenderer;
+    /// NAT-101: the dynamic state the Update*State functions fill: the scheduler's, or a native
+    /// command list's while native mode records into it.
+    static inline thread_local DynamicState* t_dynamic_state = nullptr;
+    DynamicState& DynState() const {
+        return t_dynamic_state ? *t_dynamic_state : scheduler.GetDynamicState();
+    }
+
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
@@ -507,6 +570,7 @@ private:
         boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> diag_storage_images;
         u32 set_write_index{};
         Pipeline::DescriptorWrites set_writes;
+        Pipeline::WriteSets set_write_sets; // SHD-002
         Shader::PushData push_data;
         vk::ImageAspectFlags attachment_feedback_loop{};
         bool needs_barrier{};
@@ -550,6 +614,48 @@ private:
     std::unordered_map<VAddr, std::vector<u8>> pending_fence_bytes;
     u64 gpu_constant_refresh_count{};
     u64 next_gpu_constant_refresh_report{1000};
+#ifdef RYTY_GPU
+    std::unique_ptr<NativeRenderer> native; // NAT-100
+#endif
+    // NAT-116
+    bool frame_dump_collecting{};
+    bool frame_dump_done{};
+    bool frame_dump_write_old{}; // written at the next draw (not at the flip)
+    std::filesystem::path frame_dump_dir;
+    /// FIX-153 (diagnosis): render targets of the dumped frame the CPU reads back (from
+    /// 0xf000000000 up), and how many flips to wait before their guest memory is saved.
+    u32 frame_dump_index{}; ///< FIX-156 (diagnosis): which RYGT_FRAME_DUMP_AT time is next
+    std::vector<VAddr> frame_dump_mem;
+    std::filesystem::path frame_dump_mem_dir;
+    u32 frame_dump_mem_wait{};
+
+public:
+    /// FIX-153 (diagnosis, RYGT_EXPOSURE_LOG=1): the auto exposure's inputs over time: the
+    /// brightness grids the CPU reads back, and the exposure GT Sport's shaders get.
+    static bool ExposureLogOn();
+    void ExposureLogShader(const Shader::Info& stage, const char* renderer);
+
+private:
+    std::mutex exposure_mutex;
+    std::vector<std::pair<VAddr, u64>> exposure_targets; // brightness grid, flip drawn at
+    u64 exposure_flip{};
+    std::array<u32, 2> exposure_last{};
+    std::atomic<bool> exposure_dump_requested{false};
+    std::vector<std::pair<VideoCore::ImageId, u64>> frame_dump_old; // image, uid
+    void FrameDumpNoteOld();
+    void FrameDumpWriteOld();
+    std::mutex frame_dump_mutex; // NAT-117
+    struct FrameDumpEntry {
+        std::string key;    ///< what merges consecutive draws (targets, clears)
+        std::string detail; ///< the pass's first draw (NAT-118)
+        u32 draws;
+    };
+    std::vector<FrameDumpEntry> frame_dump_events;
+    std::string trace_last_pass; // NAT-130
+    void TraceText(const std::string& text);
+    void FrameDumpWriteEvents(const std::filesystem::path& dir);
+    /// NAT-123: GPU-written images the frame sampled, by texture key (old path).
+    std::vector<std::tuple<std::string, VideoCore::ImageId, u64>> frame_dump_textures;
 };
 
 } // namespace Vulkan

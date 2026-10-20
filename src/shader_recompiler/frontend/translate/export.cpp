@@ -112,8 +112,12 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
             components[3] = IR::F32{ir.CompositeExtract(unpacked_value, 1)};
         }
     } else {
-        // Components are float32 into separate VGPRS
-        u32 mask = MaskFromExportFormat(exp.en, color_buffer.export_format);
+        // Components are float32 into separate VGPRS. SHD-004: with a packed export format (a
+        // target the draw doesn't bind is translated as one), every enabled component goes out.
+        const auto export_format = IsCompressedExportFormat(color_buffer.export_format)
+                                       ? AmdGpu::ShaderExportFormat::ABGR_32
+                                       : color_buffer.export_format;
+        u32 mask = MaskFromExportFormat(exp.en, export_format);
         for (u32 i = 0; i < 4; i++, mask >>= 1) {
             if ((mask & 1) == 0) {
                 continue;

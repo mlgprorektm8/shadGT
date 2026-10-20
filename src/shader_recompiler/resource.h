@@ -277,7 +277,8 @@ struct PushData {
     float yoffset;
     float xscale;
     float yscale;
-    std::array<u8, NUM_BUFFERS> buf_offsets;
+    /// SHD-002: 64 offsets, each stage with its own range (Backend::StageBufferOffsetBase).
+    std::array<u8, 64> buf_offsets;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());

@@ -23,6 +23,9 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#ifdef RYTY_GPU
+#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#endif
 #include "video_core/texture_cache/image.h"
 
 #include <algorithm>
@@ -839,6 +842,12 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
     g_prepared_frames.fetch_add(1, std::memory_order_relaxed); // DIAG-137
+    rasterizer->FrameDumpFlip(); // NAT-116
+#ifdef RYTY_GPU
+    if (auto* native = rasterizer->Native()) {
+        return PrepareNativeFrame(*native, attribute, cpu_address);
+    }
+#endif
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
@@ -982,6 +991,119 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     draw_scheduler.Flush(info);
     return frame;
 }
+
+#ifdef RYTY_GPU
+Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
+                                     const Libraries::VideoOut::BufferAttributeGroup& attribute,
+                                     VAddr cpu_address) {
+    // NAT-100: the picture native mode drew at the display buffer, through the same host passes.
+    const VideoCore::TextureCache::ImageDesc desc{attribute, cpu_address};
+    const vk::Format view_format = GetFrameViewFormat(attribute.attrib.pixel_format);
+    const auto display = native.FindDisplay(desc.info, view_format);
+    if (!display) {
+        return PrepareBlankFrame(false);
+    }
+    Frame* frame = GetRenderFrame();
+    const vk::ImageSubresourceRange single{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+    // The display picture is read in the shader-read layout, then goes back to the general
+    // layout native mode keeps its images in.
+    const std::array<vk::ImageMemoryBarrier2, 2> barriers{{
+        {
+            .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .image = frame->image,
+            .subresourceRange{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            },
+        },
+        {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
+                            vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image = display->image,
+            .subresourceRange = single,
+        },
+    }};
+    draw_scheduler.EndRendering();
+    draw_scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+        .pImageMemoryBarriers = barriers.data(),
+    });
+    const vk::Extent2D image_size{display->width, display->height};
+    expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
+    vk::ImageView image_view = display->view;
+    const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
+    bool scaled = false;
+    if (const auto dlss_view = dlss_pass.Render(pass_cmdbuf, display->image, image_view,
+                                                view_format, image_size,
+                                                {frame->width, frame->height});
+        dlss_view != image_view) {
+        image_view = dlss_view;
+        scaled = true;
+    }
+    if (!scaled && fsr_settings.enable) {
+        const float sharpness =
+            fsr_settings.use_rcas ? 1.0f - fsr_settings.rcas_attenuation / 2.0f : -1.0f;
+        if (const auto fsr3_view =
+                fsr3_pass.Render(pass_cmdbuf, display->image, image_view, view_format, image_size,
+                                 {frame->width, frame->height}, sharpness,
+                                 attribute.attrib.pixel_format ==
+                                     Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
+            fsr3_view != image_view) {
+            image_view = fsr3_view;
+            scaled = true;
+        }
+    }
+    if (!scaled) {
+        image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
+                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+    }
+    pp_settings.srgb_input =
+        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings);
+    const vk::ImageMemoryBarrier2 back{
+        .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
+                        vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = display->image,
+        .subresourceRange = single,
+    };
+    pass_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &back,
+    });
+    DebugState.game_resolution = {image_size.width, image_size.height};
+    DebugState.output_resolution = {frame->width, frame->height};
+    frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
+    frame->ready_tick = draw_scheduler.CurrentTick();
+    frame->ready_scheduler = &draw_scheduler;
+    SubmitInfo info{};
+    draw_scheduler.Flush(info);
+    return frame;
+}
+#endif
 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Request a free presentation frame.

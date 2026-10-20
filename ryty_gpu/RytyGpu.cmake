@@ -115,6 +115,19 @@ ryty_add_library(ryty_gpu libSceVideoOut
         # FIX-074: shadGT's static red-zone patching, applied to the converted game code.
         ryty_gpu/ryty_red_zone.cpp
         ryty_gpu/ryty_game_patch.cpp
+        # NAT-001/002: hook points in GT Sport's code for the native renderer (experimental).
+        ryty_gpu/native/entry_hook.cpp
+        ryty_gpu/native/gts_hooks.cpp
+        ryty_gpu/native/job_walker.cpp
+        ryty_gpu/native/shadow.cpp
+        # NAT-010/011: the native renderer's backend interface and its Vulkan backend.
+        ryty_gpu/native/rhi/rhi_vulkan.cpp
+        ryty_gpu/native/rhi/rhi_selftest.cpp
+        # NAT-020/021: the native image registry and its self test.
+        ryty_gpu/native/image_registry.cpp
+        ryty_gpu/native/native_selftest.cpp
+        # NAT-100: native mode (RYGT_NATIVE=1): draws recorded with native images.
+        src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
         src/core/cpu_patches.cpp
         src/core/loader/dwarf.cpp
 )

@@ -5,6 +5,7 @@
 
 #include <atomic>
 
+#include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -73,8 +74,21 @@ public:
         return is_compute;
     }
 
+    /// NAT-100 / SHD-002: how the pipeline takes its descriptors (native mode binds them
+    /// itself): one set per stage (Shader::Backend::StageSet), one of them pushed.
+    static constexpr u32 NoPushSet = ~0u;
+    u32 PushSet() const {
+        return push_set;
+    }
+    vk::DescriptorSetLayout SetLayout(u32 set) const {
+        return set < set_layouts.size() ? set_layouts[set] : vk::DescriptorSetLayout{};
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
-    void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
+    /// SHD-002: the descriptor set of each write.
+    using WriteSets = std::vector<u8>;
+    void BindResources(DescriptorWrites& set_writes, const WriteSets& write_sets,
+                       const Shader::PushData& push_data) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
@@ -86,10 +100,13 @@ protected:
     vk::UniquePipeline pipeline;
     std::atomic<VkPipeline> optimized_pipeline{};
     vk::UniquePipelineLayout pipeline_layout;
-    vk::UniqueDescriptorSetLayout desc_layout;
+    /// SHD-002: the layouts of the stage sets (set_layouts also holds the empty layout of sets
+    /// between them).
+    std::array<vk::UniqueDescriptorSetLayout, Shader::Backend::MaxDescriptorSets> desc_layouts;
+    std::array<vk::DescriptorSetLayout, Shader::Backend::MaxDescriptorSets> set_layouts{};
     mutable std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     std::array<const Shader::Info*, Shader::MaxStageTypes> canonical_stages{};
-    bool uses_push_descriptors{};
+    u32 push_set = NoPushSet;
     bool is_compute;
 };
 

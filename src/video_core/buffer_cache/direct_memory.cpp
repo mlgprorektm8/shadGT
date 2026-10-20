@@ -275,7 +275,8 @@ bool DirectMemory::ImportView(VAddr address) {
     buffer_info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT; // NAT-100: dispatch arguments
     VkBuffer buffer{};
     if (d.vkCreateBuffer(device, &buffer_info, nullptr, &buffer) != VK_SUCCESS ||
         d.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
@@ -298,6 +299,26 @@ bool DirectMemory::ImportView(VAddr address) {
 #else
     return false;
 #endif
+}
+
+bool DirectMemory::ForEachPart(VAddr address, u64 size,
+                               const std::function<void(const Buffer&, u64, u64, u64)>& fn) const {
+    std::scoped_lock lk{mutex};
+    const VAddr end = address + size;
+    for (VAddr cursor = address; cursor < end;) {
+        auto it = views.upper_bound(cursor);
+        if (it == views.begin()) {
+            return false;
+        }
+        const View& view = std::prev(it)->second;
+        if (cursor < view.begin || cursor >= view.end || !view.wrapper) {
+            return false;
+        }
+        const u64 bytes = std::min(end, view.end) - cursor;
+        fn(*view.wrapper, cursor - view.begin, cursor - address, bytes);
+        cursor += bytes;
+    }
+    return true;
 }
 
 bool DirectMemory::EnsureImported(VAddr address, u64 size) {

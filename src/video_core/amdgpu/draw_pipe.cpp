@@ -15,6 +15,12 @@
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/amdgpu/draw_pipe.h"
 
+#ifdef RYTY_GPU
+namespace Vulkan {
+bool NativeModeRequested(); // NAT-100 (vk_rasterizer_native.cpp)
+}
+#endif
+
 namespace AmdGpu {
 
 namespace {
@@ -37,8 +43,11 @@ DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_)
     // D9: on by default with the direct renderer (its recorder obtains far fewer buffers, so the
     // stage's plans are rarely refused: Tokyo rain 45.2 fps vs 43.4); =0 turns it off.
     const char* stage_env = std::getenv("SHADGT_BUFFER_STAGE");
-    const bool stage_wanted = stage_env && *stage_env ? stage_env[0] == '1'
-                                                      : VideoCore::DirectMemory::Enabled();
+    bool stage_wanted = stage_env && *stage_env ? stage_env[0] == '1'
+                                                : VideoCore::DirectMemory::Enabled();
+#ifdef RYTY_GPU
+    stage_wanted = stage_wanted && !Vulkan::NativeModeRequested(); // NAT-100
+#endif
     if (stage_wanted && Common::PerfFeatureEnabled(74)) {
         stage_enabled = true;
         if (const char* workers_env = std::getenv("SHADGT_STAGE_WORKERS")) {

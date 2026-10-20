@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <shared_mutex>
+#include <thread>
+
 #include "common/spin_mutex.h"
 
 #include <atomic>
@@ -84,6 +88,37 @@ u32 PipelineBuildsRunning();
 /// Active shader translation or driver pipeline compilation, independent of guest-clock holds.
 bool CompilationInProgress();
 
+/// NAT-031: the pipeline cache's lookup lock. The command and recorder threads take it
+/// exclusively (as before); game job threads looking pipelines up take it shared, and step aside
+/// while one of the threads above waits for it.
+class LookupLock {
+public:
+    void lock() {
+        writers_waiting.fetch_add(1, std::memory_order_acq_rel);
+        mutex.lock();
+        writers_waiting.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    bool try_lock() {
+        return mutex.try_lock();
+    }
+    void unlock() {
+        mutex.unlock();
+    }
+    void lock_shared() {
+        while (writers_waiting.load(std::memory_order_acquire) != 0) {
+            std::this_thread::yield();
+        }
+        mutex.lock_shared();
+    }
+    void unlock_shared() {
+        mutex.unlock_shared();
+    }
+
+private:
+    std::shared_mutex mutex;
+    std::atomic<u32> writers_waiting{0};
+};
+
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
@@ -99,15 +134,30 @@ public:
     /// PERF-047: with pipelines selected on the command thread, both GPU threads look pipelines
     /// up; every GetGraphicsPipeline/GetComputePipeline call holds this lock, and so does any
     /// read of the infos below or copy of a cached info.
-    Common::SpinMutex& LookupMutex() {
+    LookupLock& LookupMutex() {
         return lookup_mutex;
     }
     /// The infos the last GetGraphicsPipeline selected, with that draw's user data.
     const std::array<const Shader::Info*, MaxShaderStages>& SelectedInfos() const {
-        return infos;
+        return scratch_.infos;
     }
 
     const ComputePipeline* GetComputePipeline();
+
+    /// NAT-030: the pipeline already built for the draw a game job thread is reading (its
+    /// registers installed with Liverpool::SetThreadDrawState), or nullptr. Nothing is
+    /// translated, loaded, built or waited for, and the selection made by the threads above is
+    /// left as it was. Hold LookupMutex.
+    const GraphicsPipeline* LookupBuiltPipeline(const DrawIndirectParams params);
+    /// NAT-030: why the last LookupBuiltPipeline found nothing.
+    const char* LookupMiss() const {
+        return t_last_miss;
+    }
+    /// NAT-032: the stage infos of this thread's last LookupBuiltPipeline (its own copies, with
+    /// the draw's user data), valid until its next lookup.
+    static const std::array<const Shader::Info*, MaxShaderStages>& JobInfos() {
+        return *t_job_infos;
+    }
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
     Result GetProgram(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
@@ -220,7 +270,6 @@ private:
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
-    DrawIndirectParams draw_indirect_params{};
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     /// PERF-013: per program, one past the highest permutation index in the stored cache, so a
     /// permutation created at runtime never reuses (and overwrites) a stored index.
@@ -271,8 +320,6 @@ private:
     tsl::robin_map<size_t, std::unique_ptr<Program>> legacy_programs;
     bool legacy_fallback{};
     bool force_legacy{};      ///< making the key with the old translations only
-    bool legacy_failed{};     ///< a stage had none
-    bool key_uses_legacy{};   ///< the current key has a stage with an old translation
     bool fallback_nested{};
     bool fallback_miss{};     ///< a new translation was queued for the current key
     struct LegacyStats {
@@ -289,11 +336,41 @@ private:
     void ReportLegacy();
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
-    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
-    std::array<const Shader::Info*, MaxShaderStages> infos{};
-    std::array<vk::ShaderModule, MaxShaderStages> modules{};
-    Shader::Gcn::FetchShaderData* fetch_shader{};
-    GraphicsPipelineKey graphics_key{};
+    /// NAT-031: what a key is computed in. The command and recorder threads use the cache's own
+    /// (scratch_, under the exclusive lock); a game job thread looking a pipeline up uses its
+    /// own (under the shared lock), so job threads look pipelines up at the same time.
+    struct KeyScratch {
+        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+        std::array<const Shader::Info*, MaxShaderStages> infos{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        Shader::Gcn::FetchShaderData* fetch_shader{};
+        GraphicsPipelineKey graphics_key{};
+        DrawIndirectParams draw_indirect_params{};
+        bool stage_deferred{};
+        bool legacy_failed{};   ///< a stage had none
+        bool key_uses_legacy{}; ///< the current key has a stage with an old translation
+        const char* lookup_miss{}; ///< NAT-030: why a job thread's lookup found nothing
+    };
+    KeyScratch scratch_;
+    static inline thread_local KeyScratch* t_scratch = nullptr;
+    /// NAT-030: this thread is a game job thread looking a pipeline up (LookupBuiltPipeline).
+    static inline thread_local bool t_lookup_only = false;
+    static inline thread_local const char* t_last_miss = nullptr; ///< of this thread's last lookup
+    static inline thread_local const std::array<const Shader::Info*, MaxShaderStages>* t_job_infos =
+        nullptr;
+    KeyScratch& S() {
+        return t_scratch ? *t_scratch : scratch_;
+    }
+    const KeyScratch& S() const {
+        return t_scratch ? *t_scratch : scratch_;
+    }
+    /// NAT-031: the info a job thread's lookup matches in: its own copy of a cached one (the
+    /// threads above write the draw's user data into the cached ones).
+    Shader::Info& MatchInfo(const Shader::Info& cached);
+    /// NAT-031: GetProgram for a game job thread's lookup (read-only).
+    Result GetProgramForJob(Shader::HwStage hw_stage, const Shader::ShaderParams& params,
+                            const Shader::RuntimeInfo& runtime_info,
+                            Shader::Backend::Bindings& binding);
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
 
@@ -360,7 +437,13 @@ private:
         u64 deferred{};
         u64 installed{};
         u64 skipped_draws{};
+        u64 skipped_translating{}; ///< SHD-005
     } async_stats;
+    /// SHD-005: a draw of a race skipped while its new shader translates on a worker, instead of
+    /// the command thread waiting for the translation.
+    bool SkipTranslationWait(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
+    tsl::robin_map<u64, bool> code_writes_memory; ///< by program hash
+    bool translation_skipped{};
     struct PrewarmStats {
         u64 installed{};
         u64 skipped{};
@@ -372,7 +455,7 @@ private:
         std::chrono::steady_clock::time_point since{};
     } prewarm_stats;
     std::jthread prewarm_reader;
-    Common::SpinMutex lookup_mutex; // PERF-047, PERF-060
+    LookupLock lookup_mutex; // PERF-047, PERF-060; NAT-031: shared for job threads
 
     /// FIX-078: a shader the read-ahead found with no matching translation is translated on a
     /// worker thread; the draw that needs it takes the result (or waits for it) instead of
@@ -418,9 +501,6 @@ private:
                           const Shader::Backend::Bindings& start);
     tsl::robin_map<u64, std::vector<std::shared_ptr<TranslateJob>>> translate_jobs;
     tsl::robin_map<u64, std::vector<std::shared_ptr<TranslateJob>>> ready_translations;
-    /// FIX-078: a stage of the key being made was queued; the later stages are not (their start
-    /// bindings follow from its translation).
-    bool stage_deferred{};
     /// FIX-078: while set, a draw's own missing translations are queued (all its stages at
     /// once) instead of made here one by one; `deferred_miss` tells that one was.
     bool defer_misses{};

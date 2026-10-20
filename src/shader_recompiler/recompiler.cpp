@@ -133,6 +133,33 @@ bool HasLaneReadsAndLoop(std::span<const u32> code) {
     return lane_reads && loop;
 }
 
+bool HasMemoryWrites(std::span<const u32> code) {
+    using namespace Gcn;
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    const auto in = [](Opcode op, Opcode first, Opcode last) { return op >= first && op <= last; };
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        const Opcode op = inst.opcode;
+        if (in(op, Opcode::BUFFER_STORE_FORMAT_X, Opcode::BUFFER_STORE_FORMAT_XYZW) ||
+            in(op, Opcode::BUFFER_STORE_BYTE, Opcode::BUFFER_STORE_DWORDX3) ||
+            in(op, Opcode::BUFFER_ATOMIC_SWAP, Opcode::BUFFER_ATOMIC_FMAX_X2) ||
+            in(op, Opcode::TBUFFER_STORE_FORMAT_X, Opcode::TBUFFER_STORE_FORMAT_XYZW) ||
+            in(op, Opcode::IMAGE_STORE, Opcode::IMAGE_STORE_MIP_PCK) ||
+            in(op, Opcode::IMAGE_ATOMIC_SWAP, Opcode::IMAGE_ATOMIC_FMAX) ||
+            in(op, Opcode::DS_GWS_SEMA_RELEASE_ALL, Opcode::DS_GWS_BARRIER) ||
+            op == Opcode::DS_CONSUME || op == Opcode::DS_APPEND ||
+            op == Opcode::DS_ORDERED_COUNT ||
+            (inst.category == InstCategory::DataShare && inst.control.ds.gds)) {
+            return true;
+        }
+        if (op == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return false;
+}
+
 bool HasLegacyMad(std::span<const u32> code) {
     using namespace Gcn;
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());

@@ -42,6 +42,10 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "core/libraries/system/systemservice.h"
 #include "ryty_gpu/ryty_diag.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/native/shadow.h"
+#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#endif
 
 namespace AmdGpu {
 
@@ -753,10 +757,29 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // PERF-047: the pipeline is selected now, on this thread, from these registers; the
     // recorder checks the selection against the memory it sees before using it.
     std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
-    if (direct_draw && rasterizer->SelectsPipelinesAhead()) {
+    bool prepared_draw = false;
+#ifdef RYTY_GPU
+    // OPT-012: a draw a game job thread prepared is selected there (the recorder installs
+    // that selection).
+    if (!compute && direct_draw && decode_draw_packet &&
+        regs.primitive_type != PrimitiveType::QuadList &&
+        Vulkan::NativeRenderer::PrepareEnabled()) {
+        if (auto* native = rasterizer->Native()) {
+            prepared_draw = native->HasPrepared(decode_draw_packet);
+        }
+    }
+    decode_draw_packet = nullptr;
+#endif
+    if (direct_draw && rasterizer->SelectsPipelinesAhead() && !prepared_draw) {
         selected = compute ? rasterizer->SelectComputePipelineAhead()
                            : rasterizer->SelectPipelineAhead();
     }
+#ifdef RYTY_GPU
+    if (!compute && Native::ShadowComparing()) {
+        // NAT-030: the pipeline the draw's job looked up on its thread, against this selection.
+        Native::ShadowCheckPipeline(selected ? selected->pipeline : nullptr, selected.has_value());
+    }
+#endif
     // PERF-062: the upload epoch this draw is decoded in; its pages are hashed now, on this
     // thread, and the recorder uses those hashes for this draw.
     const u32 decode_epoch = VideoCore::g_upload_epoch.load(std::memory_order_acquire);
@@ -1563,6 +1586,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     if (!original_dcb.empty()) {
         RecordCmdBuffer(original_dcb.data(), original_dcb.size_bytes(), false);
         decoding_submit.fetch_add(1, std::memory_order_relaxed); // DIAG-061
+#ifdef RYTY_GPU
+        if (Native::ShadowEnabled()) {
+            Native::ShadowSubmitBase(regs); // NAT-003: the state render jobs start from
+        }
+#endif
     }
     if (early_fences_pending && std::chrono::steady_clock::now() >= early_fences_at) {
         early_fences_mode = std::exchange(early_fences_pending, 0); // EXP-120
@@ -1875,16 +1903,27 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+#ifdef RYTY_GPU
+                if (Native::ShadowComparing()) {
+                    Native::ShadowCheckDraw(header, regs); // NAT-003
+                }
+#endif
                 if (!rasterizer) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 staged_index_offset = 0; // MT-005
+                decode_draw_packet = cmd_address; // OPT-012
                 RecordDraw(
                     [this, cmd_address] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndex2",
                                                 fmt::make_format_args(cmd_address),
-                                                [&] { rasterizer->Draw(true); });
+                                                [&] {
+                                                    // NAT-032: shadow checks key by it
+                                                    Vulkan::Rasterizer::t_draw_packet = cmd_address;
+                                                    rasterizer->Draw(true);
+                                                    Vulkan::Rasterizer::t_draw_packet = nullptr;
+                                                });
                     },
                     false, true);
                 break;
@@ -1901,17 +1940,28 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+#ifdef RYTY_GPU
+                if (Native::ShadowComparing()) {
+                    Native::ShadowCheckDraw(header, regs); // NAT-003
+                }
+#endif
                 if (!rasterizer) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 const u32 index_offset = draw_index_off->index_offset;
                 staged_index_offset = index_offset; // MT-005
+                decode_draw_packet = cmd_address; // OPT-012
                 RecordDraw(
                     [this, cmd_address, index_offset] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndexOffset2",
                                                 fmt::make_format_args(cmd_address),
-                                                [&] { rasterizer->Draw(true, index_offset); });
+                                                [&] {
+                                                    // NAT-032: shadow checks key by it
+                                                    Vulkan::Rasterizer::t_draw_packet = cmd_address;
+                                                    rasterizer->Draw(true, index_offset);
+                                                    Vulkan::Rasterizer::t_draw_packet = nullptr;
+                                                });
                     },
                     false, true);
                 break;
@@ -1925,15 +1975,26 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
+#ifdef RYTY_GPU
+                if (Native::ShadowComparing()) {
+                    Native::ShadowCheckDraw(header, regs); // NAT-003
+                }
+#endif
                 if (!rasterizer) {
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
+                decode_draw_packet = cmd_address; // OPT-012
                 RecordDraw(
                     [this, cmd_address] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndexAuto",
                                                 fmt::make_format_args(cmd_address),
-                                                [&] { rasterizer->Draw(false); });
+                                                [&] {
+                                                    // NAT-032: shadow checks key by it
+                                                    Vulkan::Rasterizer::t_draw_packet = cmd_address;
+                                                    rasterizer->Draw(false);
+                                                    Vulkan::Rasterizer::t_draw_packet = nullptr;
+                                                });
                     },
                     false, true);
                 break;
@@ -2414,6 +2475,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     RecordLabelWrite(
                         reinterpret_cast<VAddr>(address), std::move(label),
                         [this, address, data = std::move(data)]() mutable {
+#ifdef RYTY_GPU
+                            // NAT-100: native mode writes it on the GPU in command order.
+                            if (rasterizer && rasterizer->NativeInlineWrite(
+                                                  reinterpret_cast<VAddr>(address), data)) {
+                                return;
+                            }
+#endif
                             const u32 data_size = static_cast<u32>(data.size());
                             const std::vector<u8> value = data;
                             const bool deferred =
@@ -3170,6 +3238,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 RecordLabelWrite(
                     write_data->Address<VAddr>(), std::move(label),
                     [this, address = write_data->Address<VAddr>(), data = std::move(data)] {
+#ifdef RYTY_GPU
+                        // NAT-100: native mode writes it on the GPU in command order.
+                        if (rasterizer && rasterizer->NativeInlineWrite(address, data)) {
+                            return;
+                        }
+#endif
                         // DIAG-130 (SHADGT_DIRECT_HOLD_COMPUTE=1): with the direct renderer the
                         // label waits for the GPU like graphics labels do.
                         static const bool hold = [] {

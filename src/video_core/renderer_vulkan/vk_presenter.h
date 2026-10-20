@@ -53,6 +53,8 @@ enum SchedulerType {
 
 class Rasterizer;
 
+class NativeRenderer;
+
 class Presenter {
 public:
     Presenter(Frontend::WindowSDL& window, AmdGpu::Liverpool* liverpool);
@@ -102,6 +104,12 @@ public:
                         VAddr cpu_address);
 
     Frame* PrepareBlankFrame(bool present_thread);
+#ifdef RYTY_GPU
+    /// NAT-100: PrepareFrame for native mode (the picture native mode drew there).
+    Frame* PrepareNativeFrame(NativeRenderer& native,
+                              const Libraries::VideoOut::BufferAttributeGroup& attribute,
+                              VAddr cpu_address);
+#endif
 
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
     Frame* PrepareLastFrame();
