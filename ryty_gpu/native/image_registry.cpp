@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdlib>
 #include "common/logging/log.h"
+#include "core/guest_hash.h"
 #include "core/memory.h"
 #include <xxhash.h>
 #include "ryty_gpu/native/image_registry.h"
@@ -803,8 +804,9 @@ bool ImageRegistry::MemoryUnchanged(const ImageEntry& entry) {
         memory_clamp(entry.info.guest_address, size) != size) {
         return false;
     }
-    const u64 hash =
-        XXH3_64bits(reinterpret_cast<const void*>(entry.info.guest_address), size) | 1;
+    // FIX-160: read safely; the game can release the memory while the caches still say it is
+    // mapped (a GPU-thread fault under Proton).
+    const u64 hash = Core::HashGuestBytes(entry.info.guest_address, size) | 1;
     return hash == entry.content_hash;
 }
 
@@ -1049,8 +1051,8 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
         // FIX-157: render targets of any size (what their memory held when made).
         if ((size <= HashedSize || !entry->from_cpu) && memory_clamp &&
             memory_clamp(info.guest_address, size) == size) {
-            const u64 hash =
-                XXH3_64bits(reinterpret_cast<const void*>(info.guest_address), size) | 1;
+            // FIX-160: a safe read (see MemoryUnchanged).
+            const u64 hash = Core::HashGuestBytes(info.guest_address, size) | 1;
             if (!forced && hash == entry->content_hash) {
                 ++upload_stats.unchanged;
                 if (WatchedTexture(info.guest_address, info.guest_address + 1)) {
@@ -1100,9 +1102,14 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
                                 info.resources.levels, readable);
                 }
             }
-            if (readable != 0) {
-                std::memcpy(source->Mapped(), reinterpret_cast<const void*>(info.guest_address),
-                            readable);
+            // FIX-160: the game can release part of it meanwhile; then zeros where nothing is
+            // mapped any more.
+            if (readable != 0 &&
+                !Core::RytyMemory::GuardedCopy(source->Mapped(),
+                                               reinterpret_cast<const void*>(info.guest_address),
+                                               readable)) {
+                Core::Memory::Instance()->CopySparseMemory(info.guest_address, source->Mapped(),
+                                                           readable);
             }
             bytes = source.get();
             bytes_offset = 0;

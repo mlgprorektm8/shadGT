@@ -31,6 +31,7 @@
 // (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
 #undef near
 #undef far
+#include "core/guest_hash.h"
 #include "core/memory.h"
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/job_walker.h"
@@ -1433,7 +1434,11 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // can't read it: NAT-106).
     const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
     const u64 readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), size);
-    std::memcpy(data, reinterpret_cast<const void*>(address), readable);
+    // FIX-160: the game can release part of the range meanwhile (zeros there then).
+    if (readable != 0 &&
+        !Core::RytyMemory::GuardedCopy(data, reinterpret_cast<const void*>(address), readable)) {
+        r.memory->CopySparseMemory(address, data, readable);
+    }
     if (readable < size) {
         std::memset(data + readable, 0, size - readable);
     }
@@ -4528,8 +4533,7 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
                 r.memory->ClampRangeSize(info.guest_address, size) == size &&
                 Native::ReadablePrefix(reinterpret_cast<const void*>(info.guest_address), size) ==
                     size) {
-                hash_now =
-                    XXH3_64bits(reinterpret_cast<const void*>(info.guest_address), size) | 1;
+                hash_now = Core::HashGuestBytes(info.guest_address, size) | 1;
             }
             list += fmt::format("{} -> {} {:#x} {}x{} mips {} layers {} {}, {} sources, "
                                 "version {}{}; memory {}; {}; uploads {}, stale {}; "

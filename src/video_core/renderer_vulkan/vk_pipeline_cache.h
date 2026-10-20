@@ -467,7 +467,8 @@ private:
         Shader::SwStage sw_stage;
         u64 hash;
         std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data;
-        std::span<const u32> code;
+        std::span<const u32> code; // FIX-160: over code_copy, not guest memory
+        std::vector<u32> code_copy;
         Shader::RuntimeInfo runtime_info;
         Shader::Backend::Bindings start;
         std::unique_ptr<Shader::Info> info;

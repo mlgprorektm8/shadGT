@@ -3802,7 +3802,19 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     job->sw_stage = sw_stage;
     job->hash = params.hash;
     std::ranges::copy(params.user_data, job->user_data.begin());
-    job->code = params.code;
+    // FIX-160: the worker translates its own copy of the code. The game can release that memory
+    // before a worker gets to it, and the read then crashed the worker (under Proton). Translation
+    // does not use the code's address (pgm_base is set again when the result is taken).
+    job->code_copy.resize(params.code.size());
+#ifdef RYTY_GPU
+    if (!Core::RytyMemory::GuardedCopy(job->code_copy.data(), params.code.data(),
+                                       params.code.size_bytes())) {
+        return false; // gone already; translated on the command thread if a draw needs it
+    }
+#else
+    std::ranges::copy(params.code, job->code_copy.begin());
+#endif
+    job->code = job->code_copy;
     job->start = start;
     jobs.push_back(job);
     ++translate_stats.queued;
