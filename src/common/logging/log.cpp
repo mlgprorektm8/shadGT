@@ -78,9 +78,10 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
     const auto entry = fmt::format("[{}] <{}> ({}) {}:{} {}: {}", NameOf(log_class),
         NameOf(ToSpdlog(level)), Common::GetCurrentThreadName(),
         spdlog::source_loc::basename(file), line, fn, std::string_view(msg.data(), msg.size()));
-    logger->log(ToSpdlog(level), "{}", entry);
 #ifdef RYTY_GPU
     if (g_stdout_logger) g_stdout_logger->log(ToSpdlog(level), "{}", entry);
+#else
+    logger->log(ToSpdlog(level), "{}", entry);
 #endif
 }
 
@@ -161,12 +162,14 @@ void Setup(std::string_view shadps4_filename) {
     g_stdout_logger->flush_on(spdlog::level::trace);
 #endif
 
+#ifndef RYTY_GPU
     // Setup file
 
     g_shad_file_sink = std::make_shared<LogFileSink>(
         (GetUserPath(Common::FS::PathType::LogDir) / shadps4_filename).string(), false,
         EmulatorSettings.GetLogSizeLimit());
     g_shad_file_sink->set_pattern("%^%v%$");
+#endif
 
     UpdateSinks();
 #ifdef RYTY_GPU
@@ -179,10 +182,12 @@ void Switch(std::string_view game_filename, bool append_log) {
     UpdateLogLevels(EmulatorSettings.GetLogFilter());
     UpdateLogFlushLevel(EmulatorSettings.GetLogFlushLevel());
 
+#ifndef RYTY_GPU
     g_shad_file_sink->_size_limit = EmulatorSettings.GetLogSizeLimit();
     g_shad_file_sink->session_file_helper_.open(
         (GetUserPath(Common::FS::PathType::LogDir) / game_filename).string(),
         !(append_log || EmulatorSettings.IsLogAppend()));
+#endif
 }
 
 void Shutdown() {
@@ -209,11 +214,10 @@ void Flush() {
 
 void UpdateSinks() {
 #ifdef RYTY_GPU
-    // Keep existing per-class file logging independent of the stdout threshold.
-    std::initializer_list<spdlog::sink_ptr> sinks{g_shad_file_sink};
+    // RyGT writes only through its gated stdout logger; never create a private file sink.
+    return;
 #else
     std::initializer_list<spdlog::sink_ptr> sinks{g_console_sink, g_shad_file_sink};
-#endif
 
     std::initializer_list<spdlog::sink_ptr> async_sink{std::make_shared<spdlog::sinks::async_sink>(
         spdlog::sinks::async_sink::config{.sinks = sinks})};
@@ -228,6 +232,7 @@ void UpdateSinks() {
                               ? dup_filter
                               : (EmulatorSettings.IsLogSync() ? sinks : async_sink);
     }
+#endif
 }
 
 void UpdateLogLevels(std::string_view log_filter) {
@@ -270,8 +275,8 @@ void UpdateLogLevels(std::string_view log_filter) {
         }
 #ifdef RYTY_GPU
         if (g_stdout_logger) {
-            // The macro gate must admit messages wanted by either independent output.
-            g_class_levels[i] = FromSpdlog((std::min)(logger->log_level(), g_stdout_logger->log_level()));
+            // Avoid formatting diagnostics when stdout is disabled.
+            g_class_levels[i] = FromSpdlog(g_stdout_logger->log_level());
         }
 #endif
     }
