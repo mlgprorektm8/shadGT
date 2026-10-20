@@ -239,6 +239,42 @@ private:
     /// NAT-150: what the last GuestBuffer bound (for the NAT-142 counters).
     enum class Bound : u8 { InPlace, Region, Mirror };
     Bound last_bound = Bound::InPlace;
+    /// OPT-003: what a guest range resolved to the last time (a region, a mirror, or imported
+    /// guest memory read in place), valid while no region or mirror was made or dropped and no
+    /// memory unmapped since (buffer_generation); a region or mirror with pages to copy in takes
+    /// the full lookup.
+    struct BufferMemo {
+        VAddr address = 0;
+        u64 size = 0;
+        u32 flags = 0;
+        u64 generation = ~u64{0};
+        vk::Buffer buffer{};
+        u64 offset = 0;
+        Region* region = nullptr;
+        Mirror* mirror = nullptr;
+        Bound bound = Bound::InPlace;
+    };
+    std::array<BufferMemo, 2048> buffer_memos{};
+    u64 buffer_generation = 0;
+    /// OPT-003: what the last lookup can be remembered as (set by GuestBufferLookup).
+    enum class MemoKind : u8 { None, Region, Mirror, InPlace };
+    MemoKind memo_kind = MemoKind::None;
+    Region* memo_region = nullptr;
+    Mirror* memo_mirror = nullptr;
+    std::optional<std::pair<vk::Buffer, u64>> GuestBufferLookup(VAddr address, u64 size, bool write,
+                                                                bool mirror);
+    /// OPT-002: what a T# resolved to the last time (picture and views), by the T# and how the
+    /// shader reads it, valid while the registry made or dropped no picture and no memory was
+    /// unmapped since.
+    struct TextureMemo {
+        std::array<u64, 4> sharp{};
+        u32 flags = 0;
+        u64 generation = ~u64{0};
+        Native::ImageEntry* entry = nullptr;
+        std::array<vk::ImageView, 4> views{};
+    };
+    std::array<TextureMemo, 4096> texture_memos{};
+    u64 unmap_generation = 0;
     /// NAT-107: a guest range gathered on the GPU from the imported views holding it, into a
     /// buffer of the list (none when part of it is not imported).
     std::optional<std::pair<vk::Buffer, u64>> GatherOnGpu(VAddr address, u64 size);
@@ -312,6 +348,7 @@ private:
     Stream stream;
     DrawBindings bindings;
     u64 frame = 0;
+    u64 timing_tick = 0; ///< OPT-001
     /// NAT-142: guest memory the GPU reads or writes in place (64 KB pages, every 8th frame):
     /// vertex buffers, indices, read-only storage through the page table, other storage
     /// buffers read, storage buffers written; NAT-150: then what is bound from video memory
@@ -379,6 +416,9 @@ private:
         u64 region_refresh_pages = 0, region_refresh_ns = 0; ///< NAT-145
         u64 guest_buffer_calls = 0, guest_buffer_ns = 0;     ///< NAT-145
         u64 rewrite_fills = 0;   ///< NAT-132
+        u64 timed_draws = 0;     ///< OPT-001
+        u64 texture_memo_hits = 0, texture_lookups = 0; ///< OPT-002
+        u64 buffer_memo_hits = 0;                        ///< OPT-003
         u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,
             mirrors_evicted = 0, mirror_over_budget = 0, mirror_refresh_pages = 0; ///< NAT-150
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,

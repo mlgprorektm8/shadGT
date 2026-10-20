@@ -255,6 +255,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         }
         result = entry.get();
         shard.images.emplace(info.guest_address, std::move(entry));
+        generation.fetch_add(1, std::memory_order_acq_rel); // OPT-002
     }
     IndexEntry(*result);
     if (render_target) {
@@ -527,6 +528,9 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     {
         std::scoped_lock lock{upload_mutex};
         std::erase_if(pending_uploads, [&](ImageEntry* entry) { return gone.contains(entry); });
+    }
+    if (!taken.empty()) {
+        generation.fetch_add(1, std::memory_order_acq_rel); // OPT-002
     }
     // The links between textures and targets that went (NAT-111: both directions).
     for (const auto& entry : taken) {

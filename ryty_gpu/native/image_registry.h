@@ -167,6 +167,11 @@ public:
     /// queued for upload from guest memory; a render target is not. Thread-safe.
     ImageEntry* Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame);
 
+    /// OPT-002: changes whenever a picture is made or dropped (what Find returns may change).
+    u64 Generation() const {
+        return generation.load(std::memory_order_acquire);
+    }
+
     /// NAT-100: whether uploads are queued (RecordUploads has work).
     bool HasPendingUploads() {
         std::scoped_lock lock{upload_mutex};
@@ -266,6 +271,7 @@ private:
     std::array<Shard, NumShards> shards;
     std::mutex upload_mutex;
     std::vector<ImageEntry*> pending_uploads;
+    std::atomic<u64> generation{0}; ///< OPT-002
     std::unique_ptr<Rhi::PipelineLayout> untile_layout;
     std::mutex untile_mutex;
     std::unordered_map<u64, std::unique_ptr<Rhi::Pipeline>> untile_pipelines;

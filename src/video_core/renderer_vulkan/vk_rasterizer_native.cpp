@@ -231,13 +231,23 @@ T* Handle(u64 handle) {
 }
 
 /// NAT-110: adds the time until the end of the scope to a counter.
+// OPT-001: the phase timers read the clock on one draw in 16 (reading it in every phase of every
+// draw was 7% of the recorder's time); the report divides by the draws timed.
+thread_local bool t_timed = true;
 struct PhaseClock {
-    u64& total;
-    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    u64* total;
+    std::chrono::steady_clock::time_point start{};
+    explicit PhaseClock(u64& total_) : total{t_timed ? &total_ : nullptr} {
+        if (total) {
+            start = std::chrono::steady_clock::now();
+        }
+    }
     ~PhaseClock() {
-        total += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                     std::chrono::steady_clock::now() - start)
-                     .count();
+        if (total) {
+            *total += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+        }
     }
 };
 
@@ -846,6 +856,7 @@ NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
 }
 
 NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
+    ++buffer_generation; // OPT-003: regions are taken in or made
     auto* direct = r.buffer_cache.GetDirectMemory();
     // The new region takes in every region it overlaps (their GPU-written contents kept).
     VAddr begin = Common::AlignDown(address, 4096);
@@ -945,6 +956,7 @@ void NativeRenderer::SortRegionWrites() {
             if (dynamic) {
                 mirror_bytes -= mirror.end - mirror.begin;
                 ++stats.mirrors_dropped;
+                ++buffer_generation; // OPT-003
                 it = mirrors.erase(it); // freed once the GPU is done with it
                 continue;
             }
@@ -1012,6 +1024,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
         RefreshMirror(*mirror);
         mirror->used_frame = frame;
         ++stats.mirror_binds;
+        memo_kind = MemoKind::Mirror; // OPT-003
+        memo_mirror = mirror;
         return std::pair{vk::Buffer{Handle<VkBuffer_T>(mirror->buffer->NativeHandle())},
                          u64{address - mirror->begin}};
     }
@@ -1080,6 +1094,7 @@ void NativeRenderer::MakePendingMirrors() {
     }
     std::vector<std::pair<VAddr, VAddr>> pending;
     pending.swap(pending_mirrors);
+    ++buffer_generation; // OPT-003: mirrors are made, taken in or evicted
     std::ranges::sort(pending);
     std::vector<std::pair<VAddr, VAddr>> ranges; // overlapping or touching ranges joined
     for (const auto& [begin, end] : pending) {
@@ -1176,6 +1191,7 @@ void NativeRenderer::MakePendingMirrors() {
 void NativeRenderer::DropMirrors(VAddr address, u64 size) {
     for (auto it = FirstMirror(address); it != mirrors.end() && it->second.begin < address + size;) {
         mirror_bytes -= it->second.end - it->second.begin;
+        ++buffer_generation; // OPT-003
         it = mirrors.erase(it); // freed once the GPU is done with it
     }
 }
@@ -1239,6 +1255,55 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     }
     PhaseClock guest_clock{stats.guest_buffer_ns}; // NAT-145
     ++stats.guest_buffer_calls;
+    // OPT-003: the range's last result, when nothing it depends on changed.
+    const u32 flags = u32(write) | (u32(mirror) << 1);
+    const std::array<u64, 3> memo_key{address, size, flags};
+    BufferMemo& memo =
+        buffer_memos[XXH3_64bits(memo_key.data(), sizeof(memo_key)) & (buffer_memos.size() - 1)];
+    if (memo.generation == buffer_generation && memo.address == address && memo.size == size &&
+        memo.flags == flags) {
+        if (memo.region || memo.mirror) {
+            SortRegionWrites(); // CPU writes since: pages to copy in (may drop a mirror)
+        }
+        const bool fresh =
+            memo.generation == buffer_generation &&
+            (!memo.region || memo.region->dirty_pages.empty()) &&
+            (!memo.mirror || memo.mirror->dirty_pages.empty());
+        if (fresh) {
+            if (memo.region) {
+                ++stats.region_binds;
+            } else if (memo.mirror) {
+                ++stats.mirror_binds;
+                memo.mirror->used_frame = frame;
+            }
+            last_bound = memo.bound;
+            ++stats.buffer_memo_hits;
+            return std::pair{memo.buffer, memo.offset};
+        }
+    }
+    memo_kind = MemoKind::None;
+    memo_region = nullptr;
+    memo_mirror = nullptr;
+    const auto result = GuestBufferLookup(address, size, write, mirror);
+    if (result && memo_kind != MemoKind::None) {
+        memo = BufferMemo{
+            .address = address,
+            .size = size,
+            .flags = flags,
+            .generation = buffer_generation,
+            .buffer = result->first,
+            .offset = result->second,
+            .region = memo_region,
+            .mirror = memo_mirror,
+            .bound = last_bound,
+        };
+    }
+    return result;
+}
+
+std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAddr address, u64 size,
+                                                                            bool write,
+                                                                            bool mirror) {
     last_bound = Bound::Region;
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
@@ -1248,6 +1313,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
         if (region) {
             RefreshRegion(*region);
             ++stats.region_binds;
+            memo_kind = MemoKind::Region; // OPT-003
+            memo_region = region;
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
@@ -1264,6 +1331,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     if (write && write_regions && size <= 256_MB) {
         if (Region* region = MakeRegion(address, size)) {
             ++stats.region_binds;
+            memo_kind = MemoKind::Region; // OPT-003
+            memo_region = region;
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
@@ -1281,6 +1350,9 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     if (auto* direct = r.buffer_cache.GetDirectMemory();
         direct && direct->EnsureImported(address, size)) {
         if (const auto found = direct->FindBuffer(address, size)) {
+            if (!mirror) {
+                memo_kind = MemoKind::InPlace; // OPT-003 (vertices and indices keep looking:
+            }                                  // they become mirrors when bound again)
             return std::pair{found->first->Handle(), found->second};
         }
     }
@@ -1673,6 +1745,38 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             ++stats.null_reasons[reason];
             add_write();
         };
+        // OPT-002: the picture and views this T# resolved to last time.
+        ++stats.texture_lookups;
+        TextureMemo* memo = nullptr;
+        std::array<u64, 4> raw_sharp{};
+        static_assert(sizeof(tsharp) == sizeof(raw_sharp));
+        std::memcpy(raw_sharp.data(), &tsharp, sizeof(raw_sharp));
+        const u32 memo_flags = u32(storage) | (u32(image_desc.is_array) << 1) |
+                               (u32(image_desc.is_depth) << 2) |
+                               (u32(image_desc.mip_fallback_mode) << 3) |
+                               ((image_desc.constant_mip_index & 0xff) << 6) |
+                               (num_bindings << 16);
+        if (num_bindings <= 4 && stage.pgm_hash != 0xaa3822a3 && !r.FrameDumpCollecting()) {
+            memo = &texture_memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
+                                                       memo_flags) &
+                                  (texture_memos.size() - 1)];
+            if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
+                memo->generation == registry->Generation() + unmap_generation) {
+                Native::ImageEntry* entry = memo->entry;
+                entry->last_use.store(frame, std::memory_order_relaxed);
+                ApplyRewrite(*entry); // NAT-120
+                if (!storage && entry->from_cpu) {
+                    RefreshSources(*entry); // NAT-104
+                }
+                for (u32 i = 0; i < num_bindings; ++i) {
+                    b.images.push_back({VK_NULL_HANDLE, memo->views[i], vk::ImageLayout::eGeneral});
+                }
+                (storage ? b.stored : b.sampled).push_back(entry);
+                add_write();
+                ++stats.texture_memo_hits;
+                continue;
+            }
+        }
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid ||
@@ -1747,6 +1851,16 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             const vk::ImageView view =
                 View(*entry, view_info, storage ? ViewUse::Storage : ViewUse::Sampled);
             b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
+        }
+        if (memo) {
+            // OPT-002: remembered for the next draws reading this T# the same way.
+            memo->sharp = raw_sharp;
+            memo->flags = memo_flags;
+            memo->entry = entry;
+            for (u32 i = 0; i < num_bindings; ++i) {
+                memo->views[i] = b.images[first + i].imageView;
+            }
+            memo->generation = registry->Generation() + unmap_generation;
         }
         (storage ? b.stored : b.sampled).push_back(entry);
         add_write();
@@ -2159,6 +2273,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                          .count();
         }
     } timed{start, stats.draw_ns};
+    t_timed = (++timing_tick & 15) == 0; // OPT-001
+    stats.timed_draws += t_timed ? 1 : 0;
     r.scheduler.PopPendingOperations();
     const auto& regs = r.liverpool->DrawRegs();
     switch (Classify(regs)) {
@@ -2633,6 +2749,7 @@ void NativeRenderer::DispatchDirect() {
                          .count();
         }
     } timed{start, stats.dispatch_ns};
+    t_timed = false; // OPT-001: the phase timers are the draws'
     r.scheduler.PopPendingOperations();
     const auto& cs_program = r.liverpool->DrawCsRegs();
     const ComputePipeline* pipeline = r.AcquireComputePipeline();
@@ -2675,6 +2792,7 @@ void NativeRenderer::DispatchDirect() {
 
 void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     std::scoped_lock lock{mutex};
+    t_timed = false; // OPT-001
     r.scheduler.PopPendingOperations();
     const ComputePipeline* pipeline = r.AcquireComputePipeline();
     if (!pipeline) {
@@ -2911,6 +3029,8 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
         }
     }
     DropMirrors(address, size); // NAT-150
+    ++buffer_generation;        // OPT-003
+    ++unmap_generation;         // OPT-002
 }
 
 void NativeRenderer::EvictImages() {
@@ -3255,6 +3375,7 @@ void NativeRenderer::Report() {
              "mirrors {} ({:.1f} MB; NAT-150: {} binds, {} made ({:.1f} MB), {} dropped as "
              "CPU-written, {} evicted, {} over budget, {} pages refreshed, {} granules read in "
              "place), "
+             "memo hits textures {}/{} buffers {} (OPT-002/003), "
              "fill shaders {}, targets rewritten by clears/uploads/partial clears/fills "
              "{}/{}/{}/{} (NAT-120/124/132), "
              "on the GPU ({:.1f} MB), uploads from guest memory on the GPU/CPU {}/{}; images so far: "
@@ -3278,10 +3399,12 @@ void NativeRenderer::Report() {
                  return bytes / 1048576.0;
              }(),
              stats.region_refresh_pages, stats.region_refresh_ns / 1e6, stats.guest_buffer_calls,
-             stats.guest_buffer_ns / 1e6, mirrors.size(), mirror_bytes / 1048576.0,
+             stats.guest_buffer_ns * 16 / 1e6, // OPT-001: timed on one draw in 16
+             mirrors.size(), mirror_bytes / 1048576.0,
              stats.mirror_binds, stats.mirrors_made, stats.mirror_made_bytes / 1048576.0,
              stats.mirrors_dropped, stats.mirrors_evicted, stats.mirror_over_budget,
-             stats.mirror_refresh_pages, dynamic_granules.size(),
+             stats.mirror_refresh_pages, dynamic_granules.size(), stats.texture_memo_hits,
+             stats.texture_lookups, stats.buffer_memo_hits,
              stats.fill_shaders, stats.rewrite_clears, stats.rewrite_uploads,
              stats.rewrite_partial, stats.rewrite_fills,
              stats.gathered_bytes / 1048576.0,
@@ -3296,7 +3419,8 @@ void NativeRenderer::Report() {
                  for (u32 i = 0; i < stats.phase_ns.size(); ++i) {
                      text += fmt::format(
                          "{}{:.2f}", i == 0 ? "" : (i == 4 ? "(" : (i == 5 ? ")/" : "/")),
-                         stats.draws ? stats.phase_ns[i] / 1000.0 / stats.draws : 0.0);
+                         stats.timed_draws ? stats.phase_ns[i] / 1000.0 / stats.timed_draws
+                                           : 0.0);
                  }
                  return text;
              }());
@@ -3316,6 +3440,8 @@ void NativeRenderer::Report() {
     stats.barriers = stats.splices = stats.copied_reads = stats.copied_bytes = stats.unbound = 0;
     stats.null_images = stats.fills = stats.copies = stats.meta_clears = stats.inline_writes = 0;
     stats.source_copies = stats.draw_ns = stats.dispatch_ns = 0;
+    stats.timed_draws = 0;
+    stats.texture_memo_hits = stats.texture_lookups = stats.buffer_memo_hits = 0;
     stats.gathers = stats.gathered_bytes = stats.writebacks = 0;
     stats.region_binds = stats.regions_made = stats.region_refreshes = 0;
     stats.fill_shaders = stats.rewrite_clears = stats.rewrite_uploads = 0;
