@@ -153,7 +153,12 @@ static auto UserPaths = [] {
     create_path(PathType::MetaDataDir, user_dir / METADATA_DIR);
     create_path(PathType::CustomTrophy, user_dir / CUSTOM_TROPHY);
     create_path(PathType::CustomConfigs, user_dir / CUSTOM_CONFIGS);
+#ifdef RYTY_GPU
+    // RyGT keeps the shaders in plain sight: <RyGT folder>\shaders, beside user.
+    create_path(PathType::CacheDir, user_dir.parent_path() / "shaders");
+#else
     create_path(PathType::CacheDir, user_dir / CACHE_DIR);
+#endif
     create_path(PathType::FontsDir, user_dir / FONTS_DIR);
     create_path(PathType::TrophyDir, user_dir / TROPHY_DIR);
     create_path(PathType::HomeDir, user_dir / HOME_DIR);
