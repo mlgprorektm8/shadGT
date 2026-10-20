@@ -269,6 +269,10 @@ public:
         std::scoped_lock lk{mutex};
         bool any = false;
         IterateWords(bounds, [&](u64 index, u64 mask) {
+            // Cold words still participate in GetWatcherBounds below. Leaving
+            // their mask uninitialized can add watchers with no cache owner,
+            // so CPU invalidation can never remove the resulting protection.
+            write_prot[index] = 0;
             const u64 hot_bits = hot[index] & mask;
             if (hot_bits == 0) {
                 return;
