@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include <chrono>
 
 #include <vk_mem_alloc.h>
 
@@ -214,6 +215,7 @@ struct RecycledImage {
     vk::Image image;
     vk::DeviceSize size_bytes;
     u64 seq;
+    std::chrono::steady_clock::time_point unused_since;
 };
 std::deque<std::pair<RecycleKey, u64>> g_recycle_order; // oldest first, for eviction
 u64 g_recycle_seq = 0;
@@ -284,7 +286,7 @@ bool Recycle(VmaAllocator allocator, const vk::ImageCreateInfo& ci, VmaAllocatio
         });
     }
     const u64 seq = ++g_recycle_seq;
-    g_recycled[key].push_back({allocation, image, size_bytes, seq});
+    g_recycled[key].push_back({allocation, image, size_bytes, seq, std::chrono::steady_clock::now()});
     g_recycle_order.emplace_back(key, seq);
     g_recycled_bytes += size_bytes;
     return true;
@@ -312,6 +314,31 @@ std::optional<RecycledImage> TakeRecycled(const vk::ImageCreateInfo& ci) {
     return taken;
 }
 } // namespace
+
+void TrimUnusedRecycledImages(VmaAllocator allocator) {
+    const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{30};
+    std::scoped_lock lk{g_recycle_mutex};
+    while (!g_recycle_order.empty()) {
+        const auto& [key, seq] = g_recycle_order.front();
+        auto bucket = g_recycled.find(key);
+        if (bucket == g_recycled.end()) {
+            g_recycle_order.pop_front();
+            continue;
+        }
+        auto& images = bucket->second;
+        const auto it = std::ranges::find(images, seq, &RecycledImage::seq);
+        if (it != images.end()) {
+            if (it->unused_since > cutoff) break;
+            // Images enter this pool only after their GPU completion callback.
+            vmaDestroyImage(allocator, it->image, it->allocation);
+            g_recycled_bytes -= it->size_bytes;
+            images.erase(it);
+            ++g_recycle_dropped;
+        }
+        if (images.empty()) g_recycled.erase(bucket);
+        g_recycle_order.pop_front();
+    }
+}
 
 UniqueImage::~UniqueImage() {
     Destroy();

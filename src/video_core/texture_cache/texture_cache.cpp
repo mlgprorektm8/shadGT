@@ -1652,7 +1652,36 @@ void TextureCache::GarbageCollectSamplers() {
     }
 }
 
+void TextureCache::GarbageCollectUnusedImages() {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    if (now - idle_gc_epoch >= seconds{30}) {
+        // At least 30 seconds old, regardless of submission rate. Two epochs avoid
+        // querying a clock for every texture touch on the hot draw path.
+        idle_gc_cutoff_tick = idle_gc_previous_tick;
+        idle_gc_previous_tick = gc_tick;
+        idle_gc_epoch = now;
+    }
+    if (now - idle_gc_last_scan < seconds{1}) return;
+    idle_gc_last_scan = now;
+    TrimUnusedRecycledImages(instance.GetAllocator());
+    if (idle_gc_cutoff_tick == 0) return;
+
+    u32 freed = 0;
+    image_lru_cache.ForEachItemBelow(idle_gc_cutoff_tick, [&](Image& image) {
+        // Never discard the only GPU-written copy. These remain under the existing
+        // readback-aware pressure collector or explicit guest-unmap path.
+        if (True(image.flags & ImageFlagBits::GpuModified)) return false;
+        FreeImage(slot_images.GetSlotId(image));
+        return ++freed >= 64;
+    });
+    if (freed != 0) {
+        LOG_DEBUG(Render_Vulkan, "Reclaimed {} long-unused reloadable textures", freed);
+    }
+}
+
 void TextureCache::RunGarbageCollector() {
+    GarbageCollectUnusedImages();
     GarbageCollectImages();
     GarbageCollectSamplers();
     ++gc_tick;

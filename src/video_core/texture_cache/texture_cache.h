@@ -400,6 +400,7 @@ private:
     }
 
     void GarbageCollectImages();
+    void GarbageCollectUnusedImages();
     /// DIAG-117: why images are freed (call line), with a sample image, every 2 s.
     void NoteImageFree(ImageId image_id, u32 line);
     void GarbageCollectSamplers();
@@ -437,6 +438,11 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    // Wall-clock epochs map onto existing LRU submission ticks (not frame counts).
+    std::chrono::steady_clock::time_point idle_gc_epoch = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point idle_gc_last_scan{};
+    u64 idle_gc_previous_tick = 0;
+    u64 idle_gc_cutoff_tick = 0;
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
     /// A recorded image readback waiting for the GPU before its guest write.
