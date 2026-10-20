@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <cstdio>
 #include <thread>
 #include "common/logging/log.h"
 #include "common/arch.h"
@@ -55,10 +56,12 @@ void assert_fail_impl() {
                 GetModuleFileNameA(module, name, sizeof(name));
             }
             const char* base = std::strrchr(name, '\\');
-            LOG_CRITICAL(Debug, "  #{} {}+{:#x}", i, base ? base + 1 : name,
-                         reinterpret_cast<uintptr_t>(frames[i]) -
-                             reinterpret_cast<uintptr_t>(module));
+            std::fprintf(stderr, "  #%u %s+0x%llx\n", static_cast<unsigned>(i),
+                         base ? base + 1 : name,
+                         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(frames[i]) -
+                             reinterpret_cast<uintptr_t>(module)));
         }
+        std::fflush(stderr);
         Common::Log::Flush();
     }
 #endif

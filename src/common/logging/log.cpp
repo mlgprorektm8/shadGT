@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 #include <iostream>
 #include <ranges>
 #include <string>
@@ -29,6 +30,7 @@ using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 #endif
 
 #include "common/assert.h"
+#include "common/recoverable.h"
 #include "common/logging/log.h"
 #include "common/logging/stdout_level.h"
 #include "common/logging/log_file_sink.h"
@@ -69,6 +71,8 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
         return;
     }
 #ifdef RYTY_GPU
+    // Fatal assertion reports must survive the diagnostic stdout gate.
+    const bool fatal_report = level == Level::Critical && Common::RecoverableDepth() == 0;
     // RyGT exposes a single Error level for error and critical diagnostics.
     if (level == Level::Critical) level = Level::Error;
 #endif
@@ -79,6 +83,10 @@ void VLog(Class log_class, Level level, const char* file, int line, const char* 
         NameOf(ToSpdlog(level)), Common::GetCurrentThreadName(),
         spdlog::source_loc::basename(file), line, fn, std::string_view(msg.data(), msg.size()));
 #ifdef RYTY_GPU
+    if (fatal_report) {
+        std::fprintf(stderr, "%s\n", entry.c_str());
+        std::fflush(stderr);
+    }
     if (g_stdout_logger) g_stdout_logger->log(ToSpdlog(level), "{}", entry);
 #else
     logger->log(ToSpdlog(level), "{}", entry);
