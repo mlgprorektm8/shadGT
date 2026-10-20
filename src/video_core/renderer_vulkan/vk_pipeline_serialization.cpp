@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <map>
+#include <mutex>
+
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -125,10 +128,123 @@ bool LoadStoredGraphicsPipeline(std::vector<u8>&& blob, GraphicsPipelineKey& key
     return sdata.Deserialize(ar);
 }
 
+namespace {
+// SHD-006 census: how many new translations one made before any draw, from a program's code and
+// registers alone, would have matched: null sharps (2D/array float textures, unstrided raw
+// buffers, plain samplers), pixel inputs in order, plain float targets with the packed export.
+// Logged every 250 new translations with what the others needed.
+struct TranslationCensus {
+    std::mutex mutex;
+    u64 total{}, ps{}, ps_default{}, vs{}, vs_default{}, other{};
+    std::map<std::string, u64> reasons;
+} g_census;
+
+void CountTranslation(const Shader::Info& info, const Shader::StageSpecialization& spec) {
+    std::string why;
+    const auto add = [&](const char* reason) {
+        if (why.find(reason) == std::string::npos) {
+            why += why.empty() ? "" : "+";
+            why += reason;
+        }
+    };
+    using Type = AmdGpu::ImageType;
+    for (const auto& image : spec.images) {
+        if (image.type == Type::Cube) {
+            add("cube");
+        } else if (image.type == Type::Color3D) {
+            add("3d");
+        } else if (image.type == Type::Color2DMsaa || image.type == Type::Color2DMsaaArray) {
+            add("msaa");
+        }
+        if (image.is_integer) {
+            add("int-texture");
+        }
+        if (image.is_srgb) {
+            add("srgb");
+        }
+        if (image.num_conversion != AmdGpu::NumberConversion::None) {
+            add("tex-conversion");
+        }
+    }
+    for (const auto& buffer : spec.buffers) {
+        if (buffer.stride != 0) {
+            add("stride");
+        }
+        if (buffer.is_formatted) {
+            add("formatted-buffer");
+        }
+    }
+    for (const auto& sampler : spec.samplers) {
+        if (sampler.force_unnormalized || sampler.force_degamma) {
+            add("sampler");
+        }
+    }
+    const bool is_ps = info.sw_stage == Shader::SwStage::Fragment;
+    const bool is_vs = info.sw_stage == Shader::SwStage::Vertex;
+    if (is_ps) {
+        const auto& fs = spec.runtime_info.hw.fs;
+        for (u32 i = 0; i < fs.num_inputs && i < fs.inputs.size(); ++i) {
+            if (fs.inputs[i].param_index != i || fs.inputs[i].is_default) {
+                add("inputs");
+                break;
+            }
+        }
+        for (const auto& cb : fs.color_buffers) {
+            if (cb.data_format == AmdGpu::DataFormat::FormatInvalid) {
+                continue;
+            }
+            const bool plain = cb.num_format == AmdGpu::NumberFormat::Float &&
+                               cb.num_conversion == AmdGpu::NumberConversion::None &&
+                               cb.export_format == AmdGpu::ShaderExportFormat::ABGR_FP16 &&
+                               cb.swizzle == AmdGpu::IdentityMapping && !cb.blend_self_scale &&
+                               !cb.blend_swizzled_alpha && !cb.blend_swizzled_factors;
+            if (!plain) {
+                add("outputs");
+                break;
+            }
+        }
+    }
+    if (is_vs && !spec.vs_attribs.empty()) {
+        add("vertex-layout");
+    }
+    std::scoped_lock lock{g_census.mutex};
+    ++g_census.total;
+    if (is_ps) {
+        ++g_census.ps;
+        g_census.ps_default += why.empty() ? 1 : 0;
+    } else if (is_vs) {
+        ++g_census.vs;
+        g_census.vs_default += why.empty() ? 1 : 0;
+    } else {
+        ++g_census.other;
+    }
+    if (!why.empty()) {
+        ++g_census.reasons[(is_ps ? "ps:" : is_vs ? "vs:" : "other:") + why];
+    }
+    if (g_census.total % 250 == 0) {
+        std::vector<std::pair<u64, std::string>> top;
+        for (const auto& [reason, count] : g_census.reasons) {
+            top.emplace_back(count, reason);
+        }
+        std::ranges::sort(top, std::greater{});
+        std::string text;
+        for (size_t i = 0; i < std::min<size_t>(top.size(), 14); ++i) {
+            text += fmt::format(" {}={}", top[i].second, top[i].first);
+        }
+        LOG_WARNING(Render_Vulkan,
+                    "SHD-006 census: {} new translations; pixel {} ({} from code alone), vertex {} "
+                    "({} from code alone), other {}; needed:{}",
+                    g_census.total, g_census.ps, g_census.ps_default, g_census.vs,
+                    g_census.vs_default, g_census.other, text);
+    }
+}
+} // namespace
+
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash,
                         size_t perm_idx) {
+    CountTranslation(info, spec); // SHD-006
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
