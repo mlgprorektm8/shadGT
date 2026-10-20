@@ -44,6 +44,7 @@
 #include "ryty_gpu/ryty_diag.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/native/shadow.h"
+#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #endif
 
 namespace AmdGpu {
@@ -756,7 +757,20 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // PERF-047: the pipeline is selected now, on this thread, from these registers; the
     // recorder checks the selection against the memory it sees before using it.
     std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
-    if (direct_draw && rasterizer->SelectsPipelinesAhead()) {
+    bool prepared_draw = false;
+#ifdef RYTY_GPU
+    // OPT-012: a draw a game job thread prepared is selected there (the recorder installs
+    // that selection).
+    if (!compute && direct_draw && decode_draw_packet &&
+        regs.primitive_type != PrimitiveType::QuadList &&
+        Vulkan::NativeRenderer::PrepareEnabled()) {
+        if (auto* native = rasterizer->Native()) {
+            prepared_draw = native->HasPrepared(decode_draw_packet);
+        }
+    }
+    decode_draw_packet = nullptr;
+#endif
+    if (direct_draw && rasterizer->SelectsPipelinesAhead() && !prepared_draw) {
         selected = compute ? rasterizer->SelectComputePipelineAhead()
                            : rasterizer->SelectPipelineAhead();
     }
@@ -1899,6 +1913,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 staged_index_offset = 0; // MT-005
+                decode_draw_packet = cmd_address; // OPT-012
                 RecordDraw(
                     [this, cmd_address] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndex2",
@@ -1936,6 +1951,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 const u32 index_offset = draw_index_off->index_offset;
                 staged_index_offset = index_offset; // MT-005
+                decode_draw_packet = cmd_address; // OPT-012
                 RecordDraw(
                     [this, cmd_address, index_offset] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndexOffset2",
@@ -1968,6 +1984,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
+                decode_draw_packet = cmd_address; // OPT-012
                 RecordDraw(
                     [this, cmd_address] {
                         rasterizer->ScopeMarker("gfx:{}:DrawIndexAuto",

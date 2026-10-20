@@ -2379,8 +2379,33 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     const bool quad_list = regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
     bool quad_triangles = quad_list && Common::PerfFeatureEnabled(28) &&
                           u64(regs.num_indices) / 4 * 6 * sizeof(u32) <= MaxQuadIndexBytes;
-    const GraphicsPipeline* pipeline = [&] {
+    // OPT-010: the draw a game job thread prepared, if any.
+    static const bool prepare = PrepareEnabled();
+    PreparedDraw* prepared = nullptr;
+    if (prepare && !r.FrameDumpCollecting()) {
+        prepared = TakePrepared(Rasterizer::t_draw_packet);
+        stats.prepared_missing += prepared ? 0 : 1;
+    }
+    struct GiveBack {
+        NativeRenderer& n;
+        PreparedDraw* p;
+        ~GiveBack() {
+            if (p) {
+                n.FreePrepared(p);
+            }
+        }
+    } give_back{*this, prepared};
+    // OPT-012: when the command thread didn't select (it saw the prepared draw), the job
+    // thread's selection is installed and trusted.
+    bool trusted = false;
+    const GraphicsPipeline* pipeline = [&]() -> const GraphicsPipeline* {
         PhaseClock clock{stats.phase_ns[0]};
+        if (prepared && !quad_list && r.selected_pipeline == nullptr && prepared->pipeline) {
+            if (const GraphicsPipeline* installed = InstallPrepared(*prepared)) {
+                trusted = true;
+                return installed;
+            }
+        }
         return r.AcquireGraphicsPipeline(
             {
                 .vertex_sgpr_offset = 0,
@@ -2402,26 +2427,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     if (r.FrameDumpActive()) {
         r.FrameDumpPass(regs, targets.state, pipeline); // NAT-117
     }
-    // OPT-010: the bindings a game job thread worked out ahead, when they hold.
-    static const bool prepare = PrepareEnabled();
-    PreparedDraw* prepared = nullptr;
-    if (prepare && !r.FrameDumpCollecting()) {
-        prepared = TakePrepared(Rasterizer::t_draw_packet);
-        stats.prepared_missing += prepared ? 0 : 1;
-    }
-    struct GiveBack {
-        NativeRenderer& n;
-        PreparedDraw* p;
-        ~GiveBack() {
-            if (p) {
-                n.FreePrepared(p);
-            }
-        }
-    } give_back{*this, prepared};
+    // OPT-010: the bindings the job thread worked out ahead, when they hold.
     bool from_prepared = false;
     if (prepared) {
         PhaseClock clock{stats.phase_ns[2]};
-        from_prepared = CommitPrepared(*prepared, *pipeline, regs);
+        from_prepared = CommitPrepared(*prepared, *pipeline, regs, trusted);
     }
     DrawBindings& b = from_prepared ? prepared->bindings : bindings;
     if (!from_prepared) {
@@ -2439,7 +2449,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock clock{stats.phase_ns[5]};
         if (from_prepared && prepared->has_vertices &&
             CommitPreparedVertices(*prepared, *pipeline, regs, is_indexed, index_offset,
-                                   quad_triangles)) {
+                                   quad_triangles, trusted)) {
             vi = prepared->vertex_index.get(); // OPT-011
         } else {
             vertex_index = {};
@@ -2579,6 +2589,9 @@ void NativeRenderer::PreparedDraw::Reset() {
     index_address = 0;
     mirrors.clear();
     in_place.clear();
+    for (auto& copy : stage_copies) {
+        copy.present = false;
+    }
 }
 
 void NativeRenderer::ChangeLog::Note(VAddr begin, VAddr end) {
@@ -2622,6 +2635,42 @@ void NativeRenderer::FreePrepared(PreparedDraw* draw) {
     draw->Reset();
     std::scoped_lock lock{prepared_pool_mutex};
     prepared_free.push_back(draw);
+}
+
+bool NativeRenderer::HasPrepared(const void* packet) {
+    if (!packet) {
+        return false;
+    }
+    PreparedShard& shard = ShardFor(packet);
+    std::scoped_lock lock{shard.mutex};
+    return shard.draws.contains(packet);
+}
+
+const GraphicsPipeline* NativeRenderer::InstallPrepared(PreparedDraw& p) {
+    // As AcquireGraphicsPipeline with the command thread's selection: the stages' user data
+    // and flattened user data, the flattened buffers moved in (and the old ones kept here).
+    std::array<Rasterizer::SelectedStage, Shader::MaxStageTypes> selected{};
+    for (u32 i = 0; i < selected.size(); ++i) {
+        const auto& copy = p.stage_copies[i];
+        auto& stage = selected[i];
+        stage.present = copy.present;
+        if (!copy.present) {
+            continue;
+        }
+        stage.pgm_base = copy.pgm_base;
+        stage.num_user_data = copy.num_user_data;
+        std::copy_n(copy.user_data.begin(), copy.num_user_data, stage.user_data.begin());
+        stage.flattened = std::move(p.stage_copies[i].flattened);
+    }
+    const bool installed = r.InstallDrawStages(p.pipeline, selected, true);
+    for (u32 i = 0; i < selected.size(); ++i) {
+        p.stage_copies[i].flattened = std::move(selected[i].flattened);
+    }
+    if (!installed) {
+        return nullptr;
+    }
+    ++stats.prepared_installed;
+    return p.pipeline;
 }
 
 NativeRenderer::PreparedDraw* NativeRenderer::TakePrepared(const void* packet) {
@@ -2687,6 +2736,19 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
         }
     }
     p->bindings.writes.reserve(total);
+    for (u32 i = 0; i < count; ++i) {
+        // OPT-012: what the recorder installs (as the command thread's selection would copy).
+        auto& copy = p->stage_copies[i];
+        const auto* stage = stages[i];
+        copy.present = stage != nullptr;
+        if (stage) {
+            copy.pgm_base = stage->pgm_base;
+            copy.num_user_data =
+                static_cast<u32>(std::min<size_t>(stage->user_data.size(), copy.user_data.size()));
+            std::copy_n(stage->user_data.begin(), copy.num_user_data, copy.user_data.begin());
+            copy.flattened.assign(stage->flattened_ud_buf.begin(), stage->flattened_ud_buf.end());
+        }
+    }
     for (u32 i = 0; ok && i < count; ++i) {
         const auto* stage = stages[i];
         p->stage_hashes[i] = stage ? StageHash(*stage) : 0;
@@ -3157,7 +3219,8 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
 
 bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipeline& pipeline,
                                             const AmdGpu::Regs& regs, bool is_indexed,
-                                            u32 index_offset, bool quad_triangles) {
+                                            u32 index_offset, bool quad_triangles,
+                                            bool trusted) {
     // (The ranges were checked with the bindings'.)
     const auto reject = [&] {
         ++stats.prepared_vertices_rejected;
@@ -3166,7 +3229,8 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
     if (quad_triangles || p.indexed != is_indexed || p.index_offset != index_offset) {
         return reject();
     }
-    if (VertexHash(pipeline, pipeline.GetStage(Shader::SwStage::Vertex),
+    if (!trusted &&
+        VertexHash(pipeline, pipeline.GetStage(Shader::SwStage::Vertex),
                    regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1) != p.vertex_hash) {
         return reject();
     }
@@ -3198,7 +3262,7 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
 }
 
 bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pipeline,
-                                    const AmdGpu::Regs& regs) {
+                                    const AmdGpu::Regs& regs, bool trusted) {
     const auto reject = [&](u32 why) {
         ++stats.prepared_rejected[why];
         return false;
@@ -3207,7 +3271,8 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         return reject(0);
     }
     const auto stages = pipeline.GetStages();
-    for (u32 i = 0; i < stages.size() && i < p.stage_hashes.size(); ++i) {
+    // OPT-012: stages installed from this prepared draw are what it was worked out from.
+    for (u32 i = 0; !trusted && i < stages.size() && i < p.stage_hashes.size(); ++i) {
         if ((stages[i] ? StageHash(*stages[i]) : 0) != p.stage_hashes[i]) {
             return reject(1);
         }
@@ -4203,7 +4268,8 @@ void NativeRenderer::Report() {
              "previous one's mirror {} (OPT-004), vertex records skipped {} (OPT-005), "
              "prepared draws (OPT-010): {} used, {} without one, rejected (pipeline/user "
              "data/unmap/images/buffers) {}, made on job threads {} ({:.2f} us each, {} could "
-             "not, {} replaced, {} stale), vertices from them {} ({} not), record parts "
+             "not, {} replaced, {} stale), vertices from them {} ({} not), pipelines from "
+             "them {} (OPT-012), record parts "
              "barrier/begin/dynamic/vertex/pipeline/bindings/draw/notes {}, "
              "fill shaders {}, targets rewritten by clears/uploads/partial clears/fills "
              "{}/{}/{}/{} (NAT-120/124/132), "
@@ -4240,7 +4306,7 @@ void NativeRenderer::Report() {
                                        : 0.0,
              prepare_stats.failed.load(), prepare_stats.replaced.load(),
              prepare_stats.stale.load(), stats.prepared_vertices,
-             stats.prepared_vertices_rejected,
+             stats.prepared_vertices_rejected, stats.prepared_installed,
              [&] {
                  std::string text;
                  for (u32 i = 0; i < stats.record_ns.size(); ++i) {
@@ -4292,6 +4358,7 @@ void NativeRenderer::Report() {
     stats.prepared_used = stats.prepared_missing = 0;
     stats.prepared_rejected = {};
     stats.prepared_vertices = stats.prepared_vertices_rejected = 0;
+    stats.prepared_installed = 0;
     stats.record_ns = {};
     prepare_stats.made = 0;
     prepare_stats.failed = 0;

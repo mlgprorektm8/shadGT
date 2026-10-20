@@ -607,6 +607,8 @@ private:
     std::atomic<u64> labels_pushed{};
     std::atomic<u64> labels_done{};
     std::atomic<u64> decoding_submit{};
+    /// OPT-012: the draw packet RecordDraw records (direct draws), for the prepared-draw check.
+    const void* decode_draw_packet{};
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);

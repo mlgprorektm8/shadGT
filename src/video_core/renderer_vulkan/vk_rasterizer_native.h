@@ -108,6 +108,9 @@ public:
 
     /// OPT-010 (RYGT_NATIVE_PREPARE=1): whether game job threads prepare draws.
     static bool PrepareEnabled();
+    /// OPT-012: on the command thread, whether a job thread prepared the draw at the packet
+    /// (with its stages): then the command thread doesn't select its pipeline.
+    bool HasPrepared(const void* packet);
     /// OPT-010: on a game job thread whose walk reached a draw (`regs` its state there) and
     /// found its built pipeline, the stage infos holding the draw's user data: the draw's
     /// bindings worked out ahead for the recorder (see PreparedDraw).
@@ -419,6 +422,17 @@ private:
         VAddr index_address = 0;
         boost::container::small_vector<Mirror*, 4> mirrors;
         boost::container::small_vector<std::pair<VAddr, u64>, 4> in_place;
+        /// OPT-012: the stages as the job thread matched them (what the command thread's
+        /// selection would copy): the recorder installs them when the command thread didn't
+        /// select (HasPrepared).
+        struct StageCopy {
+            bool present = false;
+            VAddr pgm_base = 0;
+            u32 num_user_data = 0;
+            std::array<u32, 16> user_data{};
+            std::vector<u32> flattened;
+        };
+        std::array<StageCopy, Shader::MaxStageTypes> stage_copies;
         void Reset();
     };
     /// OPT-010: the guest ranges whose region or mirror was made or dropped, by sequence number
@@ -475,7 +489,7 @@ private:
                                                               Mirror** mirror_out);
     bool CommitPreparedVertices(PreparedDraw& p, const GraphicsPipeline& pipeline,
                                 const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
-                                bool quad_triangles);
+                                bool quad_triangles, bool trusted);
     static u64 VertexHash(const GraphicsPipeline& pipeline, const Shader::Info& vs,
                           u32 step_rate_0, u32 step_rate_1);
     /// GuestBufferLookup's lookups without its side effects: none when it would make a region,
@@ -485,7 +499,10 @@ private:
     /// Recorder: whether the prepared draw holds for the draw being recorded (its ordered part
     /// is then done).
     bool CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pipeline,
-                        const AmdGpu::Regs& regs);
+                        const AmdGpu::Regs& regs, bool trusted);
+    /// OPT-012: installs the prepared draw's stages for its pipeline (nullptr if they don't
+    /// fit it).
+    const GraphicsPipeline* InstallPrepared(PreparedDraw& p);
     static u64 StageHash(const Shader::Info& info);
     std::atomic<u64> shared_frame{0}; ///< OPT-010: `frame`, for job threads
     std::atomic<u32> recorder_epoch{0};
@@ -580,6 +597,7 @@ private:
         u64 prepared_used = 0, prepared_missing = 0;
         std::array<u64, 5> prepared_rejected{};
         u64 prepared_vertices = 0, prepared_vertices_rejected = 0; ///< OPT-011
+        u64 prepared_installed = 0; ///< OPT-012: pipelines from a job thread's selection
         /// OPT-011: the record phase's parts: barrier choice, pass begin, dynamic state, vertex
         /// and index binds, pipeline bind, descriptors and push constants, the draw, write notes.
         std::array<u64, 8> record_ns{};
