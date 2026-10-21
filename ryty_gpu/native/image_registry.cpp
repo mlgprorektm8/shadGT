@@ -206,6 +206,11 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             if (it->second->reused.load(std::memory_order_relaxed)) {
                 continue; // FIX-157: stale
             }
+            // A texture uploaded before the first draw is not a render target. Create and
+            // link a target so its writes become sources for the texture's other views.
+            if (render_target && it->second->from_cpu) {
+                continue;
+            }
             if (SameLayout(it->second->info, info)) {
                 exact = it->second.get();
                 if (render_target || !exact->from_cpu) {
@@ -356,7 +361,8 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         const auto [first, last] = shard.images.equal_range(info.guest_address);
         for (auto it = first; it != last; ++it) {
             if (SameLayout(it->second->info, info) &&
-                !it->second->reused.load(std::memory_order_relaxed)) {
+                !it->second->reused.load(std::memory_order_relaxed) &&
+                (!render_target || !it->second->from_cpu)) {
                 ++stats.hits;
                 return it->second.get();
             }
