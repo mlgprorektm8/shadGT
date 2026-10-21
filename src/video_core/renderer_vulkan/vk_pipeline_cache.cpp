@@ -821,9 +821,41 @@ PipelineCache::~PipelineCache() {
     SaveDriverCache(true);
 }
 
+// FIX-165 (RyGT): the driver's pipeline cache file is off unless RYGT_DRIVER_CACHE=1. GT Sport's grew to
+// 3.7 GB: it was loaded whole at start, and each save (every 30 s while new pipelines were made)
+// held the driver for 1.4-4.3 s and then wrote for 11 s. Lance's Lago Maggiore races dropped to
+// 10 fps and back again and again, and once the menus froze for a minute. The driver keeps its
+// own shader cache, and races ran no slower without the file (2026-10-16). With
+// RYGT_DRIVER_CACHE=1 the file is loaded, and saved only when the game ends.
+static bool DriverCacheFileEnabled() {
+#ifdef RYTY_GPU
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_DRIVER_CACHE");
+        return env && env[0] == '1';
+    }();
+    return enabled && EmulatorSettings.IsPipelineCacheEnabled();
+#else
+    return EmulatorSettings.IsPipelineCacheEnabled();
+#endif
+}
+
 void PipelineCache::CreateDriverCache() {
     std::vector<u8> data;
-    if (EmulatorSettings.IsPipelineCacheEnabled()) {
+#ifdef RYTY_GPU
+    if (!DriverCacheFileEnabled()) {
+        const auto& game_serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+        const auto unused = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                            fmt::format("{}.vkpipelinecache", game_serial);
+        std::error_code ec;
+        if (std::filesystem::exists(unused, ec)) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-165: the driver pipeline cache file is not used (RYGT_DRIVER_CACHE=1 "
+                        "turns it on); {} ({} MB) can be deleted",
+                        unused.string(), std::filesystem::file_size(unused, ec) >> 20);
+        }
+    }
+#endif
+    if (DriverCacheFileEnabled()) {
         const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
         driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
                             fmt::format("{}.vkpipelinecache", serial);
@@ -947,6 +979,10 @@ void PipelineCache::SaveDriverCache(bool wait) {
 }
 
 void PipelineCache::MaybeSaveDriverCache() {
+#ifdef RYTY_GPU
+    // FIX-165: never during play (the whole cache is read out and written each time).
+    return;
+#endif
     // New pipelines are compiled during play; save them in batches without blocking the frame.
     using namespace std::chrono_literals;
     if (num_new_pipelines - pipelines_at_driver_save >= 64 &&
