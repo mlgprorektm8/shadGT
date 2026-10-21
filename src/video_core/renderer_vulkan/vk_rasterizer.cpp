@@ -2804,11 +2804,12 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
                              buffer_cache.GetDirectMemory() != nullptr &&
                              DirectReadsRecently() && !MenuBarShown(); // FIX-125, FIX-127
 #ifdef RYTY_GPU
-    // NAT-100: native mode reads all guest memory in place: graphics fences wait for the GPU.
-    // FIX-158 (diagnosis, RYGT_NATIVE_HOLD_COMPUTE=1): compute-queue fences too.
+    // Native compute also reads guest memory in place and writes counters consumed by the CPU.
+    // Publish its fences only after GPU completion, so the guest cannot recycle those inputs
+    // or consume stale particle counters. Early compute fences caused stretched spark geometry.
     static const bool native_hold_compute = [] {
         const char* env = std::getenv("RYGT_NATIVE_HOLD_COMPUTE");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0');
     }();
     direct_hold = direct_hold || (native && (!compute_queue || native_hold_compute));
 #endif
