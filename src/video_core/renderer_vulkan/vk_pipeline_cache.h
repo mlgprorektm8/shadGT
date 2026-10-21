@@ -61,6 +61,7 @@ struct DrawIndirectParams {
     /// PERF-028: draw a quad list through the tessellation helpers instead of as triangles
     /// (indirect draws, or indices the command thread cannot read).
     bool tessellate_quads{};
+    bool is_indirect{};
 };
 
 class PipelineCache {

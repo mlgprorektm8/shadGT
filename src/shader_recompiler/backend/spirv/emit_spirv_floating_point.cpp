@@ -7,7 +7,12 @@
 namespace Shader::Backend::SPIRV {
 
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
-    ctx.Decorate(op, spv::Decoration::NoContraction);
+    // Pre-rasterization stages keep it, so position math stays the same across pipelines.
+    const bool can_contract = ctx.profile.fast_shader_math && (ctx.sw_stage == SwStage::Fragment ||
+                                                               ctx.sw_stage == SwStage::Compute);
+    if (!can_contract) {
+        ctx.Decorate(op, spv::Decoration::NoContraction);
+    }
     return op;
 }
 
@@ -76,8 +81,13 @@ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
     if (ctx.profile.supports_trinary_minmax) {
         return ctx.OpFMid3AMD(ctx.F32[1], a, b, c);
     }
-    const Id mmx{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], a, b), c)};
-    return ctx.OpNMax(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), mmx);
+    const Id is_nan{ctx.OpLogicalOr(
+        ctx.U1[1], ctx.OpIsNan(ctx.U1[1], a),
+        ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], b), ctx.OpIsNan(ctx.U1[1], c)))};
+    const Id mmx{ctx.OpFMin(ctx.F32[1], ctx.OpFMax(ctx.F32[1], a, b), c)};
+    const Id med3{ctx.OpFMax(ctx.F32[1], ctx.OpFMin(ctx.F32[1], a, b), mmx)};
+    const Id min3{ctx.OpNMin(ctx.F32[1], a, ctx.OpNMin(ctx.F32[1], b, c))};
+    return ctx.OpSelect(ctx.F32[1], is_nan, min3, med3);
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
@@ -149,16 +159,14 @@ Id EmitFPSqrt(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPSaturate32(EmitContext& ctx, Id value) {
-    const Id zero{ctx.ConstF32(f32{0.0})};
-    const Id one{ctx.ConstF32(f32{1.0})};
     // The GCN clamp modifier maps NaN to 0.
-    return ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, zero), one);
+    return ctx.OpNClamp(ctx.F32[1], value, ctx.f32_zero_value, ctx.f32_one_value);
 }
 
 Id EmitFPSaturate64(EmitContext& ctx, Id value) {
     const Id zero{ctx.Constant(ctx.F64[1], f64{0.0})};
     const Id one{ctx.Constant(ctx.F64[1], f64{1.0})};
-    return ctx.OpNMin(ctx.F64[1], ctx.OpNMax(ctx.F64[1], value, zero), one);
+    return ctx.OpNClamp(ctx.F64[1], value, zero, one);
 }
 
 // GCN clamping maps NaN to the lower bound; this is GLSL NClamp.

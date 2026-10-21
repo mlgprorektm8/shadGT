@@ -180,14 +180,13 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
     };
 
 #ifdef ARCH_X86_64
-    // Static patching rewrites the functions of the executable segments ahead of time. Windows
-    // uses it for guest red-zone protection, macOS to apply its CPU patches.
+    // Static patching rewrites the functions of the executable segments ahead of time. Initially
+    // useful because Windows uses it for guest red-zone protection, and macOS to apply its CPU
+    // patches, but now used on all OSes to patch 4-byte instructions
 #if defined(_WIN32)
     const bool use_static_patching = WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
-#elif defined(__APPLE__)
-    constexpr bool use_static_patching = true;
 #else
-    constexpr bool use_static_patching = false;
+    constexpr bool use_static_patching = true;
 #endif
     std::vector<std::pair<VAddr, u64>> executable_segments;
     std::vector<uintptr_t> function_starts;
@@ -253,6 +252,9 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             break;
         case PT_SCE_PROCPARAM:
             proc_param_virtual_addr = elf_pheader[i].p_vaddr + base_virtual_addr;
+            break;
+        case PT_SCE_MODULE_PARAM:
+            module_param_virtual_addr = elf_pheader[i].p_vaddr + base_virtual_addr;
             break;
         case PT_GNU_EH_FRAME: {
             eh_frame_hdr_addr = elf_pheader[i].p_vaddr;
@@ -647,8 +649,19 @@ const LibraryInfo* Module::FindLibrary(std::string_view id) {
 void* Module::FindByName(std::string_view name) {
     const auto nid_str = StringToNid(name);
     const auto symbols = export_sym.GetSymbols();
+    const auto it = std::ranges::find_if(symbols, [&](const Loader::SymbolRecord& record) {
+        return record.symbol.name == nid_str || record.symbol.nidName == name;
+    });
+    if (it != symbols.end()) {
+        return reinterpret_cast<void*>(it->virtual_address);
+    }
+    return nullptr;
+}
+
+void* Module::FindByNid(std::string_view nid) {
+    const auto symbols = export_sym.GetSymbols();
     const auto it = std::ranges::find_if(
-        symbols, [&](const Loader::SymbolRecord& record) { return record.symbol.name == nid_str; });
+        symbols, [&](const Loader::SymbolRecord& record) { return record.symbol.name == nid; });
     if (it != symbols.end()) {
         return reinterpret_cast<void*>(it->virtual_address);
     }

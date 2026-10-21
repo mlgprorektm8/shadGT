@@ -8,8 +8,14 @@
 #include <filesystem>
 #include <mutex>
 #include <shared_mutex>
+#include <optional>
+#include <thread>
+#include <unordered_set>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
+#include <boost/container/small_vector.hpp>
+#include <queue>
+#include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
 #include "common/multi_level_page_table.h"
@@ -78,6 +84,13 @@ public:
         VideoOut,
     };
 
+    enum class DownloadMemoryFlags : u32 {
+        None = 0,
+        Sync = 1 << 0,
+        Priority = 1 << 1,
+        DiscardBufferCache = 1 << 2,
+    };
+
     struct ImageDesc {
         ImageInfo info;
         ImageViewInfo view_info;
@@ -102,7 +115,7 @@ public:
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                  Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache,
-                 PageManager& tracker);
+                 PageManager& page_manager);
     ~TextureCache();
 
     TileManager& GetTileManager() noexcept {
@@ -114,6 +127,9 @@ public:
 
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+
+    /// Marks all images as maybe GPU dirty within the provided range.
+    void MarkAsMaybeGpuDirty(VAddr addr, size_t size);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
@@ -135,6 +151,9 @@ public:
 
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
+
+    /// Links the stencil plane of a depth surface to its depth image.
+    void AssociateStencil(ImageId depth_id, const ImageInfo& depth_info);
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
@@ -199,6 +218,31 @@ public:
         FMask,
         HTile,
     };
+
+    struct MetaDataInfo {
+        MetaType type;
+        ImageId owner_id{};
+        u64 owner_uid{};
+        u32 num_samples = 1;
+        s32 clear_mask = -1;
+    };
+
+    /// Returns metadata information if the specified address belongs to a live image.
+    std::optional<MetaDataInfo> GetMetaInfo(VAddr address) const {
+        const auto it = surface_metas.find(address);
+        if (it == surface_metas.end()) {
+            return std::nullopt;
+        }
+        const auto& meta = it->second;
+        if (!meta.owner_id || !slot_images.IsAllocated(meta.owner_id)) {
+            return std::nullopt;
+        }
+        const auto& owner = slot_images[meta.owner_id];
+        if (owner.image_uid != meta.owner_uid || False(owner.flags & ImageFlagBits::Registered)) {
+            return std::nullopt;
+        }
+        return meta;
+    }
 
     /// Returns meta type if the specified address is a metadata surface.
     std::optional<MetaType> IsMeta(VAddr address) const {
@@ -309,6 +353,20 @@ public:
         });
     }
 
+    template <typename Func>
+    void ForEachImageWithAddress(VAddr cpu_addr, Func&& func) {
+        const auto it = page_table.find(cpu_addr >> Traits::PAGE_BITS);
+        if (it == nullptr) {
+            return;
+        }
+        const u32 key = u32(cpu_addr >> 8);
+        for (const auto& entry : it->entries) {
+            if (entry.key == key) {
+                func(entry.id, slot_images[entry.id]);
+            }
+        }
+    }
+
 private:
     /// Iterate over all page indices in a range
     template <typename Func>
@@ -327,7 +385,8 @@ private:
     }
 
     /// Copies image memory back to CPU.
-    void DownloadImageMemory(ImageId image_id, bool sync = false);
+    void DownloadImageMemory(ImageId image_id,
+                             DownloadMemoryFlags flags = DownloadMemoryFlags::None);
 
     /// Register image in the page table
     void RegisterImage(ImageId image);
@@ -345,13 +404,14 @@ private:
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
+    void RegisterMeta(VAddr address, MetaDataInfo info);
+    void UnregisterMeta(VAddr address, u64 owner_uid);
+
     /// Removes the image and any views/surface metas that reference it.
     void DeleteImage(ImageId image_id);
 
     /// Touch the image in the LRU cache.
-    void TouchImage(Image& image) {
-        image_lru_cache.Touch(image, gc_tick);
-    }
+    void TouchImage(Image& image);
 
     /// Removes image from the cache and schedules it for deletion.
     void FreeImage(ImageId image_id) {
@@ -372,7 +432,7 @@ private:
     Vulkan::Runtime& runtime;
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
-    PageManager& tracker;
+    PageManager& page_manager;
     PageTable page_table;
     std::atomic<u64> registry_generation{1}; // PERF-057
     mutable std::shared_mutex registry_mutex;  // PERF-067: page_table structure
@@ -453,11 +513,8 @@ private:
     const bool readback_linear_images;
     std::mutex download_images_mutex;
     std::atomic<s64> last_readback_queued_ns{};
-    struct MetaDataInfo {
-        MetaType type;
-        s32 clear_mask = -1;
-    };
     absl::flat_hash_map<VAddr, MetaDataInfo> surface_metas;
 };
+DECLARE_ENUM_FLAG_OPERATORS(TextureCache::DownloadMemoryFlags)
 
 } // namespace VideoCore

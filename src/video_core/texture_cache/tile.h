@@ -425,8 +425,9 @@ struct TableEntry {
     std::array<MipInfo, MAX_MIPS> mips_layout;
 };
 
+static constexpr u32 MAX_DIM_LOG2 = 12;
+
 constexpr auto Pow2Bcn64ImageTable = [] {
-    static constexpr u32 MAX_DIM_LOG2 = 11;
     std::array<TableEntry, MAX_DIM_LOG2> entry{};
     for (u32 i = 0; i < MAX_DIM_LOG2; ++i) {
         const u32 pitch = 1 << i;
@@ -439,7 +440,6 @@ constexpr auto Pow2Bcn64ImageTable = [] {
 }();
 
 constexpr auto Pow2Bcn128ImageTable = [] {
-    static constexpr u32 MAX_DIM_LOG2 = 11;
     std::array<TableEntry, MAX_DIM_LOG2> entry{};
     for (u32 i = 0; i < MAX_DIM_LOG2; ++i) {
         const u32 pitch = 1 << i;

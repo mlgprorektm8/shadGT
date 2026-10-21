@@ -302,7 +302,18 @@ Liverpool::~Liverpool() {
     process_thread.request_stop();
     process_thread.join();
     draw_pipe.reset();
+    while (!ce_submits.empty()) {
+        ce_submits.front().destroy();
+        ce_submits.pop();
+    }
+    for (auto& queue : mapped_queues) {
+        while (!queue.submits.empty()) {
+            queue.submits.front().destroy();
+            queue.submits.pop();
+        }
+    }
 }
+
 
 // PERF-031: the draw pipe is opt-in (SHADGT_DRAW_PIPE=1) while it is measured;
 // -DisablePerf 46 keeps it off regardless.
@@ -1061,6 +1072,33 @@ bool Liverpool::CommandThreadFaultIsUrgent() {
            !draw_pipe->IsExclusive();
 }
 
+void Liverpool::ProcessCeQueue() {
+    auto& queue = mapped_queues[GfxQueueId];
+    Task::Handle task{};
+    {
+        std::scoped_lock lock{queue.m_access};
+        if (ce_submits.empty()) {
+            return;
+        }
+        task = ce_submits.front();
+    }
+    task.resume();
+    if (task.done()) {
+        task.destroy();
+        {
+            std::scoped_lock lock{queue.m_access};
+            ce_submits.pop();
+        }
+        --num_tasks;
+        // PERF-031: like a graphics submission, finished once the work before it is recorded.
+        RecordSafe([this] {
+            --num_submits;
+            std::scoped_lock lock2{submit_mutex};
+            submit_cv.notify_all();
+        });
+    }
+}
+
 void Liverpool::ProcessCommands() {
     if (draw_pipe) {
         draw_pipe->RunUrgentIfExclusive(); // PERF-050
@@ -1130,8 +1168,9 @@ void Liverpool::Process(std::stop_token stoken) {
 
         curr_qid = -1;
 
-        while (num_tasks || num_commands) {
+        while ((num_tasks || num_commands) && !stoken.stop_requested()) {
             ProcessCommands();
+            ProcessCeQueue();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
 
@@ -1292,6 +1331,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             auto task =
                 ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+            SCOPE_EXIT {
+                task.handle.destroy();
+            };
             RESUME_CE(task);
 
             while (!task.handle.done()) {
@@ -1311,14 +1353,13 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb,
                                            std::span<const u32> original_dcb) {
     FIBER_ENTER(dcb_task_name);
     if (!original_dcb.empty()) {
         RecordCmdBuffer(original_dcb.data(), original_dcb.size_bytes(), false);
     }
 
-    cblock.Reset();
     // PERF-019: a command buffer can be reused with other contents; never continue an earlier
     // read-ahead into this one.
     scan_buffer_end = nullptr;
@@ -1340,16 +1381,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         !(Common::PerfFeatureEnabled(23) && scanned_packets.contains(dcb.data()))) {
         lookahead_dcb = dcb;
         PipeReadAhead();
-    }
-
-    // TODO: potentially, ASCs also can depend on CE and in this case the
-    // CE task should be moved into more global scope
-    Task ce_task{};
-
-    if (!ccb.empty()) {
-        // In case of CCB provided kick off CE asap to have the constant heap ready to use
-        ce_task = ProcessCeUpdate(ccb);
-        RESUME_GFX(ce_task);
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
@@ -1710,6 +1741,27 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     false);
                 break;
             }
+            case PM4ItOpcode::DrawIndirectCountMulti: {
+                const auto* draw_indirect =
+                    reinterpret_cast<const PM4CmdDrawIndirectCountMulti*>(header);
+                const auto offset = draw_indirect->data_offset;
+                const auto stride = sizeof(DrawIndirectArgs);
+                if (DebugState.DumpingCurrentReg()) {
+                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+                }
+                if (!rasterizer) {
+                    break;
+                }
+                const auto cmd_address = reinterpret_cast<const void*>(header);
+                rasterizer->ScopeMarker(
+                    "gfx:{}:DrawIndirectCountMulti", fmt::make_format_args(cmd_address), [&] {
+                        rasterizer->DrawIndirect(
+                            false, indirect_args_addr, offset, draw_indirect->stride,
+                            draw_indirect->count, draw_indirect->count_addr,
+                            draw_indirect->base_vtx_loc, draw_indirect->start_inst_loc);
+                    });
+                break;
+            }
             case PM4ItOpcode::DrawIndirectMulti: {
                 const auto* draw_indirect =
                     reinterpret_cast<const PM4CmdDrawIndirectMulti*>(header);
@@ -1744,6 +1796,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     reinterpret_cast<const PM4CmdDrawIndexIndirect*>(header);
                 const auto offset = draw_index_indirect->data_offset;
                 const auto stride = sizeof(DrawIndexedIndirectArgs);
+                regs.max_index_size = index_buffer_num_indices;
+                MarkReg(regs.max_index_size);
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -1769,6 +1823,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* draw_index_indirect =
                     reinterpret_cast<const PM4CmdDrawIndexIndirectMulti*>(header);
                 const auto offset = draw_index_indirect->data_offset;
+                regs.max_index_size = index_buffer_num_indices;
+                MarkReg(regs.max_index_size);
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -1798,6 +1854,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* draw_index_indirect =
                     reinterpret_cast<const PM4CmdDrawIndexIndirectCountMulti*>(header);
                 const auto offset = draw_index_indirect->data_offset;
+                regs.max_index_size = index_buffer_num_indices;
+                MarkReg(regs.max_index_size);
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -1889,8 +1947,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndexBufferSize: {
                 const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
-                regs.num_indices = index_size->num_indices;
-                MarkReg(regs.num_indices);
+                index_buffer_num_indices = index_size->num_indices;
                 break;
             }
             case PM4ItOpcode::SetBase: {
@@ -2349,7 +2406,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 u64(indirect_buffer->ib_size) * sizeof(u32), true);
                 lookahead_outer.push_back(lookahead_dcb);
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+                SCOPE_EXIT {
+                    task.handle.destroy();
+                };
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
@@ -2365,12 +2425,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::WaitOnCeCounter: {
                 GpuWaitDiagnostics diagnostics;
-                while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
+                while (cblock.ce_count <= cblock.de_count) {
                     if (diagnostics.Ready()) {
                         LOG_WARNING(Render, "GPU DE wait stalled: CE={} DE={}", cblock.ce_count,
                                     cblock.de_count);
                     }
-                    RESUME_GFX(ce_task);
+                    YIELD_GFX();
                 }
                 break;
             }
@@ -2417,15 +2477,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         }
     }
 
-    if (ce_task.handle) {
-        while (!ce_task.handle.done()) {
-            RESUME_GFX(ce_task);
-        }
-        ce_task.handle.destroy();
-    }
     std::erase_if(live_cmd_buffers,
                   [&](const auto& span) { return span.data() == live_dcb.data(); });
-
     FIBER_EXIT;
 }
 
@@ -2659,6 +2712,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             auto task = ProcessCompute<true>(
                 {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+            SCOPE_EXIT {
+                task.handle.destroy();
+            };
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
@@ -3091,16 +3147,19 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         }
         last_gfx_submit = now;
     }
-    auto task = ProcessGraphics(dcb, ccb, original_dcb);
+    auto task = ProcessGraphics(dcb, original_dcb);
     {
-        std::scoped_lock lock{queue.m_access};
+        std::scoped_lock lock{submit_mutex, queue.m_access};
+        if (!ccb.empty()) {
+            ce_submits.emplace(ProcessCeUpdate(ccb).handle);
+            ++num_submits;
+            ++num_tasks;
+        }
         queue.submits.emplace(task.handle);
+        ++num_submits;
+        ++num_tasks;
+        submit_cv.notify_one();
     }
-
-    std::scoped_lock lk{submit_mutex};
-    ++num_submits;
-    ++num_tasks;
-    submit_cv.notify_one();
 }
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {

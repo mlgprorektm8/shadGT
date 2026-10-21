@@ -72,7 +72,7 @@ struct RangeSet {
 
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
-        if (size == 0 || m_ranges_set.empty()) {
+        if (m_ranges_set.empty() || size == 0) {
             return;
         }
         const VAddr start_address = base_addr;
@@ -178,7 +178,7 @@ public:
 
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
-        if (m_ranges_map.empty()) {
+        if (m_ranges_map.empty() || size == 0) {
             return;
         }
         const VAddr start_address = base_addr;
@@ -282,7 +282,7 @@ public:
 
     template <typename Func>
     void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
-        if (m_ranges_map.empty()) {
+        if (m_ranges_map.empty() || size == 0) {
             return;
         }
         const VAddr start_address = base_addr;

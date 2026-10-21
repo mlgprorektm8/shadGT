@@ -309,7 +309,7 @@ private:
     bool BindResources(const Pipeline* pipeline);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
-    void BindIndexBuffer(u32 index_offset = 0);
+    void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
     bool CanDrawQuadListAsTriangles(bool is_indexed, u32 index_offset);
     u32 BindQuadListIndices(bool is_indexed, u32 index_offset);
 
@@ -420,7 +420,7 @@ private:
     /// FIX-046: whether the address is inside the guest address space.
     bool IsMappedStart(VAddr address);
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
-    std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
+    ImageBinding db_desc;
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
@@ -437,11 +437,15 @@ private:
         const VideoCore::Buffer* buffer;
         u64 offset;
         u32 size;
-        bool is_written;
+        vk::AccessFlags2 src_access;
         VAddr guest_address{};
+
+        bool IsWritten() const {
+            return static_cast<bool>(src_access & vk::AccessFlagBits2::eShaderWrite);
+        }
     };
-    boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
-    boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+    std::vector<BoundBuffer> bound_buffers;
+    std::vector<VideoCore::ImageId> bound_images;
     /// DIAG-041: buffers and images of the current draw that were bound empty.
     std::string diag_empty_bindings;
     /// DIAG-044: records the current draw or dispatch in the dependency history.

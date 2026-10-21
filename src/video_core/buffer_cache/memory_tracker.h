@@ -37,8 +37,8 @@ public:
         });
     }
 
-    /// Mark a fully synchronized region as authoritative in the buffer cache.
-    void MarkRegionAsGpuModified(VAddr cpu_addr, u64 size) {
+    /// Mark region as modified from the host GPU without uploading it again
+    void MarkRegionAsGpuModified(VAddr cpu_addr, u64 size) noexcept {
         IteratePages<true>(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
             // PERF-012: the region was just synchronized, so hot pages can be clean again.
             manager->UntrackHotPages(offset, size);

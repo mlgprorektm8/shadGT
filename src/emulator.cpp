@@ -38,8 +38,10 @@
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/np/np_handler/np_handler.h"
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/save_data/save_backup.h"
+#include "core/libraries/usbd/usbstorage.h"
 #include "core/linker.h"
 #include "core/memory.h"
 #include "core/user_settings.h"
@@ -478,6 +480,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "General isRedZonePatchingEnabled: {}",
              EmulatorSettings.IsRedZonePatchingEnabled());
 #endif
+    LOG_INFO(Config, "General p2pPort: {}", EmulatorSettings.GetP2PPort());
     LOG_INFO(Config, "Log sync: {}", EmulatorSettings.IsLogSync());
     LOG_INFO(Config, "Log skipDuplicate: {}", EmulatorSettings.IsLogSkipDuplicate());
 #ifdef _WIN32
@@ -495,6 +498,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU userfaultfdTracking: {}", EmulatorSettings.IsUserfaultfdTracking());
 #endif
     LOG_INFO(Config, "GPU inlineFetchShader: {}", EmulatorSettings.IsInlineFetchShader());
+    LOG_INFO(Config, "GPU fastShaderMath: {}", EmulatorSettings.IsFastShaderMath());
     LOG_INFO(Config, "Vulkan gpuId: {}", EmulatorSettings.GetGpuId());
     LOG_INFO(Config, "Vulkan vkValidation: {}", EmulatorSettings.IsVkValidationEnabled());
     LOG_INFO(Config, "Vulkan vkValidationCore: {}", EmulatorSettings.IsVkValidationCoreEnabled());
@@ -607,12 +611,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     // Mounting temp folders
     const auto& mount_temp_dir = Common::FS::GetUserPath(Common::FS::PathType::TempDataDir) / id;
-    if (std::filesystem::exists(mount_temp_dir)) {
-        // Temp folder should be cleared on each boot.
-        std::filesystem::remove_all(mount_temp_dir);
-    }
     std::filesystem::create_directory(mount_temp_dir);
-    mnt->Mount(mount_temp_dir, "/temp0");
     mnt->Mount(mount_temp_dir, "/temp");
 
     const auto& mount_download_dir =
@@ -621,6 +620,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         std::filesystem::create_directory(mount_download_dir);
     }
     mnt->Mount(mount_download_dir, "/download0");
+
+    const auto mount_usb_dir = Libraries::UsbStorage::GetUsbMountPath();
+    std::error_code ec_usb;
+    std::filesystem::create_directories(mount_usb_dir, ec_usb);
+    mnt->Mount(mount_usb_dir, "/mnt/usb0");
 
     const auto& mount_captures_dir = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir);
     if (!std::filesystem::exists(mount_captures_dir)) {
@@ -775,6 +779,7 @@ void Emulator::Restart(std::filesystem::path eboot_path,
     args.insert(guest_args, {"--wait-for-pid", std::to_string(Debugger::GetCurrentPid())});
 
     LOG_INFO(Common, "Relaunching the emulator with args: {}", fmt::join(args, " "));
+    Libraries::Np::NpHandler::GetInstance().Shutdown();
     Common::Log::Shutdown();
 
     auto& ipc = IPC::Instance();

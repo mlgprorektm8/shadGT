@@ -28,7 +28,8 @@
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
-#include "core/libraries/network/sys_net.h"
+#include "core/libraries/net/net.h"
+#include "core/libraries/net/net_kernel.h"
 
 #ifdef _WIN64
 #include <Rpc.h>
@@ -36,8 +37,6 @@
 #include <uuid/uuid.h>
 #endif
 #include <common/singleton.h>
-#include <core/libraries/network/net_error.h>
-#include <core/libraries/network/sockets.h>
 #include <core/linker.h>
 #include "aio.h"
 
@@ -82,6 +81,15 @@ static void KernelServiceThread(std::stop_token stoken) {
 }
 
 static PS4_SYSV_ABI void stack_chk_fail() {
+    void* caller = __builtin_return_address(0);
+    auto* linker = Common::Singleton<Core::Linker>::Instance();
+    auto* mod = linker ? linker->FindByAddress(reinterpret_cast<VAddr>(caller)) : nullptr;
+    if (mod) {
+        LOG_CRITICAL(Lib_Kernel, "called from {:p} (module: {}, offset: {:#x})", caller, mod->name,
+                     reinterpret_cast<VAddr>(caller) - mod->GetBaseAddress());
+    } else {
+        LOG_CRITICAL(Lib_Kernel, "called from {:p} (unknown module)", caller);
+    }
     UNREACHABLE();
 }
 
@@ -444,6 +452,9 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
 
     static char const** kernel_environ = g_environment;
 
+    // Before any socket exists: net ids are file descriptors from the kernel's table.
+    Libraries::Net::InstallKernelIntegration();
+
     Libraries::Kernel::RegisterFileSystem(sym);
     Libraries::Kernel::RegisterTime(sym);
     Libraries::Kernel::RegisterThreads(sym);
@@ -529,6 +540,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("ca7v6Cxulzs", "libkernel", 1, "libkernel", sceKernelSetGPO);
     LIB_FUNCTION("iKJMWrAumPE", "libkernel", 1, "libkernel", getargc);
     LIB_FUNCTION("FJmglmTMdr4", "libkernel", 1, "libkernel", getargv);
+    LIB_FUNCTION("DLORcroUqbc", "libkernel", 1, "libkernel", sceKernelGetOpenPsId);
 }
 
 } // namespace Libraries::Kernel
