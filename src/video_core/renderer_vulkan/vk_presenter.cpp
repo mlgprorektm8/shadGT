@@ -107,6 +107,21 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format for
     return MakeImageBlit(frame_width, frame_height, swapchain_width, swapchain_height, 0, 0);
 }
 
+#ifdef RYTY_GPU
+float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
+#endif
+
+// GTS-009: with a widened camera (GPU.aspect_ratio) the game's 16:9 picture is stretched over the
+// whole window instead of being shown between black bars.
+static bool StretchToWindow() {
+#ifdef RYTY_GPU
+    static const bool stretch = RytyDisplayAspect() > 0.0f;
+    return stretch;
+#else
+    return false;
+#endif
+}
+
 static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_width,
                            s32 swapchain_height) {
     float frame_aspect = static_cast<float>(frame_width) / frame_height;
@@ -1324,8 +1339,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 ImVec2 contentArea = ImGui::GetContentRegionAvail();
                 SetExpectedGameSize((s32)contentArea.x, (s32)contentArea.y);
 
+                const bool stretch =
+                    StretchToWindow() && game_texture == frame->imgui_texture; // not the splash
                 const auto imgRect =
-                    FitImage(game_width, game_height, (s32)contentArea.x, (s32)contentArea.y);
+                    stretch ? vk::Rect2D{{0, 0}, {static_cast<u32>(contentArea.x),
+                                                  static_cast<u32>(contentArea.y)}}
+                            : FitImage(game_width, game_height, (s32)contentArea.x,
+                                       (s32)contentArea.y);
                 ImVec2 offset{
                     static_cast<float>(imgRect.offset.x),
                     static_cast<float>(imgRect.offset.y),
@@ -1527,6 +1547,9 @@ void Presenter::SetExpectedGameSize(s32 width, s32 height) {
 
     expected_frame_height = height;
     expected_frame_width = width;
+    if (StretchToWindow()) {
+        return; // GTS-009: the frame takes the window's shape; the passes scale to it
+    }
     if (ratio > expected_ratio) {
         expected_frame_width = static_cast<s32>(height * expected_ratio);
     } else {

@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -1000,6 +1001,95 @@ bool ConfigFlag(const char* key, bool fallback) {
     return text.compare(value, 4, "true") == 0;
 }
 
+// A setting of the GT Sport config as written (a string without its quotes, a number), or "".
+static std::string ConfigValue(const char* key) {
+    char path[MAX_PATH];
+    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return {};
+    }
+    std::string config{path, length};
+    config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
+    std::FILE* file = std::fopen(config.c_str(), "rb");
+    if (!file) {
+        return {};
+    }
+    std::string text;
+    char chunk[4096];
+    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
+        text.append(chunk, n);
+    }
+    std::fclose(file);
+    const std::string quoted = std::string{"\""} + key + "\"";
+    const size_t at = text.find(quoted);
+    if (at == std::string::npos) {
+        return {};
+    }
+    const size_t value = text.find_first_not_of(" \t\r\n:", at + quoted.size());
+    if (value == std::string::npos) {
+        return {};
+    }
+    if (text[value] == '"') {
+        const size_t end = text.find('"', value + 1);
+        return end == std::string::npos ? std::string{} : text.substr(value + 1, end - value - 1);
+    }
+    const size_t end = text.find_first_of(",}\r\n", value);
+    return text.substr(value, end == std::string::npos ? std::string::npos : end - value);
+}
+
+// GTS-009: the camera's aspect ratio for a screen wider (or narrower) than 16:9, from
+// GPU.aspect_ratio: "auto" (the shape of the game's window or screen, from the display settings),
+// "21:9", "32:9", another width:height or a number. 0 when the game's own 16:9 applies.
+// RYGT_ASPECT overrides it.
+namespace Vulkan {
+float RytyDisplayAspect() {
+    static const float aspect = [] {
+        std::string value = ConfigValue("aspect_ratio");
+        if (const char* env = std::getenv("RYGT_ASPECT")) {
+            value = env;
+        }
+        double ratio = 0.0;
+        if (value == "auto") {
+            const bool full = ConfigValue("full_screen") == "true";
+            const bool exclusive = ConfigValue("full_screen_mode") == "Fullscreen";
+            double width = std::atof(ConfigValue("window_width").c_str());
+            double height = std::atof(ConfigValue("window_height").c_str());
+            if (full && !exclusive) { // borderless: the desktop's resolution
+                width = GetSystemMetrics(SM_CXSCREEN);
+                height = GetSystemMetrics(SM_CYSCREEN);
+            }
+            ratio = height > 0.0 ? width / height : 0.0;
+        } else if (const size_t colon = value.find(':'); colon != std::string::npos) {
+            const double height = std::atof(value.substr(colon + 1).c_str());
+            ratio = height > 0.0 ? std::atof(value.substr(0, colon).c_str()) / height : 0.0;
+        } else {
+            ratio = std::atof(value.c_str());
+        }
+        if (!(ratio > 0.5 && ratio < 6.0) || std::abs(ratio - 16.0 / 9.0) < 0.01) {
+            return 0.0f;
+        }
+        return static_cast<float>(ratio);
+    }();
+    return aspect;
+}
+} // namespace Vulkan
+
+// GTS-009: the race camera's view is set up with a 16:9 aspect
+// (eboot 0x5e717f: mov dword [rbx+0x8d464], 1.7777778f); the wider aspect widens its view.
+static void InstallWideCamera(u8* base) {
+    const float aspect = Vulkan::RytyDisplayAspect();
+    if (aspect <= 0.0f) {
+        return;
+    }
+    const float original = 16.0f / 9.0f;
+    std::vector<u8> from(4), to(4);
+    std::memcpy(from.data(), &original, 4);
+    std::memcpy(to.data(), &aspect, 4);
+    if (Apply(base, Patch{0x5f7185, from, to, fmt::format("GTS-009 camera aspect {:.3f}", aspect)})) {
+        std::fprintf(stderr, "[patch] GTS-009: picture stretched to the window\n");
+    }
+}
+
 void InstallMirrorHalfRate(u8* base) {
     bool wanted = ConfigFlag("mirror_half_rate", false);
     if (const char* env = std::getenv("RYGT_MIRROR_HALF")) {
@@ -1145,6 +1235,7 @@ void InstallFatalErrorDiag(u8* base) {
 } // namespace
 
 void RytyApplyGamePatches() {
+    InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!WetReflectionsWanted()) {
