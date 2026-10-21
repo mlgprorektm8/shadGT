@@ -4,11 +4,11 @@
 #include <deque>
 #include <fstream>
 #include <optional>
-#include <xxhash.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
 #include <fmt/ranges.h>
+#include <xxhash.h>
 #include "common/debug.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
@@ -93,15 +93,14 @@ DrawFilter ClassifyDraw(const AmdGpu::Regs& regs, bool& depth_copy, bool& stenci
     }
     const bool cb_disabled =
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
-    depth_copy =
-        regs.depth_render_override.force_z_dirty && regs.depth_render_override.force_z_valid &&
-        regs.depth_buffer.DepthValid() && regs.depth_buffer.DepthWriteValid() &&
-        regs.depth_buffer.DepthAddress() != regs.depth_buffer.DepthWriteAddress();
-    stencil_copy =
-        regs.depth_render_override.force_stencil_dirty &&
-        regs.depth_render_override.force_stencil_valid && regs.depth_buffer.StencilValid() &&
-        regs.depth_buffer.StencilWriteValid() &&
-        regs.depth_buffer.StencilAddress() != regs.depth_buffer.StencilWriteAddress();
+    depth_copy = regs.depth_render_override.force_z_dirty &&
+                 regs.depth_render_override.force_z_valid && regs.depth_buffer.DepthValid() &&
+                 regs.depth_buffer.DepthWriteValid() &&
+                 regs.depth_buffer.DepthAddress() != regs.depth_buffer.DepthWriteAddress();
+    stencil_copy = regs.depth_render_override.force_stencil_dirty &&
+                   regs.depth_render_override.force_stencil_valid &&
+                   regs.depth_buffer.StencilValid() && regs.depth_buffer.StencilWriteValid() &&
+                   regs.depth_buffer.StencilAddress() != regs.depth_buffer.StencilWriteAddress();
     if (cb_disabled && (depth_copy || stencil_copy)) {
         return DrawFilter::Copy;
     }
@@ -310,11 +309,13 @@ void Rasterizer::HashDrawPagesAhead(const SelectedPipeline& selected, u32 epoch)
     // Opt-in (SHADGT_HASH_AHEAD=1): in the October 10 Nurburgring benchmark it hashed about
     // 600,000 pages per 2 s ahead (a new upload epoch starts about 10 times a frame) of which a
     // quarter were used, and decoding a submission went from 5 to 14 ms (27 FPS against 35).
-    static const bool enabled = [] {
-        const char* env = std::getenv("SHADGT_HASH_AHEAD");
-        return env && env[0] == '1';
-    }() && Common::PerfFeatureEnabled(70) &&
-                                EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Precise;
+    static const bool enabled =
+        [] {
+            const char* env = std::getenv("SHADGT_HASH_AHEAD");
+            return env && env[0] == '1';
+        }() &&
+        Common::PerfFeatureEnabled(70) &&
+        EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Precise;
     if (!enabled) {
         return;
     }
@@ -391,9 +392,8 @@ bool Rasterizer::CaptureGuestRange(Common::ReadCapture& capture, VAddr address, 
     return true;
 }
 
-bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
-                                  Common::ReadCapture& capture, VAddr index_address,
-                                  u64 index_size) {
+bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected, Common::ReadCapture& capture,
+                                  VAddr index_address, u64 index_size) {
     const Pipeline* pipeline = selected.is_compute
                                    ? static_cast<const Pipeline*>(selected.compute)
                                    : static_cast<const Pipeline*>(selected.pipeline);
@@ -514,8 +514,7 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
                 return false;
             }
             const auto tsharp = desc.GetSharp(view);
-            if (tsharp.Address() == 0 ||
-                tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid ||
+            if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid ||
                 !magic_enum::enum_contains(tsharp.GetDataFmt()) ||
                 !magic_enum::enum_contains(tsharp.GetNumberFmt()) ||
                 LiverpoolToVK::TrySurfaceFormat(tsharp.GetDataFmt(), tsharp.GetNumberFmt()) ==
@@ -558,10 +557,9 @@ bool Rasterizer::CaptureDrawReads(const SelectedPipeline& selected,
                 return false;
             }
             AmdGpu::Buffer vsharp;
-            capture.Copy(entry, reinterpret_cast<u8*>(&vsharp), sizeof(vsharp),
-                         [this](VAddr address, u8* to, u64 n) {
-                             memory->CopySparseMemory(address, to, n);
-                         });
+            capture.Copy(
+                entry, reinterpret_cast<u8*>(&vsharp), sizeof(vsharp),
+                [this](VAddr address, u8* to, u64 n) { memory->CopySparseMemory(address, to, n); });
             vsharp.base_address += attrib.inst_offset;
             capture_range(vsharp.base_address, vsharp.GetSize());
         }
@@ -633,8 +631,10 @@ bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPla
     return true;
 }
 
-std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedBuffer(
-    VAddr address, u32 size, bool written, bool texel) {
+std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedBuffer(VAddr address,
+                                                                                      u32 size,
+                                                                                      bool written,
+                                                                                      bool texel) {
     auto* plan = buffer_plan;
     if (!plan || plan->next >= plan->entries.size()) {
         return std::nullopt;
@@ -660,8 +660,8 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::TakePlannedB
 
 Rasterizer::ShadowInfo& Rasterizer::ShadowOf(const Shader::Info* canonical) {
     // PERF-065: most draws use the infos of the draws before them; the map is looked up once.
-    auto& cached = shadow_lookup[(reinterpret_cast<uintptr_t>(canonical) >> 6) %
-                                 shadow_lookup.size()];
+    auto& cached =
+        shadow_lookup[(reinterpret_cast<uintptr_t>(canonical) >> 6) % shadow_lookup.size()];
     if (cached.first != canonical) {
         cached = {canonical, &shadow_infos[canonical]};
     }
@@ -765,9 +765,9 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
             ++stats.ahead;
             return nullptr;
         }
-        if (InstallDrawStages(pipeline,
-                              tess ? selected_pipeline->quad_tess_stages : selected_pipeline->stages,
-                              true)) {
+        if (InstallDrawStages(
+                pipeline, tess ? selected_pipeline->quad_tess_stages : selected_pipeline->stages,
+                true)) {
             ++stats.ahead;
             // Every 64th selection is checked against one made here, from the recorder's
             // registers and memory; a difference is reported and this one used.
@@ -796,9 +796,9 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
                           "PERF-047: pipeline selected on the command thread ({:#x}) differs from "
                           "the one selected here ({:#x})",
                           std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey()),
-                          own_pipeline ? std::hash<GraphicsPipelineKey>{}(
-                                             own_pipeline->GetGraphicsKey())
-                                       : 0);
+                          own_pipeline
+                              ? std::hash<GraphicsPipelineKey>{}(own_pipeline->GetGraphicsKey())
+                              : 0);
             }
             if (own_pipeline) {
                 InstallDrawStages(own_pipeline, own, false);
@@ -1731,11 +1731,10 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         return false;
     }
     if (readbacks_pending) {
-        last_readback_fence_ns.store(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
-                .count(),
-            std::memory_order_relaxed);
+        last_readback_fence_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count(),
+                                     std::memory_order_relaxed);
     }
     texture_cache.ReleaseFinishedReadbacks();
     buffer_cache.ReleaseFinishedAsyncReadbacks();
@@ -1926,7 +1925,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
-        stage_bindings[i] = PlanStageResourceBindings(*stage, binding);
+        stage_bindings[i] = PlanStageResourceBindings(
+            *stage, binding, pipeline->ImageDescriptorCounts(stage->sw_stage));
         auto buffer_binding = stage_bindings[i].buffers;
         Common::PhaseTimer t{Common::Phase::Buffers};
         BindBuffers(*stage, buffer_binding, push_data);
@@ -1942,7 +1942,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         if (const auto* stage = stages[i]) {
             auto texture_binding = stage_bindings[i].textures;
             Common::PhaseTimer t{Common::Phase::Textures};
-            BindTextures(*stage, texture_binding);
+            BindTextures(*stage, texture_binding, pipeline->ImageDescriptorCounts(stage->sw_stage));
         }
     }
     const u32 num_color_targets =
@@ -2561,10 +2561,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0 || impossible || unmapped) {
                 // DIAG-041: empty buffer bindings of the draw.
                 if (DiagHistoryEnabled()) {
-                    diag_empty_bindings += fmt::format(
-                        " | EMPTY buf {} of {:#x}: base={:#x} stride={} records={:#x}",
-                        buffer_infos.size(), stage.pgm_hash, u64(vsharp.base_address),
-                        vsharp.GetStride(), vsharp.num_records);
+                    diag_empty_bindings +=
+                        fmt::format(" | EMPTY buf {} of {:#x}: base={:#x} stride={} records={:#x}",
+                                    buffer_infos.size(), stage.pgm_hash, u64(vsharp.base_address),
+                                    vsharp.GetStride(), vsharp.num_records);
                 }
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
@@ -2845,7 +2845,8 @@ static void LogRejectedSharpSource(const Shader::Info& stage, const Fetch& fetch
                 stage.hw_stage, stage.pgm_hash, u32(fetch.summary), fetch.load_mask, dwords);
 }
 
-void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                              std::span<const u32> layout_image_counts) {
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
@@ -2884,18 +2885,23 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 decoded->flags = flags;
             }
         }
+        // FIX-051: every descriptor the pipeline's layout declares for the image is written.
+        const u32 num_bindings =
+            ImageDescriptorCount(stage, &image_desc - stage.images.data(), layout_image_counts);
+        const auto bind_null_entry = [&] {
+            auto& [image_id, desc] = image_bindings[num_images++];
+            image_id = {};
+            desc = {};
+            // Preserve every compiled mip slot and its sampled/storage type when rejecting the
+            // guest descriptor, including reused scratch entries.
+            desc.type = image_desc.is_written ? VideoCore::TextureCache::BindingType::Storage
+                                              : VideoCore::TextureCache::BindingType::Texture;
+        };
         const auto bind_null_image = [&] {
-            const u32 array_size =
-                ForEachImageDescriptorBinding(stage, image_desc, [&](bool is_written) {
-                    auto& [image_id, desc] = image_bindings[num_images++];
-                    image_id = {};
-                    desc = {};
-                    // Preserve every compiled mip slot and its sampled/storage type when
-                    // rejecting the guest descriptor, including reused scratch entries.
-                    desc.type = is_written ? VideoCore::TextureCache::BindingType::Storage
-                                           : VideoCore::TextureCache::BindingType::Texture;
-                });
-            image_descriptor_array_sizes.push_back(array_size);
+            for (u32 i = 0; i < num_bindings; ++i) {
+                bind_null_entry();
+            }
+            image_descriptor_array_sizes.push_back(num_bindings);
         };
         if (!decoded_hit &&
             (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid)) {
@@ -2929,8 +2935,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
 
         const auto geometry_error =
-            decoded_hit ? VideoCore::ImageDescriptorGeometryError::None
-                        : VideoCore::CheckImageDescriptorGeometry(tsharp, instance.GetImageLimits());
+            decoded_hit
+                ? VideoCore::ImageDescriptorGeometryError::None
+                : VideoCore::CheckImageDescriptorGeometry(tsharp, instance.GetImageLimits());
         if (geometry_error != VideoCore::ImageDescriptorGeometryError::None) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid T# geometry={} address={:#x} type={} "
@@ -2960,7 +2967,19 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         image_desc.sharp_fetch.offsets[0]);
         }
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
-        const u32 num_bindings = image_desc.NumBindings(stage);
+        // FIX-051: mips the T# has beyond the layout's count cannot be indexed by the shader;
+        // array entries past the T#'s mips are bound as null images.
+        const u32 tsharp_bindings = image_desc.NumBindings(stage);
+        if (tsharp_bindings != num_bindings) {
+            static std::atomic<u32> logged{};
+            if (const u32 n = ++logged; n <= 20 || n % 1000 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-051: image {} of {}_{:#x} has {} mip bindings in its T#, the "
+                            "pipeline layout {} ({} times)",
+                            &image_desc - stage.images.data(), stage.hw_stage, stage.pgm_hash,
+                            tsharp_bindings, num_bindings, n);
+            }
+        }
 
         if (!decoded_hit) {
             // FIX-046: the image must start inside the guest address space. A garbage T# of
@@ -2988,7 +3007,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 decoded->valid = true;
             }
         }
-        for (auto i = 0; i < num_bindings; i++) {
+        for (u32 i = 0; i < num_bindings; i++) {
+            if (i >= tsharp_bindings) {
+                bind_null_entry();
+                continue;
+            }
             auto& [image_id, desc] = image_bindings[num_images++];
             if (decoded) {
                 std::construct_at(&desc, decoded->desc);

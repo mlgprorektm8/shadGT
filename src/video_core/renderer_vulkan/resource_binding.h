@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <span>
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/depth_attachment.h"
 
@@ -20,6 +21,30 @@ inline StageResourceBindings PlanStageResourceBindings(const Shader::Info& stage
     result.textures.buffer += stage.buffers.size();
     result.textures.unified += stage.buffers.size();
     stage.AddBindings(result.next);
+    return result;
+}
+
+/// FIX-051: the descriptor count of the stage's image `index` in the pipeline's layout (the
+/// count the image's T# gives when the layout has none recorded).
+inline u32 ImageDescriptorCount(const Shader::Info& stage, size_t index,
+                                std::span<const u32> layout_counts) {
+    return index < layout_counts.size() ? layout_counts[index]
+                                        : stage.images[index].NumBindings(stage);
+}
+
+/// FIX-051: the bindings of a stage laid out with the pipeline layout's image descriptor counts.
+/// The counts the draw's T#s give can differ, which shifted every later binding.
+inline StageResourceBindings PlanStageResourceBindings(const Shader::Info& stage,
+                                                       Shader::Backend::Bindings start,
+                                                       std::span<const u32> layout_counts) {
+    StageResourceBindings result{start, start, start};
+    result.textures.buffer += stage.buffers.size();
+    result.textures.unified += stage.buffers.size();
+    result.next.buffer += stage.buffers.size();
+    result.next.unified += stage.buffers.size() + stage.samplers.size();
+    for (size_t i = 0; i < stage.images.size(); ++i) {
+        result.next.unified += ImageDescriptorCount(stage, i, layout_counts);
+    }
     return result;
 }
 

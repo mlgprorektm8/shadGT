@@ -821,6 +821,8 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             continue;
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
+        auto& image_counts = image_descriptor_counts[u32(stage->sw_stage)];
+        image_counts.clear();
         for (const auto& buffer : stage->buffers) {
             if (!preloading) {
                 [[maybe_unused]] const auto sharp = buffer.GetSharp(*stage);
@@ -834,6 +836,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         }
         for (const auto& image : stage->images) {
             const u32 num_bindings = image.NumBindings(*stage);
+            image_counts.push_back(num_bindings);
             bindings.push_back({
                 .binding = binding,
                 .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage

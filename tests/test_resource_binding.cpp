@@ -118,6 +118,35 @@ TEST(ResourceBinding, BufferFirstPassPreservesStageAndMipArrayBindingNumbers) {
     EXPECT_EQ(vs.next, (Shader::Backend::Bindings{.unified = 18, .buffer = 7}));
 }
 
+TEST(ResourceBinding, LayoutImageCountsDecideBindingNumbersWhenTheTsharpChanged) {
+    // FIX-051: the pipeline layout was built when the mip array's T# had two levels; the draw's
+    // T# has three. The layout's two slots are planned, so the sampler keeps its binding.
+    Shader::Info stage;
+    stage.buffers.emplace_back();
+    auto& storage = stage.images.emplace_back();
+    storage.is_written = true;
+    storage.mip_fallback_mode = Shader::MipStorageFallbackMode::DynamicIndex;
+    auto sharp = AmdGpu::Image::Null(false);
+    sharp.base_level = 0;
+    sharp.last_level = 2;
+    storage.sharp_fetch.immediates = std::bit_cast<std::array<u32, 8>>(sharp);
+    stage.samplers.emplace_back();
+    ASSERT_EQ(storage.NumBindings(stage), 3u);
+
+    const std::array<u32, 1> layout_counts{2};
+    EXPECT_EQ(Vulkan::ImageDescriptorCount(stage, 0, layout_counts), 2u);
+    const auto plan =
+        Vulkan::PlanStageResourceBindings(stage, {.unified = 4, .buffer = 2}, layout_counts);
+    EXPECT_EQ(plan.textures, (Shader::Backend::Bindings{.unified = 5, .buffer = 3}));
+    // One buffer, two mip-array slots, one sampler.
+    EXPECT_EQ(plan.next, (Shader::Backend::Bindings{.unified = 8, .buffer = 3}));
+
+    // Without recorded layout counts the T# decides, as before.
+    EXPECT_EQ(Vulkan::ImageDescriptorCount(stage, 0, {}), 3u);
+    EXPECT_EQ(Vulkan::PlanStageResourceBindings(stage, {.unified = 4, .buffer = 2}, {}).next,
+              Vulkan::PlanStageResourceBindings(stage, {.unified = 4, .buffer = 2}).next);
+}
+
 TEST(ResourceBinding, EmptyStageDoesNotAdvanceEitherBindingCounter) {
     Shader::Info empty;
     const Shader::Backend::Bindings start{.unified = 13, .buffer = 5};

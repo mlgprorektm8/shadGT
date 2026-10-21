@@ -45,6 +45,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     }
     for (const auto& image : info->images) {
         const u32 num_bindings = image.NumBindings(*info);
+        image_descriptor_counts[u32(Shader::SwStage::Compute)].push_back(num_bindings);
         bindings.push_back({
             .binding = binding,
             .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage

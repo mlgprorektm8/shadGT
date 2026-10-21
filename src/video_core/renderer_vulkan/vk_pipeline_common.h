@@ -73,6 +73,12 @@ public:
         return is_compute;
     }
 
+    /// FIX-051: the descriptor count of each image of a stage, as the layout declares it. The
+    /// draw's T# may give another mip count than the one the layout was built from.
+    std::span<const u32> ImageDescriptorCounts(Shader::SwStage stage) const noexcept {
+        return image_descriptor_counts[u32(stage)];
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
 
@@ -89,6 +95,8 @@ protected:
     vk::UniqueDescriptorSetLayout desc_layout;
     mutable std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     std::array<const Shader::Info*, Shader::MaxStageTypes> canonical_stages{};
+    std::array<boost::container::small_vector<u32, 8>, Shader::MaxStageTypes>
+        image_descriptor_counts{};
     bool uses_push_descriptors{};
     bool is_compute;
 };

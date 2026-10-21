@@ -12,10 +12,10 @@
 #include <chrono>
 #include <unordered_map>
 #include <unordered_set>
+#include "common/read_capture.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
-#include "common/read_capture.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -298,7 +298,8 @@ private:
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
-    void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                      std::span<const u32> layout_image_counts);
     void LogInvalidTextureContext(const Shader::Info& stage, u32 sharp_offset);
     /// Copies flattened constants whose guest source is GPU-modified from the buffer cache into
     /// the uploaded flat buffer, so the shader sees them in GPU execution order.
@@ -382,9 +383,9 @@ private:
     BufferPlan* buffer_plan{};
     std::array<std::atomic<u64>, 3> plan_refusals{};
     std::optional<std::pair<const VideoCore::Buffer*, u64>> TakePlannedBuffer(VAddr address,
-                                                                               u32 size,
-                                                                               bool written,
-                                                                               bool texel);
+                                                                              u32 size,
+                                                                              bool written,
+                                                                              bool texel);
     struct {
         u64 used;
         u64 redone;
@@ -405,8 +406,7 @@ private:
     /// false if a stage's flattened user data now differs from what selection used.
     /// PERF-065: the selection's flattened user data is moved into the stage (swapped).
     bool InstallDrawStages(const Pipeline* pipeline,
-                           std::array<SelectedStage, Shader::MaxStageTypes>& stages,
-                           bool validate);
+                           std::array<SelectedStage, Shader::MaxStageTypes>& stages, bool validate);
     ShadowInfo& ShadowOf(const Shader::Info* canonical);
     /// The user data of the infos the pipeline cache just selected (under its lock).
     /// PERF-055: the compute stage of the pipeline just looked up, in its pipeline slot.
