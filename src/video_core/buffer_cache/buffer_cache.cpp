@@ -180,7 +180,7 @@ static bool ReadbackHashEnabled() {
 }
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
-static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
+static constexpr size_t STREAM_BUFFER_SIZE = 256_MB;
 
 // PERF-094: the stream ring (small read-only buffers copied for each draw) is in system memory,
 // which the GPU reads over PCIe, instead of video memory the recorder writes over PCIe. Each copy
@@ -3907,6 +3907,7 @@ void BufferCache::ReleaseUnmappedArenaMemory(VAddr address, u64 size) {
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+    scheduler.SyncCommandThread();
     std::scoped_lock buffer_lock{mutex}; // PERF-067
     if (pending_binds.empty()) {
         return;

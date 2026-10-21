@@ -244,6 +244,21 @@ public:
         return vk12_features.shaderSharedInt64Atomics;
     }
 
+    /// Returns true if subgroup size control is supported
+    bool IsSubgroupSizeControlSupported() const {
+        return vk13_features.subgroupSizeControl;
+    }
+
+    /// Returns true if compute full subgroups is supported
+    bool IsComputeFullSubgroupsSupported() const {
+        return vk13_features.computeFullSubgroups;
+    }
+
+    /// Returns the stages supporting required subgroup size
+    vk::ShaderStageFlags RequiredSubgroupSizeStages() const {
+        return vk13_props.requiredSubgroupSizeStages;
+    }
+
     /// Returns true if the subgroup size can be set to match guest subgroup size
     bool IsSubgroupSize64Supported() const {
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
@@ -285,6 +300,11 @@ public:
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
         return properties.vendorID;
+    }
+
+    /// Returns true if the GPU vendor is Intel
+    bool IsIntel() const {
+        return properties.vendorID == 0x8086;
     }
 
     /// Returns the device ID of the physical device

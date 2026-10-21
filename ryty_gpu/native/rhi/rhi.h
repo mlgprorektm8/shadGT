@@ -129,6 +129,8 @@ public:
     virtual u64 GpuAddress() const = 0;
     /// CPU pointer of Upload/Readback memory; nullptr for device-local memory.
     virtual u8* Mapped() const = 0;
+    /// Invalidate CPU cache for mapped memory ranges (required for non-coherent host memory).
+    virtual void Invalidate(u64 offset = 0, u64 size = ~0ULL) {}
     /// The backend's own object (Vulkan: VkBuffer), for recording outside this interface.
     virtual u64 NativeHandle() const = 0;
 };
@@ -530,6 +532,8 @@ public:
     /// pool once the GPU has run the submission it was part of (or when Release is called on a
     /// list that was never submitted).
     virtual CommandList* AcquireCommandList(CommandListLevel level = CommandListLevel::Primary) = 0;
+    /// Wraps an externally managed command buffer (e.g. from the scheduler's primary session).
+    virtual std::unique_ptr<CommandList> WrapCommandBuffer(u64 native_cmdbuf) { return nullptr; }
     virtual void ReleaseUnsubmitted(CommandList* list) = 0;
     /// A list run by someone else's submission (a secondary list) goes back to its pool once
     /// `retire` is reached.

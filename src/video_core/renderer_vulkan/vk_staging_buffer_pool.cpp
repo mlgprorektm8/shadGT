@@ -28,6 +28,13 @@ u64 RoundAllocationSize(u64 size) {
     return Common::AlignUp(size, step);
 }
 
+u64 RingBlockSize(MemoryType type) {
+    if (type == MemoryType::DeviceLocal) {
+        return StagingBufferPool::DEV_LOCAL_STAGING_MIBS * 1_MB;
+    }
+    return BLOCK_SIZE;
+}
+
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
@@ -38,7 +45,8 @@ StagingBufferPool::~StagingBufferPool() = default;
 StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 alignment, bool deferred,
                                             bool unsynchronized) {
     Ring& ring = rings[u32(type)];
-    if (deferred || size > BLOCK_SIZE) {
+    const u64 block_size = RingBlockSize(type);
+    if (deferred || size > block_size) {
         return RequestLarge(size, type, deferred, unsynchronized);
     }
     return RequestFromRing(ring, size, alignment, type, unsynchronized);
@@ -66,7 +74,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
         } else {
             best = &ring.blocks.emplace_back(Block{
                 .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type,
-                                                                    BLOCK_SIZE),
+                                                                    RingBlockSize(type)),
                 .last_used_frame = frame,
             });
             ring.current = ring.blocks.size() - 1;

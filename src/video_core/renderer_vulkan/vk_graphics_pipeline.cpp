@@ -579,6 +579,7 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
 
+    // Graphics stages keep the driver's subgroup size: forcing 32 is for compute only (Intel Arc).
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = 64,
     };

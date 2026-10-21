@@ -218,6 +218,7 @@ public:
     u8* Mapped() const override {
         return mapped;
     }
+    void Invalidate(u64 offset = 0, u64 size = ~0ULL) override;
     u64 NativeHandle() const override {
         return reinterpret_cast<u64>(static_cast<VkBuffer>(buffer));
     }
@@ -332,7 +333,7 @@ struct ThreadPool;
 
 class VulkanCommandList final : public CommandList {
 public:
-    VulkanCommandList(VulkanDevice& device, ThreadPool& pool, vk::CommandBuffer cmd,
+    VulkanCommandList(VulkanDevice& device, ThreadPool* pool, vk::CommandBuffer cmd,
                       CommandListLevel level)
         : device{device}, pool{pool}, cmd{cmd}, level{level} {}
 
@@ -380,7 +381,7 @@ public:
     bool Retired() const;
 
     VulkanDevice& device;
-    ThreadPool& pool;
+    ThreadPool* pool;
     vk::CommandBuffer cmd;
     CommandListLevel level;
     // The fence and value that free the list: the device timeline after Queue::Submit, another
@@ -458,6 +459,7 @@ public:
     std::unique_ptr<Fence> CreateFence(u64 initial) override;
     std::unique_ptr<Fence> ImportFence(u64 native_handle) override;
     CommandList* AcquireCommandList(CommandListLevel level) override;
+    std::unique_ptr<CommandList> WrapCommandBuffer(u64 native_cmdbuf) override;
     void ReleaseUnsubmitted(CommandList* list) override;
     void MarkExecuted(CommandList* list, FenceValue retire) override;
     Queue& GraphicsQueue() override {
@@ -512,6 +514,13 @@ public:
     Fence* external_fence = nullptr;
     std::function<u64()> external_current;
 };
+
+void VulkanBuffer::Invalidate(u64 offset, u64 size) {
+    if (allocation) {
+        vmaInvalidateAllocation(device.allocator, allocation, offset,
+                                size == ~0ULL ? VK_WHOLE_SIZE : size);
+    }
+}
 
 VulkanBuffer::~VulkanBuffer() {
     if (!owned) {
@@ -675,8 +684,17 @@ std::unique_ptr<Buffer> VulkanDevice::ImportHostMemory(void* memory, u64 size, u
                                             &flags_info,
                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                             memory};
+    u32 memory_type_index = static_cast<u32>(std::countr_zero(pointer_properties.memoryTypeBits));
+    const auto mem_props = ctx.physical_device.getMemoryProperties();
+    for (u32 i = 0; i < mem_props.memoryTypeCount; ++i) {
+        if ((pointer_properties.memoryTypeBits & (1u << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostCached)) {
+            memory_type_index = i;
+            break;
+        }
+    }
     VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import, size,
-                                  static_cast<u32>(std::countr_zero(pointer_properties.memoryTypeBits))};
+                                  memory_type_index};
     VkDeviceMemory device_memory{};
     if (d.vkAllocateMemory(device, &allocate, nullptr, &device_memory) != VK_SUCCESS) {
         return nullptr;
@@ -1223,7 +1241,7 @@ CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
             .commandBufferCount = 1,
         });
         ASSERT_MSG(result == vk::Result::eSuccess, "NAT-011: command buffer failed");
-        pool->all.push_back(std::make_unique<VulkanCommandList>(*this, *pool, buffers[0], level));
+        pool->all.push_back(std::make_unique<VulkanCommandList>(*this, pool, buffers[0], level));
         list = pool->all.back().get();
     }
     list->retire_fence.store(nullptr, std::memory_order_relaxed);
@@ -1232,11 +1250,18 @@ CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
     return list;
 }
 
+std::unique_ptr<CommandList> VulkanDevice::WrapCommandBuffer(u64 native_cmdbuf) {
+    vk::CommandBuffer cmdbuf{reinterpret_cast<VkCommandBuffer>(native_cmdbuf)};
+    return std::make_unique<VulkanCommandList>(*this, nullptr, cmdbuf, CommandListLevel::Primary);
+}
+
 void VulkanDevice::ReleaseUnsubmitted(CommandList* list) {
+    if (!list) return;
     static_cast<VulkanCommandList*>(list)->retire_value.store(0, std::memory_order_release);
 }
 
 void VulkanDevice::MarkExecuted(CommandList* list, FenceValue retire) {
+    if (!list) return;
     auto* vulkan_list = static_cast<VulkanCommandList*>(list);
     vulkan_list->retire_fence.store(retire.fence, std::memory_order_relaxed);
     vulkan_list->retire_value.store(retire.value, std::memory_order_release);
@@ -1342,6 +1367,9 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
 void VulkanCommandList::Begin() {
     graphics = nullptr;
     compute = nullptr;
+    if (!pool) {
+        return; // Externally begun
+    }
     // Secondary lists run outside render passes of the command buffer that executes them; they
     // begin and end their own rendering.
     const vk::CommandBufferInheritanceInfo inheritance{};
@@ -1352,6 +1380,9 @@ void VulkanCommandList::Begin() {
 }
 
 void VulkanCommandList::End() {
+    if (!pool) {
+        return; // Externally ended
+    }
     std::ignore = cmd.end();
 }
 

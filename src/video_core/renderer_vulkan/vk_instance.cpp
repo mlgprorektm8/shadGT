@@ -479,6 +479,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess = vk13_features.robustImageAccess,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
+            .pipelineCreationCacheControl = vk13_features.pipelineCreationCacheControl,
+            .computeFullSubgroups = vk13_features.computeFullSubgroups,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .synchronization2 = vk13_features.synchronization2,
             .dynamicRendering = vk13_features.dynamicRendering,

@@ -688,21 +688,18 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     ASSERT(mip_block_h == (src->info.size.height >> src_dim));
     ASSERT(mip_block_p == (src->info.pitch >> src_dim));
 
-    const auto [src_layers, dst_layers] =
-        SanitizeCopyLayers(src->info, dst->info, src->info.size.depth);
-
     const vk::ImageCopy image_copy{
         .srcSubresource{
             .aspectMask = src->aspect_mask,
             .mipLevel = 0,
             .baseArrayLayer = 0,
-            .layerCount = src_layers,
+            .layerCount = 1,
         },
         .dstSubresource{
             .aspectMask = src->aspect_mask,
             .mipLevel = mip,
             .baseArrayLayer = slice,
-            .layerCount = dst_layers,
+            .layerCount = 1,
         },
         .extent = {src->info.size.width, src->info.size.height, src->info.size.depth},
     };
@@ -831,21 +828,21 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, 1);
+    const u32 copy_layers = std::max<u32>(1u, std::min<u32>(src_range.extent.layers, dst_range.extent.layers));
     if (!needs_resolve) {
         const vk::ImageCopy region = {
             .srcSubresource{
                 .aspectMask = vk::ImageAspectFlagBits::eColor,
                 .mipLevel = 0,
                 .baseArrayLayer = src_range.base.layer,
-                .layerCount = src_layers,
+                .layerCount = copy_layers,
             },
             .srcOffset = {0, 0, 0},
             .dstSubresource{
                 .aspectMask = vk::ImageAspectFlagBits::eColor,
                 .mipLevel = 0,
                 .baseArrayLayer = dst_range.base.layer,
-                .layerCount = dst_layers,
+                .layerCount = copy_layers,
             },
             .dstOffset = {0, 0, 0},
             .extent = {src->info.size.width, src->info.size.height, 1},
@@ -858,14 +855,14 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                 .aspectMask = vk::ImageAspectFlagBits::eColor,
                 .mipLevel = 0,
                 .baseArrayLayer = src_range.base.layer,
-                .layerCount = src_layers,
+                .layerCount = copy_layers,
             },
             .srcOffset = {0, 0, 0},
             .dstSubresource{
                 .aspectMask = vk::ImageAspectFlagBits::eColor,
                 .mipLevel = 0,
                 .baseArrayLayer = dst_range.base.layer,
-                .layerCount = dst_layers,
+                .layerCount = copy_layers,
             },
             .dstOffset = {0, 0, 0},
             .extent = {src->info.size.width, src->info.size.height, 1},
