@@ -20,6 +20,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vertex_format.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -783,7 +784,8 @@ void GraphicsPipeline::GetVertexInputs(
         attributes.push_back(Attribute{
             .location = semantic,
             .binding = semantic,
-            .format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()),
+            .format = VertexAttributeFormat(
+                LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt())),
             .offset = 0,
         });
         bindings.push_back(Binding{

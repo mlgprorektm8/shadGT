@@ -154,6 +154,12 @@ target_compile_features(shadps4_fps_lock_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_fps_lock_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_fps_lock_test)
 
+add_executable(shadps4_vertex_format_test test_vertex_format.cpp)
+target_include_directories(shadps4_vertex_format_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_vertex_format_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_vertex_format_test PRIVATE GTest::gtest_main Vulkan::Headers)
+gtest_discover_tests(shadps4_vertex_format_test)
+
 add_executable(shadps4_recycling_pool_test test_recycling_pool.cpp)
 target_include_directories(shadps4_recycling_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_recycling_pool_test PRIVATE cxx_std_23)
