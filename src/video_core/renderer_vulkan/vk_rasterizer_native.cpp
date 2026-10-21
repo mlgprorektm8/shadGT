@@ -26,6 +26,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "common/ryty_config.h"
 // (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
@@ -983,6 +984,15 @@ void NativeRenderer::SortRegionWrites() {
                 }
                 written->second = frame;
             }
+            // FIX-184 (diagnosis, RYGT_NATIVE_MIRROR_NODROP=1): CPU-written mirrors stay (their
+            // pages are copied in at the next use as usual).
+            static const bool no_drop = [] {
+                const char* env = std::getenv("RYGT_NATIVE_MIRROR_NODROP");
+                return env && env[0] == '1';
+            }();
+            if (dynamic && no_drop) {
+                dynamic = false;
+            }
             if (dynamic) {
                 mirror_bytes -= mirror.end - mirror.begin;
                 ++stats.mirrors_dropped;
@@ -1064,7 +1074,20 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
     // Not mirrored: a range bound in an earlier frame too gets a mirror at the start of the next
     // list (read in place until then).
     const VAddr begin = Common::AlignDown(address, 4096);
-    const VAddr end = Common::AlignUp(address + size, 4096);
+    // FIX-180: mirrors reach 256 KB past the range they are made for (RYGT_NATIVE_MIRROR_SLACK=
+    // <KB> sets it, 0 as before). With mirrors cut at the range's end, Tokyo's world geometry
+    // went missing for single frames in bursts, the sky colour showing through (Lance's
+    // "vertex sky explosions"; 6-19 such frames a 450 s race, none with mirrors off). Mirror
+    // contents matched guest memory on both the CPU (FIX-176) and the GPU (FIX-179) side and no
+    // sampled draw read past its V#s (FIX-181), so the exact cause is still open; with the slack
+    // the race had none (1 smaller jump in 13,000 frames), at the same speed (47-51 fps), with
+    // about 105 bigger mirrors instead of 800.
+    static const u64 slack = [] {
+        const char* env = std::getenv("RYGT_NATIVE_MIRROR_SLACK");
+        return (env && *env ? std::strtoull(env, nullptr, 10) : u64{256}) * 1024;
+    }();
+    const u64 reach = slack != 0 ? r.memory->ClampRangeSize(address, size + slack) : size;
+    const VAddr end = Common::AlignUp(address + std::max(size, reach), 4096);
     if (mirror_candidates.size() > 65536) {
         mirror_candidates.clear(); // per-frame data at ever-new addresses
     }
@@ -1115,6 +1138,10 @@ void NativeRenderer::RefreshMirror(Mirror& mirror) {
                                                                 .size = bytes});
                             });
         WatchPages(page, std::min<u64>(4096, mirror.end - page));
+        const u64 g = (page - mirror.begin) / MirrorGranule; // FIX-176
+        if (g < mirror.hashes.size()) {
+            mirror.hashes[g] = 0;
+        }
     }
     s.buffers_written = true;
     stats.mirror_refresh_pages += pages.size();
@@ -1145,7 +1172,15 @@ void NativeRenderer::MakePendingMirrors() {
     bool copied = false;
     bool evicted = false;
     for (auto [begin, end] : ranges) {
-        if (!direct || RegionOver(begin, end - begin) || IsDynamic(begin, end)) {
+        // FIX-185 (diagnosis, RYGT_NATIVE_MIRROR_REGION_GAP=<KB>): no mirror within that distance
+        // of a region.
+        static const u64 region_gap = [] {
+            const char* env = std::getenv("RYGT_NATIVE_MIRROR_REGION_GAP");
+            return env && *env ? std::strtoull(env, nullptr, 10) * 1024 : u64{0};
+        }();
+        if (!direct || RegionOver(begin, end - begin) || IsDynamic(begin, end) ||
+            (region_gap != 0 && RegionOver(begin > region_gap ? begin - region_gap : 0,
+                                           end - begin + 2 * region_gap))) {
             continue; // shaders write there (the region holds it), or the CPU does
         }
         // The new mirror takes in the mirrors it overlaps.
@@ -2224,6 +2259,15 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     }
 }
 
+bool NativeRenderer::MirrorKind(char kind) {
+    // FIX-177 (diagnosis, RYGT_NATIVE_MIRRORS=v or i): only vertex or only index ranges mirrored.
+    static const char only = [] {
+        const char* env = std::getenv("RYGT_NATIVE_MIRRORS");
+        return env && (env[0] == 'v' || env[0] == 'i') ? env[0] : '\0';
+    }();
+    return only == '\0' || only == kind;
+}
+
 void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
                                           const AmdGpu::Regs& regs, VertexIndexState& v) {
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
@@ -2236,12 +2280,18 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
     Mirror* near = nullptr;
     u64 near_generation = 0;
     const bool sampled = InPlaceSampled();
-    for (const auto& guest : guest_buffers) {
+    for (u32 index = 0; index < guest_buffers.size(); ++index) {
+        const auto& guest = guest_buffers[index];
         std::optional<std::pair<vk::Buffer, u64>> found;
         u64 size = 0;
         const VAddr base = guest.base_address;
         const u64 sharp_size = guest.GetSize();
-        if (near && !sampled && base != 0 && sharp_size > 0 &&
+        // FIX-178 (diagnosis, RYGT_NATIVE_VERTEX_NEAR=0): every attribute looked up.
+        static const bool near_on = [] {
+            const char* env = std::getenv("RYGT_NATIVE_VERTEX_NEAR");
+            return !(env && env[0] == '0');
+        }();
+        if (near_on && near && !sampled && base != 0 && sharp_size > 0 &&
             near_generation == buffer_generation && base >= near->begin &&
             base + sharp_size <= near->end && near->dirty_pages.empty()) {
             size = sharp_size;
@@ -2251,7 +2301,7 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
             ++stats.vertex_near;
         } else if (base != 0 && sharp_size > 0 && r.memory->MappedAreaEnd(base, base + 1) != 0) {
             size = r.memory->ClampRangeSize(base, sharp_size);
-            found = GuestBuffer(base, size, false, true);
+            found = GuestBuffer(base, size, false, MirrorKind('v')); // FIX-177
             if (sampled) {
                 in_place.Note(BoundKind(0), base, size); // NAT-142
             }
@@ -2262,7 +2312,188 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
         v.offsets.push_back(found ? found->second : 0);
         v.sizes.push_back(found ? size : 0);
         v.strides.push_back(guest.GetStride());
+        Mirror* bound_mirror = found && near && base >= near->begin &&
+                                       base + std::max<u64>(size, 1) <= near->end
+                                   ? near
+                                   : nullptr;
+        if (bound_mirror && found->first == vk::Buffer{Handle<VkBuffer_T>(
+                                                bound_mirror->buffer->NativeHandle())}) {
+            CheckMirrorBind(*bound_mirror, base, size); // FIX-179 (diagnosis)
+        }
     }
+}
+
+void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
+                                      bool is_indexed, u32 index_offset) {
+    // FIX-181 (diagnosis, RYGT_NATIVE_VERTEX_REACH_CHECK=<n>): every n-th draw, the highest
+    // vertex it can read (its indices read from guest memory, or its vertex count) against each
+    // vertex V#'s end and the mirror bound there: draws reading past a mirror's end got zeros
+    // (the tunnel explosions went away with mirrors 256 KB longer).
+    static const u32 every = [] {
+        const char* env = std::getenv("RYGT_NATIVE_VERTEX_REACH_CHECK");
+        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
+    }();
+    if (every == 0 || ++reach_check_counter % every != 0) {
+        return;
+    }
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    VertexInputs<AmdGpu::Buffer> guest_buffers;
+    pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+                             regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+    if (guest_buffers.empty()) {
+        return;
+    }
+    const auto [vertex_offset, instance_offset] =
+        DrawOffsets(regs, pipeline.GetStage(Shader::SwStage::Vertex), pipeline.GetFetchShader());
+    u64 max_index = 0;
+    const u32 count = regs.num_indices;
+    if (is_indexed) {
+        const bool is16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+        const u32 index_size = is16 ? 2 : 4;
+        const VAddr address =
+            regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
+        const u64 bytes = std::min<u64>(u64(count) * index_size, 1_MB);
+        static thread_local std::vector<u8> indices;
+        indices.resize(bytes);
+        if (bytes == 0 ||
+            !Core::RytyMemory::GuardedCopy(indices.data(), reinterpret_cast<const void*>(address),
+                                           bytes)) {
+            return;
+        }
+        const bool restart = regs.enable_primitive_restart & 1;
+        const u32 restart_index = regs.primitive_restart_index;
+        for (u64 i = 0; i < bytes / index_size; ++i) {
+            const u32 value = is16 ? u32(reinterpret_cast<const u16*>(indices.data())[i])
+                                   : reinterpret_cast<const u32*>(indices.data())[i];
+            if (restart && value == (is16 ? (restart_index & 0xffff) : restart_index)) {
+                continue;
+            }
+            max_index = std::max<u64>(max_index, value);
+        }
+    } else {
+        max_index = count == 0 ? 0 : count - 1;
+    }
+    ++stats.reach_checks;
+    for (u32 i = 0; i < guest_buffers.size(); ++i) {
+        const auto& guest = guest_buffers[i];
+        const u64 stride = guest.GetStride();
+        if (stride == 0) {
+            continue;
+        }
+        const bool per_instance = bindings[i].inputRate == vk::VertexInputRate::eInstance;
+        const u64 divisor = per_instance ? std::max<u32>(bindings[i].divisor, 1) : 1;
+        const u64 instances = std::max<u32>(regs.num_instances.NumInstances(), 1);
+        const u64 last = per_instance ? u64(instance_offset) + (instances - 1) / divisor
+                                      : u64(vertex_offset) + max_index;
+        const VAddr base = guest.base_address;
+        const VAddr sharp_end = base + guest.GetSize();
+        const VAddr reach = base + (last + 1) * stride;
+        if (reach <= sharp_end) {
+            continue;
+        }
+        ++stats.reach_past_sharp;
+        const Mirror* mirror = MirrorHolding(base, 1);
+        const bool past_mirror = mirror && reach > mirror->end;
+        stats.reach_past_mirror += past_mirror ? 1 : 0;
+        static std::atomic<u32> logged{};
+        if (Sample(logged)) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-181: draw (vs {:#x}) binding {} ({}) V# {:#x} stride {} records {} "
+                        "reads to element {} (vertex offset {}, max index {}, instance offset {}, "
+                        "{} instances): {:#x} past the V#'s end{}",
+                        pipeline.GetStage(Shader::SwStage::Vertex).pgm_hash, i,
+                        per_instance ? "per instance" : "per vertex", base, stride,
+                        guest.num_records, last, vertex_offset, max_index, instance_offset,
+                        instances, reach - sharp_end,
+                        mirror ? fmt::format(", mirror {:#x}+{:#x}{}", mirror->begin,
+                                             mirror->end - mirror->begin,
+                                             past_mirror ? " (past its end too)" : "")
+                               : std::string{});
+        }
+    }
+}
+
+void NativeRenderer::CheckMirrorBind(Mirror& mirror, VAddr base, u64 size) {
+    // FIX-179 (diagnosis, RYGT_NATIVE_MIRROR_CHECK=<n>): every n-th vertex range bound from a
+    // mirror, the mirror's bytes and guest memory's bytes there are copied out side by side right
+    // before the draw (the GPU's view of both at that point) and compared once the GPU is done.
+    static const u32 every = [] {
+        const char* env = std::getenv("RYGT_NATIVE_MIRROR_CHECK");
+        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
+    }();
+    if (every == 0) {
+        return;
+    }
+    const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    for (auto it = mirror_checks.begin(); it != mirror_checks.end();) {
+        if (it->tick > done) {
+            ++it;
+            continue;
+        }
+        const u8* a = it->buffer->Mapped();
+        const u8* b = a + it->size;
+        u64 first = it->size, last = 0, differ = 0;
+        for (u64 i = 0; i < it->size; ++i) {
+            if (a[i] != b[i]) {
+                first = std::min(first, i);
+                last = i;
+                ++differ;
+            }
+        }
+        ++stats.mirror_checks;
+        if (differ != 0) {
+            ++stats.mirror_check_differ;
+            static std::atomic<u32> logged{};
+            if (Sample(logged)) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-179: vertex range {:#x}+{:#x} (frame {}): mirror {:#x}+{:#x} "
+                            "differs from guest memory in {} bytes ({:#x}..{:#x}); mirror made or "
+                            "copied in last at frame {}, {} dirty pages then",
+                            it->base, it->size, it->frame, it->mirror_begin, it->mirror_size,
+                            differ, first, last, it->mirror_used, it->dirty);
+            }
+        }
+        it = mirror_checks.erase(it);
+    }
+    if (++mirror_check_counter % every != 0 || mirror_checks.size() >= 64) {
+        return;
+    }
+    const u64 bytes = std::min<u64>(size, 16_KB) & ~u64{3};
+    if (bytes == 0) {
+        return;
+    }
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    if (!direct || !direct->EnsureImported(base, bytes)) {
+        return;
+    }
+    auto buffer = device->CreateBuffer({.size = bytes * 2,
+                                        .usage = Native::Rhi::BufferUsageStorage |
+                                                 Native::Rhi::BufferUsageTransferDst,
+                                        .memory = Native::Rhi::MemoryKind::Readback,
+                                        .name = "mirror check"});
+    if (!buffer || !buffer->Mapped()) {
+        return;
+    }
+    Stream& s = Begin();
+    GlobalBarrier();
+    const vk::Buffer dst{Handle<VkBuffer_T>(buffer->NativeHandle())};
+    s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(mirror.buffer->NativeHandle())}, dst,
+                     vk::BufferCopy{.srcOffset = base - mirror.begin, .dstOffset = 0,
+                                    .size = bytes});
+    direct->ForEachPart(base, bytes,
+                        [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
+                            u64 part) {
+                            s.cmd.copyBuffer(view.Handle(), dst,
+                                             vk::BufferCopy{.srcOffset = view_offset,
+                                                            .dstOffset = bytes + offset,
+                                                            .size = part});
+                        });
+    s.buffers_written = true;
+    mirror_checks.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, bytes, base,
+                             frame, mirror.begin, mirror.end - mirror.begin, mirror.used_frame,
+                             mirror.dirty_pages.size()});
 }
 
 bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
@@ -2323,7 +2554,8 @@ bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u
     }
     const VAddr address =
         regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
-    const auto found = GuestBuffer(address, u64(regs.num_indices) * index_size, false, true);
+    const auto found =
+        GuestBuffer(address, u64(regs.num_indices) * index_size, false, MirrorKind('i')); // FIX-177
     if (!found) {
         return false;
     }
@@ -2763,6 +2995,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 ++stats.skipped;
                 return;
             }
+            CheckVertexReach(*pipeline, regs, is_indexed, index_offset); // FIX-181 (diagnosis)
         }
     }
     {
@@ -2780,6 +3013,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             return !(env && env[0] == '0');
         }();
         const bool pass_change = !s.rendering || !(s.render == targets.state);
+        // FIX-183 (diagnosis, RYGT_NATIVE_DRAW_BARRIER=1): a full barrier before every draw.
+        static const bool draw_barrier = [] {
+            const char* env = std::getenv("RYGT_NATIVE_DRAW_BARRIER");
+            return env && env[0] == '1';
+        }();
+        if (draw_barrier) {
+            GlobalBarrier();
+        }
         const auto targets_in = [&](const std::vector<const Native::ImageEntry*>& list) {
             if (list.empty()) {
                 return false;
@@ -4215,6 +4456,10 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
         CmdBuf{s.cmd}.updateBuffer(vk::Buffer{Handle<VkBuffer_T>(mirror.buffer->NativeHandle())},
                                    begin - mirror.begin, end - begin,
                                    data.data() + (begin - address));
+        for (u64 g = (begin - mirror.begin) / MirrorGranule;
+             g <= (end - 1 - mirror.begin) / MirrorGranule && g < mirror.hashes.size(); ++g) {
+            const_cast<Mirror&>(mirror).hashes[g] = 0; // FIX-176
+        }
     }
     s.buffers_written = true;
     ++s.commands;
@@ -4761,11 +5006,206 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         Begin();
         PrepareImages();
     }
+    ProbeDisplay(*entry); // FIX-175 (diagnosis)
     Splice();
     const Display display{vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, view,
                           entry->info.size.width, entry->info.size.height};
+    VerifyMirrors(); // FIX-176 (diagnosis)
     EvictImages(); // (the display picture was just used: it stays)
     return display;
+}
+
+u64 NativeRenderer::MirrorVerifyBudget() {
+    static const u64 budget = [] {
+        const char* env = std::getenv("RYGT_NATIVE_MIRROR_VERIFY");
+        return env && *env ? std::strtoull(env, nullptr, 10) * 1_MB : u64{0};
+    }();
+    return budget;
+}
+
+void NativeRenderer::VerifyMirrors() {
+    // FIX-176 (diagnosis, RYGT_NATIVE_MIRROR_VERIFY=<MB a frame>): guest memory under the mirrors,
+    // a few MB a frame, hashed per 64 KB granule and compared with the hash taken the last time;
+    // a change no CPU write fault or copy-in accounts for means the mirror went stale unseen (the
+    // tunnel explosions went away with RYGT_NATIVE_MIRRORS=0). Such granules are logged and
+    // copied in again.
+    const u64 budget = MirrorVerifyBudget();
+    if (budget == 0 || mirrors.empty()) {
+        return;
+    }
+    SortRegionWrites();
+    static thread_local std::vector<u8> scratch(MirrorGranule);
+    u64 hashed = 0;
+    u32 changed = 0;
+    auto it = mirrors.lower_bound(mirror_verify_cursor);
+    for (u32 visited = 0; hashed < budget && visited < 2 * mirrors.size() + 2; ++visited) {
+        if (it == mirrors.end()) {
+            it = mirrors.begin();
+            mirror_verify_cursor = 0;
+            if (it == mirrors.end()) {
+                break;
+            }
+        }
+        Mirror& mirror = it->second;
+        const u64 granules = (mirror.end - mirror.begin + MirrorGranule - 1) / MirrorGranule;
+        if (mirror.hashes.size() != granules) {
+            mirror.hashes.assign(granules, 0);
+        }
+        u64 g = mirror_verify_cursor > mirror.begin && mirror_verify_cursor < mirror.end
+                    ? (mirror_verify_cursor - mirror.begin) / MirrorGranule
+                    : 0;
+        for (; g < granules && hashed < budget; ++g) {
+            const VAddr from = mirror.begin + g * MirrorGranule;
+            const u64 size = std::min<u64>(MirrorGranule, mirror.end - from);
+            const bool dirty = std::ranges::any_of(mirror.dirty_pages, [&](VAddr page) {
+                return page >= from && page < from + size;
+            });
+            if (dirty) {
+                mirror.hashes[g] = 0; // copied in at the next use, hashed again after
+                continue;
+            }
+            if (!Core::RytyMemory::GuardedCopy(scratch.data(), reinterpret_cast<const void*>(from),
+                                               size)) {
+                continue;
+            }
+            const u64 hash = XXH3_64bits(scratch.data(), size) | 1;
+            hashed += size;
+            if (mirror.hashes[g] != 0 && mirror.hashes[g] != hash) {
+                // A CPU write that faulted just now is no news: it waits in the pending writes
+                // (not sorted here: sorting can drop this very mirror).
+                bool pending = false;
+                {
+                    std::scoped_lock lock{region_dirty_mutex};
+                    pending = std::ranges::any_of(pending_region_writes, [&](const auto& w) {
+                        return w.first < from + size && w.second > from;
+                    });
+                }
+                if (pending) {
+                    mirror.hashes[g] = 0;
+                    continue;
+                }
+                ++changed;
+                ++stats.mirror_untrapped;
+                static std::atomic<u32> logged{};
+                if (Sample(logged)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-176: mirror {:#x}+{:#x} granule {:#x}+{:#x} changed with no "
+                                "CPU write seen (frame {}, mirror last used frame {})",
+                                mirror.begin, mirror.end - mirror.begin, from, size, frame,
+                                mirror.used_frame);
+                }
+                for (VAddr page = from; page < from + size; page += 4096) {
+                    mirror.dirty_pages.push_back(page); // copied in again at the next use
+                }
+                mirror.hashes[g] = 0;
+                continue;
+            }
+            mirror.hashes[g] = hash;
+        }
+        if (g >= granules) {
+            ++it;
+            mirror_verify_cursor = it == mirrors.end() ? 0 : it->first;
+        } else {
+            mirror_verify_cursor = mirror.begin + g * MirrorGranule;
+        }
+    }
+    if (changed != 0) {
+        ++buffer_generation; // OPT-003: memos see the dirty pages
+    }
+}
+
+void NativeRenderer::ProbeDisplay(const Native::ImageEntry& entry) {
+    // FIX-175 (diagnosis, RYGT_NATIVE_WATCH_DISPLAY=x,y,w,h): a rectangle of each picture the
+    // presenter shows, read back from the GPU: the mean brightness of its top, middle and bottom
+    // thirds, one line per presented frame (single-frame glitches stand out against their
+    // neighbours; the game's working targets are no good for that, the next frame's work may
+    // already have cleared them when a probe runs).
+    static const std::array<u32, 4> rect = [] {
+        std::array<u32, 4> r{};
+        if (const char* env = std::getenv("RYGT_NATIVE_WATCH_DISPLAY"); env && *env) {
+            std::sscanf(env, "%u,%u,%u,%u", &r[0], &r[1], &r[2], &r[3]);
+        }
+        return r;
+    }();
+    if (rect[2] == 0 || rect[3] < 3 || !entry.image) {
+        return;
+    }
+    const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    for (auto it = display_probes.begin(); it != display_probes.end();) {
+        if (it->tick > done) {
+            ++it;
+            continue;
+        }
+        const u8* bytes = it->buffer->Mapped();
+        const u32 w = rect[2], third = rect[3] / 3;
+        std::array<double, 3> part{};
+        for (u32 band = 0; band < 3; ++band) {
+            for (u64 y = u64(band) * third; y < u64(band + 1) * third; ++y) {
+                for (u64 x = 0; x < w; ++x) {
+                    u32 word;
+                    std::memcpy(&word, bytes + (y * w + x) * 4, 4);
+                    part[band] += double((word & 1023) + ((word >> 10) & 1023) +
+                                         ((word >> 20) & 1023)) / (3.0 * 1023.0);
+                }
+            }
+            part[band] /= double(third) * w;
+        }
+        LOG_WARNING(Render_Vulkan, "FIX-175 display: frame {} {:#x} thirds: {:.4f} {:.4f} {:.4f}",
+                    it->frame, it->address, part[0], part[1], part[2]);
+        // FIX-182 (diagnosis): a frame much darker than the one before in two bands or more is
+        // saved with that one (raw A2B10G10R10, user\log\glitch_<frame>_<now|before>.raw).
+        u32 darker = 0;
+        for (u32 band = 0; band < 3; ++band) {
+            darker += display_last_part[band] > 0.03 && part[band] < 0.45 * display_last_part[band];
+        }
+        if (darker >= 2 && display_glitch_dumps < 12 && !display_last_bytes.empty()) {
+            ++display_glitch_dumps;
+            const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+            const auto save = [&](const char* name, const u8* data) {
+                const auto path = dir / fmt::format("glitch_{}_{}_{}x{}.raw", it->frame, name, w,
+                                                    rect[3]);
+                if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
+                    std::fwrite(data, 1, u64(w) * rect[3] * 4, file);
+                    std::fclose(file);
+                }
+            };
+            save("now", bytes);
+            save("before", display_last_bytes.data());
+            LOG_WARNING(Render_Vulkan, "FIX-182: frame {} saved (darker than the one before)",
+                        it->frame);
+        }
+        display_last_part = part;
+        display_last_bytes.assign(bytes, bytes + u64(w) * rect[3] * 4);
+        it = display_probes.erase(it);
+    }
+    const auto& desc = entry.image->Desc();
+    if (display_probes.size() >= 16 || rect[0] + rect[2] > desc.width ||
+        rect[1] + rect[3] > desc.height || entry.info.num_bits != 32) {
+        return;
+    }
+    auto buffer = device->CreateBuffer({.size = u64(rect[2]) * rect[3] * 4,
+                                        .usage = Native::Rhi::BufferUsageStorage |
+                                                 Native::Rhi::BufferUsageTransferDst,
+                                        .memory = Native::Rhi::MemoryKind::Readback,
+                                        .name = "display probe"});
+    if (!buffer || !buffer->Mapped()) {
+        return;
+    }
+    Begin();
+    GlobalBarrier();
+    stream.cmd.copyImageToBuffer(
+        vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())}, vk::ImageLayout::eGeneral,
+        vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+        vk::BufferImageCopy{.bufferOffset = 0,
+                            .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                              .mipLevel = 0,
+                                              .baseArrayLayer = 0,
+                                              .layerCount = 1},
+                            .imageOffset = {s32(rect[0]), s32(rect[1]), 0},
+                            .imageExtent = {rect[2], rect[3], 1}});
+    display_probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1,
+                              u64(rect[2]) * rect[3] * 4, frame, 0, rect[2], rect[3], true,
+                              entry.info.guest_address});
 }
 
 void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {

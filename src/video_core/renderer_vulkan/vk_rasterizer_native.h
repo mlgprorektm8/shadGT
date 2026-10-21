@@ -247,7 +247,32 @@ private:
         std::unique_ptr<Native::Rhi::Buffer> buffer;
         std::vector<VAddr> dirty_pages; ///< written by the CPU (or written back) since copied
         u64 used_frame = 0;
+        std::vector<u64> hashes; ///< FIX-176: guest memory per 64 KB granule when last verified
     };
+    static constexpr u64 MirrorGranule = u64{64} * 1024; ///< FIX-176
+    VAddr mirror_verify_cursor = 0;            ///< FIX-176
+    static u64 MirrorVerifyBudget();
+    static bool MirrorKind(char kind); ///< FIX-177
+    /// FIX-179 (diagnosis): a vertex range bound from a mirror, copied out with guest memory.
+    struct MirrorCheck {
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        u64 tick;
+        u64 size;
+        VAddr base;
+        u64 frame;
+        VAddr mirror_begin;
+        u64 mirror_size;
+        u64 mirror_used;
+        u64 dirty;
+    };
+    std::vector<MirrorCheck> mirror_checks;
+    u64 mirror_check_counter = 0;
+    void CheckMirrorBind(Mirror& mirror, VAddr base, u64 size);
+    /// FIX-181 (diagnosis): how far a draw reads past its vertex V#s and their mirrors.
+    void CheckVertexReach(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
+                          bool is_indexed, u32 index_offset);
+    u64 reach_check_counter = 0;
+    void VerifyMirrors();
     struct MirrorCandidate {
         VAddr end = 0;
         u64 frame = 0; ///< when last considered
@@ -376,6 +401,12 @@ private:
         u32 mips = 0, layers = 0;      // FIX-171: an untiled copy of every mip and layer
     };
     std::vector<Probe> probes;
+    /// FIX-175 (diagnosis): rectangles of presented pictures on their way back from the GPU.
+    std::vector<Probe> display_probes;
+    std::array<double, 3> display_last_part{}; ///< FIX-182
+    std::vector<u8> display_last_bytes;        ///< FIX-182
+    u32 display_glitch_dumps = 0;              ///< FIX-182
+    void ProbeDisplay(const Native::ImageEntry& entry);
     /// FIX-157: bytes of pictures kept past their idle time.
     u64 kept_bytes = 0;
     std::vector<Native::ImageEntry*> writebacks;
@@ -618,6 +649,9 @@ private:
         u64 pass_barriers = 0, passes_unblocked = 0; ///< NAT-140
         u64 region_refresh_pages = 0, region_refresh_ns = 0; ///< NAT-145
         u64 region_partial_pages = 0, region_partial_bytes = 0; ///< FIX-173
+        u64 mirror_untrapped = 0;                               ///< FIX-176
+        u64 mirror_checks = 0, mirror_check_differ = 0;         ///< FIX-179
+        u64 reach_checks = 0, reach_past_sharp = 0, reach_past_mirror = 0; ///< FIX-181
         u64 guest_buffer_calls = 0, guest_buffer_ns = 0;     ///< NAT-145
         u64 rewrite_fills = 0;   ///< NAT-132
         u64 timed_draws = 0;     ///< OPT-001
