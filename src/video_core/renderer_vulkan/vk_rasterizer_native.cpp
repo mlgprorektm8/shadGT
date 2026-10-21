@@ -312,7 +312,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         auto* direct = r.buffer_cache.GetDirectMemory();
         const VAddr address = entry.info.guest_address;
         const u64 size = entry.info.guest_size;
-        if (!direct || size == 0 || !direct->EnsureImported(address, size)) {
+        if (!direct || size == 0) {
             return source;
         }
         // NAT-146: the GPU's bytes there are in a region (shader-written memory lives in video
@@ -326,6 +326,9 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             source.offset = address - region->begin;
             source.kind = 1;
             source.keep.push_back(std::move(wrapped));
+            return source;
+        }
+        if (!direct->EnsureImported(address, size)) {
             return source;
         }
         if (const auto found = direct->FindBuffer(address, size);
@@ -891,9 +894,13 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
         }
     }
     buffer_log.Note(begin, end); // OPT-010
-    if (!direct || end - begin > 1_GB || !direct->EnsureImported(begin, end - begin)) {
+    if (!direct || end - begin > 1_GB || !r.IsMappedStart(begin) ||
+        !r.memory->IsValidGpuMapping(begin, end - begin)) {
         return nullptr;
     }
+    // GPU-only guest allocations need not have CPU-importable backing. They still need
+    // storage for shader writes (including the terrain's persistent shadow map).
+    const bool imported = direct->EnsureImported(begin, end - begin);
     Region region;
     region.begin = begin;
     region.end = end;
@@ -913,13 +920,27 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     GlobalBarrier();
     const vk::Buffer dst{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
     // Guest memory first, then what the GPU wrote into the regions taken in.
-    direct->ForEachPart(begin, end - begin,
+    if (imported) {
+        direct->ForEachPart(begin, end - begin,
                         [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
                             s.cmd.copyBuffer(view.Handle(), dst,
                                              vk::BufferCopy{.srcOffset = view_offset,
                                                             .dstOffset = offset,
                                                             .size = bytes});
                         });
+    } else {
+        // Preserve readable CPU contents and initialize holes consistently with sparse guest
+        // reads. Bound the staging allocation rather than snapshotting a whole large region.
+        for (u64 offset = 0; offset < end - begin;) {
+            const u64 bytes = std::min<u64>(4_MB, end - begin - offset);
+            const auto [upload, upload_offset, data] = Allocate(bytes, 4);
+            r.memory->CopySparseMemory(begin + offset, data, bytes);
+            s.cmd.copyBuffer(upload, dst, vk::BufferCopy{.srcOffset = upload_offset,
+                                                        .dstOffset = offset,
+                                                        .size = bytes});
+            offset += bytes;
+        }
+    }
     for (auto& old : merged) {
         s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(old.buffer->NativeHandle())}, dst,
                          vk::BufferCopy{.srcOffset = 0,
