@@ -744,7 +744,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
     // a program's stored translations are read when a draw first uses it, and new translations
     // are stored. -DisablePerf 47 leaves the store closed.
-    if (EmulatorSettings.IsPipelineCacheEnabled() && Common::PerfFeatureEnabled(47)) {
+    // FIX-186 (RyGT): at any RAM setting. The launcher's 16 GB setting turns
+    // pipeline_cache_enabled off for the driver's cache file, and that closed the store too, so
+    // with 16 GB nothing was written to or read from the shaders folder (Lance, 2026-10-21).
+#ifdef RYTY_GPU
+    const bool store_wanted = true;
+#else
+    const bool store_wanted = EmulatorSettings.IsPipelineCacheEnabled();
+#endif
+    if (store_wanted && Common::PerfFeatureEnabled(47)) {
         if (EmulatorSettings.IsPipelineCacheArchived()) {
             LOG_WARNING(Render_Vulkan, "PERF-032: the shader store is not used with an archived "
                                        "pipeline cache (pipeline_cache_archived)");
