@@ -24,6 +24,11 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "ryty_gpu/ryty_diag.h"
+#include "common/path_util.h"
+#include "video_core/renderdoc.h"
+#include <chrono>
+#include <filesystem>
+#include <thread>
 
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
@@ -2933,6 +2938,31 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         liverpool->ReserveCopyBufferSpace();
     }
+#ifdef RYTY_GPU
+    // DIAG-166: RenderDoc. Started through tools\renderdoc-play.ps1 (which turns on RenderDoc's
+    // Vulkan layer), the game captures the next frame into <RyGT folder>\captures on F12, or when a
+    // file named capture.now appears in the RyGT folder (removed when taken).
+    VideoCore::LoadRenderDoc();
+    if (VideoCore::IsRenderDocLoaded()) {
+        const auto root = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path();
+        std::error_code ec;
+        std::filesystem::create_directories(root / "captures", ec);
+        VideoCore::SetOutputDir(root / "captures", "GTSport");
+        static std::jthread trigger_watch{[trigger = root / "capture.now"](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                std::error_code error;
+                if (std::filesystem::remove(trigger, error)) {
+                    LOG_WARNING(Lib_GnmDriver, "DIAG-166: capture.now: capturing the next frame");
+                    VideoCore::TriggerCapture();
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+        }};
+        LOG_WARNING(Lib_GnmDriver,
+                    "DIAG-166: RenderDoc attached; F12 or a capture.now file captures a frame into {}",
+                    (root / "captures").string());
+    }
+#endif
 
     Platform::IrqC::Instance()->Register(Platform::InterruptId::GpuIdle, ResetSubmissionLock,
                                          nullptr);
