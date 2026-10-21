@@ -227,6 +227,10 @@ private:
     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
     std::vector<std::pair<VAddr, VAddr>> pending_region_writes;
     std::atomic<bool> has_pending_region_writes{false};
+    /// FIX-173: region pages as guest memory held them before the CPU's first write since they
+    /// were last copied in (taken at the write fault; guarded by region_dirty_mutex).
+    std::unordered_map<VAddr, std::unique_ptr<std::array<u8, 4096>>> page_snapshots;
+    std::atomic<u32> logged_partial{};
     void SortRegionWrites();
     Region* RegionOver(VAddr address, u64 size);
     Region* MakeRegion(VAddr address, u64 size);
@@ -290,6 +294,10 @@ private:
     Mirror* memo_mirror = nullptr;
     /// OPT-004: the mirror the last GuestBuffer bound from (none when it bound anything else).
     Mirror* last_mirror = nullptr;
+    /// FIX-170 (diagnosis): RYGT_NATIVE_SNAPSHOT_BELOW, 0 when off.
+    static u64 SnapshotBelow();
+    /// A copy of the range as it is now (NAT-106 zeros where the CPU can't read).
+    std::optional<std::pair<vk::Buffer, u64>> SnapshotRange(VAddr address, u64 size);
     std::optional<std::pair<vk::Buffer, u64>> GuestBufferLookup(VAddr address, u64 size, bool write,
                                                                 bool mirror);
     /// OPT-002: what a T# resolved to the last time (picture and views), by the T# and how the
@@ -364,6 +372,8 @@ private:
         u32 width, height;
         bool target;
         VAddr address;
+        bool packed_r11g11b10 = false; // FIX-171
+        u32 mips = 0, layers = 0;      // FIX-171: an untiled copy of every mip and layer
     };
     std::vector<Probe> probes;
     /// FIX-157: bytes of pictures kept past their idle time.
@@ -607,6 +617,7 @@ private:
         u64 rewrite_partial = 0; ///< NAT-124
         u64 pass_barriers = 0, passes_unblocked = 0; ///< NAT-140
         u64 region_refresh_pages = 0, region_refresh_ns = 0; ///< NAT-145
+        u64 region_partial_pages = 0, region_partial_bytes = 0; ///< FIX-173
         u64 guest_buffer_calls = 0, guest_buffer_ns = 0;     ///< NAT-145
         u64 rewrite_fills = 0;   ///< NAT-132
         u64 timed_draws = 0;     ///< OPT-001

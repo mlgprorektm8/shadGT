@@ -924,6 +924,9 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
                                         .dstOffset = old.begin - begin,
                                         .size = old.end - old.begin});
         s.keep.push_back(std::move(old.buffer)); // freed once the list ran
+        // FIX-173: CPU writes to it not copied in yet are copied in at the new one's next use.
+        region.dirty_pages.insert(region.dirty_pages.end(), old.dirty_pages.begin(),
+                                  old.dirty_pages.end());
     }
     s.buffers_written = true;
     // CPU writes to it from now on are copied in before its next use.
@@ -952,6 +955,15 @@ void NativeRenderer::SortRegionWrites() {
                 for (VAddr page = std::max(begin, region.begin); page < std::min(end, region.end);
                      page += 4096) {
                     region.dirty_pages.push_back(page);
+                }
+            }
+        }
+        // FIX-173: copies of pages no region holds are not needed.
+        if (end - begin <= 64_KB) {
+            std::scoped_lock lock{region_dirty_mutex};
+            for (VAddr page = begin; page < end; page += 4096) {
+                if (!RegionOver(page, 4096)) {
+                    page_snapshots.erase(page);
                 }
             }
         }
@@ -1252,29 +1264,86 @@ void NativeRenderer::RefreshRegion(Region& region) {
     const vk::Buffer dst{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
     std::ranges::sort(pages);
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-    for (const VAddr page : pages) {
-        if (page < region.begin || page >= region.end) {
-            continue;
-        }
-        direct->ForEachPart(page, std::min<u64>(4096, region.end - page),
+    const auto copy_in = [&](VAddr from, u64 size) {
+        direct->ForEachPart(from, size,
                             [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
                                 u64 bytes) {
                                 s.cmd.copyBuffer(view.Handle(), dst,
                                                  vk::BufferCopy{.srcOffset = view_offset,
-                                                                .dstOffset = page - region.begin +
+                                                                .dstOffset = from - region.begin +
                                                                              offset,
                                                                 .size = bytes});
                             });
+    };
+    for (const VAddr page : pages) {
+        if (page < region.begin || page >= region.end) {
+            continue;
+        }
+        const u64 page_bytes = std::min<u64>(4096, region.end - page);
+        // FIX-173: the page as it was before the CPU wrote it (taken at the write fault).
+        std::unique_ptr<std::array<u8, 4096>> before;
+        {
+            std::scoped_lock lock{region_dirty_mutex};
+            if (const auto it = page_snapshots.find(page); it != page_snapshots.end()) {
+                before = std::move(it->second);
+                page_snapshots.erase(it);
+            }
+        }
+        // NAT-145: only the pages copied in are watched again (the region was watched whole
+        // when made; re-watching all of it at each refresh cost ~9 us a draw with big regions).
+        // FIX-173: watched before guest memory is compared, so a CPU write from now on faults
+        // (and takes a new copy) instead of slipping in between the compare and the watch.
+        WatchPages(page, page_bytes);
+        std::array<u8, 4096> now;
+        if (!before || !Core::RytyMemory::GuardedCopy(now.data(),
+                                                      reinterpret_cast<const void*>(page),
+                                                      page_bytes)) {
+            copy_in(page, page_bytes);
+            continue;
+        }
+        // The runs of 16-byte pieces the CPU changed (gaps under 64 bytes joined).
+        constexpr u64 Piece = 16;
+        u64 run_begin = 0, run_end = 0, changed = 0;
+        bool in_run = false;
+        for (u64 at = 0; at < page_bytes; at += Piece) {
+            const u64 n = std::min(Piece, page_bytes - at);
+            if (std::memcmp(now.data() + at, before->data() + at, n) == 0) {
+                continue;
+            }
+            if (in_run && at - run_end < 64) {
+                run_end = at + n;
+                continue;
+            }
+            if (in_run) {
+                copy_in(page + run_begin, run_end - run_begin);
+                changed += run_end - run_begin;
+            }
+            in_run = true;
+            run_begin = at;
+            run_end = at + n;
+        }
+        if (in_run) {
+            copy_in(page + run_begin, run_end - run_begin);
+            changed += run_end - run_begin;
+        }
+        ++stats.region_partial_pages;
+        stats.region_partial_bytes += changed;
     }
     s.buffers_written = true;
-    // NAT-145: only the pages copied in are watched again (the region was watched whole when
-    // made; re-watching all of it at each refresh cost ~9 us a draw with big regions).
-    for (const VAddr page : pages) {
-        if (page >= region.begin && page < region.end) {
-            WatchPages(page, std::min<u64>(4096, region.end - page));
-        }
-    }
     ++stats.region_refreshes;
+    if (stats.region_partial_pages != 0 && Sample(logged_partial)) {
+        LOG_INFO(Render_Vulkan, "FIX-173: region pages copied in part: {} ({:.1f} KB of {:.1f} KB)",
+                 stats.region_partial_pages, stats.region_partial_bytes / 1024.0,
+                 stats.region_partial_pages * 4.0);
+    }
+}
+
+u64 NativeRenderer::SnapshotBelow() {
+    static const u64 below = [] {
+        const char* env = std::getenv("RYGT_NATIVE_SNAPSHOT_BELOW");
+        return env && *env ? std::strtoull(env, nullptr, 0) : u64{0};
+    }();
+    return below;
 }
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr address, u64 size,
@@ -1370,7 +1439,28 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
         return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
     }();
-    if (write && write_regions && size <= 256_MB && address < inplace_from) {
+    // FIX-172 (diagnosis, RYGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written
+    // ranges meeting one of these stay in guest memory too.
+    static const std::vector<std::pair<VAddr, VAddr>> inplace_ranges = [] {
+        std::vector<std::pair<VAddr, VAddr>> list;
+        const char* env = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
+        for (const char* at = env; at && *at;) {
+            char* end = nullptr;
+            const VAddr begin = std::strtoull(at, &end, 16);
+            if (end == at || *end != '+') {
+                break;
+            }
+            at = end + 1;
+            const u64 length = std::strtoull(at, &end, 16);
+            list.emplace_back(begin, begin + std::max<u64>(length, 1));
+            at = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    const bool listed_in_place = std::ranges::any_of(inplace_ranges, [&](const auto& range) {
+        return address < range.second && address + size > range.first;
+    });
+    if (write && write_regions && size <= 256_MB && address < inplace_from && !listed_in_place) {
         if (Region* region = MakeRegion(address, size)) {
             ++stats.region_binds;
             memo_kind = MemoKind::Region; // OPT-003
@@ -1378,6 +1468,12 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
+    }
+    // FIX-170 (diagnosis, RYGT_NATIVE_SNAPSHOT_BELOW=<bytes>): small read-only shader buffers
+    // (constants) are copied when the draw is recorded instead of read in place by the GPU later.
+    if (!mirror && !write && size <= SnapshotBelow()) {
+        last_bound = Bound::InPlace;
+        return SnapshotRange(address, size);
     }
     if (mirror && !write) {
         if (const auto mirrored = MirrorBuffer(address, size)) {
@@ -1430,6 +1526,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         }
         return std::nullopt;
     }
+    return SnapshotRange(address, size);
+}
+
+std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr address, u64 size) {
     // A snapshot of what the range holds now, in the list's upload memory (zeros where the CPU
     // can't read it: NAT-106).
     const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
@@ -1803,6 +1903,30 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 !impossible && base != 0 && sharp_size != 0 && !r.IsMappedStart(base);
             if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
                 const u64 size = r.memory->ClampRangeSize(base, sharp_size);
+                // FIX-174 (diagnosis, RYGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
+                // shaders that bind a buffer over that range (the first ones, then now and then).
+                static const std::pair<VAddr, VAddr> watch_buffer = [] {
+                    const char* env = std::getenv("RYGT_NATIVE_WATCH_BUFFER");
+                    if (!env || !*env) {
+                        return std::pair<VAddr, VAddr>{};
+                    }
+                    char* end = nullptr;
+                    const VAddr at = std::strtoull(env, &end, 16);
+                    const u64 length = end && *end == '+' ? std::strtoull(end + 1, nullptr, 16) : 1;
+                    return std::pair<VAddr, VAddr>{at, at + std::max<u64>(length, 1)};
+                }();
+                if (watch_buffer.first != 0 && base < watch_buffer.second &&
+                    base + size > watch_buffer.first) {
+                    static std::atomic<u32> watch_logged{};
+                    if (Sample(watch_logged)) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "FIX-174 watch: {} shader {:#x} binds buffer {} {:#x}+{:#x} "
+                                    "(frame {})",
+                                    stage.sw_stage == Shader::SwStage::Compute ? "compute" : "draw",
+                                    stage.pgm_hash, desc.is_written ? "write" : "read", base,
+                                    size, frame);
+                    }
+                }
                 const auto log_buffer = [&](const char* how) {
                     if (!log_watched) {
                         return;
@@ -1822,6 +1946,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                      : std::string{"unreadable"});
                 };
                 if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) &&
+                    (desc.is_written || size > SnapshotBelow()) && // FIX-170
                     !RegionOver(base, size) && direct->EnsureImported(base, size)) {
                     // D3: read in place through the page table; nothing bound.
                     direct_entries[buffer_index] = {u32(base), u32(base >> 32), u32(size), 1u};
@@ -4127,6 +4252,12 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
         }
     }
     DropMirrors(address, size); // NAT-150
+    {
+        std::scoped_lock pending_lock{region_dirty_mutex}; // FIX-173
+        std::erase_if(page_snapshots, [&](const auto& snapshot) {
+            return snapshot.first >= address && snapshot.first < address + size;
+        });
+    }
     ++buffer_generation;        // OPT-003
     ++unmap_generation;         // OPT-002
 }
@@ -4169,9 +4300,21 @@ void NativeRenderer::ProbeWatchedPictures() {
         double sum = 0;
         float lo = std::numeric_limits<float>::max(), hi = std::numeric_limits<float>::lowest();
         u64 zeros = 0;
+        // FIX-171: B10G11R11 pictures (GT Sport's light cubes) as their mean colour channel.
+        const auto small_float = [](u32 bits, u32 mantissa_bits) {
+            const u32 e = bits >> mantissa_bits;
+            const float m = float(bits & ((1u << mantissa_bits) - 1)) / float(1u << mantissa_bits);
+            return e == 0 ? std::ldexp(m, -14) : e == 31 ? 0.0f : std::ldexp(1.0f + m, int(e) - 15);
+        };
         for (u64 i = 0; i < count; ++i) {
             float v;
             std::memcpy(&v, bytes + i * 4, 4);
+            if (it->packed_r11g11b10) {
+                u32 word;
+                std::memcpy(&word, bytes + i * 4, 4);
+                v = (small_float(word & 0x7ff, 6) + small_float((word >> 11) & 0x7ff, 6) +
+                     small_float(word >> 22, 5)) / 3.0f;
+            }
             if (!std::isfinite(v)) {
                 continue;
             }
@@ -4180,6 +4323,50 @@ void NativeRenderer::ProbeWatchedPictures() {
             hi = std::max(hi, v);
             zeros += v == 0.0f ? 1 : 0;
         }
+        if (it->packed_r11g11b10 && it->layers != 0) {
+            // FIX-171: per mip, the mean of each layer (untiled copy, mip after mip).
+            std::string text;
+            u64 at = 0;
+            for (u32 mip = 0; mip < it->mips; ++mip) {
+                const u64 w = std::max(it->width >> mip, 1u), h = std::max(it->height >> mip, 1u);
+                text += fmt::format(" m{}:", mip);
+                for (u32 layer = 0; layer < it->layers; ++layer) {
+                    double layer_sum = 0;
+                    for (u64 i = 0; i < w * h && (at + i + 1) * 4 <= it->size; ++i) {
+                        u32 word;
+                        std::memcpy(&word, bytes + (at + i) * 4, 4);
+                        layer_sum += (small_float(word & 0x7ff, 6) +
+                                      small_float((word >> 11) & 0x7ff, 6) +
+                                      small_float(word >> 22, 5)) / 3.0f;
+                    }
+                    at += w * h;
+                    text += fmt::format(" {:.3f}", layer_sum / double(w * h));
+                }
+            }
+            if (it->layers == 1 && it->height >= 3) {
+                // A plain picture (the frame's main view): its top, middle and bottom thirds.
+                const u64 w = it->width, third = it->height / 3;
+                std::array<double, 3> part{};
+                for (u32 band = 0; band < 3; ++band) {
+                    for (u64 y = band * third; y < (band + 1) * third; ++y) {
+                        for (u64 x = 0; x < w; ++x) {
+                            u32 word;
+                            std::memcpy(&word, bytes + (y * w + x) * 4, 4);
+                            part[band] += (small_float(word & 0x7ff, 6) +
+                                           small_float((word >> 11) & 0x7ff, 6) +
+                                           small_float(word >> 22, 5)) / 3.0f;
+                        }
+                    }
+                    part[band] /= double(third * w);
+                }
+                text += fmt::format(" thirds: {:.4f} {:.4f} {:.4f}", part[0], part[1], part[2]);
+            }
+            LOG_WARNING(Render_Vulkan, "FIX-171 watch: frame {}: {} {:#x} {}x{} version {}:{}",
+                        it->frame, it->target ? "target" : "texture", it->address, it->width,
+                        it->height, it->version, text);
+            it = probes.erase(it);
+            continue;
+        }
         LOG_WARNING(Render_Vulkan, "FIX-156 watch: frame {}: {} {:#x} {}x{} version {} holds "
                     "mean {:.4f} min {:.4f} max {:.4f}, {} of {} words zero (as 32-bit floats)",
                     it->frame, it->target ? "target" : "texture", it->address, it->width,
@@ -4187,7 +4374,12 @@ void NativeRenderer::ProbeWatchedPictures() {
                     it->version, count ? sum / count : 0.0, lo, hi, zeros, count);
         it = probes.erase(it);
     }
-    if (frame % 30 != 0 || !probes.empty()) {
+    // FIX-171 (diagnosis, RYGT_NATIVE_WATCH_EVERY=<frames>): how often (every 30 frames).
+    static const u64 every = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WATCH_EVERY");
+        return env && *env ? std::max<u64>(std::strtoull(env, nullptr, 0), 1) : u64{30};
+    }();
+    if (frame % every != 0 || probes.size() >= (every >= 30 ? 1u : 16u)) {
         return;
     }
     Begin();
@@ -4197,7 +4389,28 @@ void NativeRenderer::ProbeWatchedPictures() {
                 entry.info.num_samples != 1) {
                 return;
             }
-            const u64 size = entry.info.guest_size;
+            const bool packed = entry.info.pixel_format == vk::Format::eB10G11R11UfloatPack32;
+            const auto& desc = entry.image->Desc();
+            // FIX-171 (RYGT_NATIVE_WATCH_RECT=x,y,w,h): of a plain picture only that rectangle.
+            static const std::array<u32, 4> rect = [] {
+                std::array<u32, 4> r{};
+                if (const char* env = std::getenv("RYGT_NATIVE_WATCH_RECT"); env && *env) {
+                    std::sscanf(env, "%u,%u,%u,%u", &r[0], &r[1], &r[2], &r[3]);
+                }
+                return r;
+            }();
+            const bool in_rect = packed && rect[2] != 0 && rect[3] != 0 && desc.mips == 1 &&
+                                 desc.layers <= 1 && rect[0] + rect[2] <= desc.width &&
+                                 rect[1] + rect[3] <= desc.height;
+            u64 untiled = 0;
+            for (u32 mip = 0; mip < desc.mips; ++mip) {
+                untiled += u64(std::max(desc.width >> mip, 1u)) *
+                           std::max(desc.height >> mip, 1u) * std::max(desc.layers, 1u) * 4;
+            }
+            if (in_rect) {
+                untiled = u64(rect[2]) * rect[3] * 4;
+            }
+            const u64 size = packed ? untiled : entry.info.guest_size;
             auto buffer = device->CreateBuffer({.size = size,
                                                 .usage = Native::Rhi::BufferUsageStorage |
                                                          Native::Rhi::BufferUsageTransferDst,
@@ -4207,11 +4420,53 @@ void NativeRenderer::ProbeWatchedPictures() {
                 return;
             }
             GlobalBarrier();
-            if (registry->RecordDownload(*stream.list, entry, *buffer, 0)) {
+            if (in_rect) {
+                const vk::BufferImageCopy region{
+                    .bufferOffset = 0,
+                    .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                      .mipLevel = 0,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1},
+                    .imageOffset = {s32(rect[0]), s32(rect[1]), 0},
+                    .imageExtent = {rect[2], rect[3], 1},
+                };
+                stream.cmd.copyImageToBuffer(
+                    vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
+                    vk::ImageLayout::eGeneral,
+                    vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, region);
+                probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
+                                  entry.write_version.load(), rect[2], rect[3], !entry.from_cpu,
+                                  watched, true, 1, 1});
+            } else if (packed) {
+                // FIX-171: each mip with all its layers, untiled.
+                std::vector<vk::BufferImageCopy> regions;
+                u64 offset = 0;
+                for (u32 mip = 0; mip < desc.mips; ++mip) {
+                    const u32 w = std::max(desc.width >> mip, 1u);
+                    const u32 h = std::max(desc.height >> mip, 1u);
+                    regions.push_back(vk::BufferImageCopy{
+                        .bufferOffset = offset,
+                        .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                          .mipLevel = mip,
+                                          .baseArrayLayer = 0,
+                                          .layerCount = std::max(desc.layers, 1u)},
+                        .imageExtent = {w, h, 1},
+                    });
+                    offset += u64(w) * h * std::max(desc.layers, 1u) * 4;
+                }
+                stream.cmd.copyImageToBuffer(
+                    vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
+                    vk::ImageLayout::eGeneral,
+                    vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, regions);
+                probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
+                                  entry.write_version.load(), desc.width, desc.height,
+                                  !entry.from_cpu, watched, true, desc.mips,
+                                  std::max(desc.layers, 1u)});
+            } else if (registry->RecordDownload(*stream.list, entry, *buffer, 0)) {
                 stream.pipeline = vk::Pipeline{};
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), entry.info.size.width,
-                                  entry.info.size.height, !entry.from_cpu, watched});
+                                  entry.info.size.height, !entry.from_cpu, watched, false});
             }
         });
     }
@@ -4377,6 +4632,32 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     if (Native::WatchedTexture(begin, end)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: CPU write fault {:#x}+{:#x} (exact {:#x}); "
                     "memory {}", address, size, exact, Native::WatchedBytes(address));
+    }
+    // FIX-173: a region page holds what the GPU wrote there, which guest memory never got; a
+    // CPU write to the page copies in only the bytes the CPU changed (RefreshRegion compares
+    // with this copy of the page from before the write), not the whole page from guest memory.
+    // Copying whole pages put stale guest bytes over the GPU's results: GT Sport computes the
+    // cockpit's light from its interior capture into 64 bytes at 0x1000e317c0 every third
+    // frame, and the CPU writes other data in that page every frame, so the cockpit was lit in
+    // one frame of three and dark in the other two.
+    if (end - begin <= 64_KB) {
+        std::shared_lock map_lock{buffer_map_mutex};
+        if (RegionOver(begin, end - begin)) {
+            std::scoped_lock pending_lock{region_dirty_mutex};
+            for (VAddr page = begin; page < end; page += 4096) {
+                auto& slot = page_snapshots[page];
+                if (slot) {
+                    continue; // the first write since the page was copied in counts
+                }
+                auto copy = std::make_unique<std::array<u8, 4096>>();
+                if (Core::RytyMemory::GuardedCopy(copy->data(),
+                                                  reinterpret_cast<const void*>(page), 4096)) {
+                    slot = std::move(copy);
+                } else {
+                    page_snapshots.erase(page);
+                }
+            }
+        }
     }
     UnwatchPages(begin, end);
     registry->CpuWrite(begin, end - begin, exact != 0 ? (address - begin) + exact : 0);
