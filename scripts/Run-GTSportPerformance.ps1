@@ -6,6 +6,9 @@ param(
     [ValidateSet(-1, 0, 1, 2)]
     [int]$ReadbacksMode = -1,
     [switch]$CrashDiagnostics,
+    # Diagnostic runs only: Vulkan validation (core, synchronization and GPU-assisted checks) from the
+    # SDK in Build/tools; messages go to the log. Much slower.
+    [switch]$Validation,
     [switch]$SyncLog,
     [ValidateSet(-1, 0, 1)]
     [int]$CopyGpuBuffers = -1,
@@ -83,6 +86,13 @@ if ($ReadbackLinearImages -ge 0) {
 # Diagnostic runs only: the Vulkan crash-diagnostic layer reports the in-flight work on device loss.
 $sdkLayers = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../Build/tools/VulkanSDK/Bin')).Path
 $crashDumps = Join-Path $ProfileDirectory 'crash-dumps'
+if ($Validation) {
+    $overrides.Vulkan.vkvalidation_enabled = $true
+    $overrides.Vulkan.vkvalidation_core_enabled = $true
+    $overrides.Vulkan.vkvalidation_sync_enabled = $true
+    $overrides.Vulkan.vkvalidation_gpu_enabled = $true
+    Write-Output 'Vulkan validation enabled (core, sync, GPU-assisted)'
+}
 if ($CrashDiagnostics) {
     $overrides.Vulkan.vkcrash_diagnostic_enabled = $true
     New-Item -ItemType Directory -Force -Path $crashDumps | Out-Null
@@ -121,6 +131,9 @@ try {
     Write-Output "Frame-rate lock: $(if ($FpsLock -gt 0) { "$FpsLock FPS" } else { 'off' }); draw pipe $env:SHADGT_DRAW_PIPE, prewarm $env:SHADGT_PREWARM"
     if ($DisablePerf) {
         Write-Output "Disabled for this run: PERF $DisablePerf"
+    }
+    if ($Validation) {
+        $env:VK_LAYER_PATH = $sdkLayers
     }
     if ($CrashDiagnostics) {
         $env:VK_LAYER_PATH = $sdkLayers
