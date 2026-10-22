@@ -156,6 +156,7 @@ private:
 
     /// The command list being recorded and its state.
     struct Stream {
+        std::unique_ptr<Native::Rhi::CommandList> wrapped_list;
         Native::Rhi::CommandList* list = nullptr;
         vk::CommandBuffer cmd{};
         bool rendering = false;

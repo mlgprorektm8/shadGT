@@ -512,11 +512,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 #endif
 
+    if (instance.IsIntel()) {
+        EndSession(); // FIX-188: Intel Arc (#65)
+    }
+
     if (on_submit) {
         on_submit(info);
     }
 
-    EndSession();
+    if (!instance.IsIntel()) {
+        EndSession();
+    }
 
     info.AddSignal(work_semaphore.Handle(), signal_value);
     if (ring) {

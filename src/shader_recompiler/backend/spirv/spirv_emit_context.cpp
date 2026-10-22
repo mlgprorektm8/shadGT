@@ -1075,10 +1075,13 @@ void EmitContext::DefineImagesAndSamplers() {
 }
 
 void EmitContext::DefineSharedMemory() {
-    const auto num_types = std::popcount(static_cast<u32>(info.shared_types));
-    if (num_types == 0) {
+    if (std::popcount(static_cast<u32>(info.shared_types)) == 0) {
         return;
     }
+    if (profile.intel_arc_workarounds) {
+        info.shared_types |= IR::Type::U32; // FIX-188: the 64-bit halves are 32-bit accesses
+    }
+    const auto num_types = std::popcount(static_cast<u32>(info.shared_types));
     ASSERT(info.hw_stage == HwStage::Compute);
     const u32 shared_memory_size =
         runtime_info.hw.cs.shared_memory_size + info.shared_memory_scratch_size;

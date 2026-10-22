@@ -181,6 +181,10 @@ static bool ReadbackHashEnabled() {
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
+// FIX-188: Intel Arc (#65) gets twice the stream rings, against ring wraps in heavy frames.
+static size_t StreamBufferSize(const Vulkan::Instance& instance) {
+    return instance.IsIntel() ? 2 * STREAM_BUFFER_SIZE : STREAM_BUFFER_SIZE;
+}
 
 // PERF-094: the stream ring (small read-only buffers copied for each draw) is in system memory,
 // which the GPU reads over PCIe, instead of video memory the recorder writes over PCIe. Each copy
@@ -220,9 +224,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       memory_tracker{std::make_unique<MemoryTracker>(tracker)}, page_manager{tracker},
-      stream_buffer{instance, scheduler, StreamRingType(), STREAM_BUFFER_SIZE},
-      ahead_stream{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
-      ahead_staging{instance, scheduler, MemoryType::HostUncached, STREAM_BUFFER_SIZE},
+      stream_buffer{instance, scheduler, StreamRingType(), StreamBufferSize(instance_)},
+      ahead_stream{instance, scheduler, MemoryType::Stream, StreamBufferSize(instance_)},
+      ahead_staging{instance, scheduler, MemoryType::HostUncached, StreamBufferSize(instance_)},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance},
       // PERF-011 is disabled: skipping GPU-written bytes in uploads loses CPU stores to those
@@ -240,9 +244,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     }
     for (u32 i = 1; i < StageWorkerCount(); ++i) { // R5
         worker_streams[i] = std::make_unique<StreamBuffer>(instance, scheduler, MemoryType::Stream,
-                                                           STREAM_BUFFER_SIZE / 2);
+                                                           StreamBufferSize(instance_) / 2);
         worker_stagings[i] = std::make_unique<StreamBuffer>(
-            instance, scheduler, MemoryType::HostUncached, STREAM_BUFFER_SIZE / 2);
+            instance, scheduler, MemoryType::HostUncached, StreamBufferSize(instance_) / 2);
     }
     const vk::BufferCreateInfo probe_ci = {
         .flags =
@@ -3907,6 +3911,9 @@ void BufferCache::ReleaseUnmappedArenaMemory(VAddr address, u64 size) {
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+    if (instance.IsIntel()) {
+        scheduler.SyncCommandThread(); // FIX-188: Intel Arc (#65)
+    }
     std::scoped_lock buffer_lock{mutex}; // PERF-067
     if (pending_binds.empty()) {
         return;

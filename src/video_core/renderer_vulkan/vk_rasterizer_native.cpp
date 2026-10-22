@@ -584,9 +584,18 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     if (s.list) {
         return s;
     }
-    s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
-    s.list->Begin();
-    s.cmd = vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())};
+    if (r.instance.IsIntel()) {
+        // FIX-188: Intel Arc (#65) records into the scheduler's own command buffer.
+        r.scheduler.EndRendering();
+        s.cmd = r.scheduler.DirectCommandBuffer();
+        s.wrapped_list = device->WrapCommandBuffer(
+            reinterpret_cast<u64>(static_cast<VkCommandBuffer>(s.cmd)));
+        s.list = s.wrapped_list.get();
+    } else {
+        s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
+        s.list->Begin();
+        s.cmd = vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())};
+    }
     s.rendering = false;
     s.dynamic.Invalidate();
     s.pipeline = vk::Pipeline{};
@@ -4238,7 +4247,8 @@ void NativeRenderer::DispatchDirect() {
     PrepareImages();
     GlobalBarrier();
     const CmdBuf cmdbuf{s.cmd};
-    if (s.pipeline != pipeline->Handle()) {
+    // FIX-188: Intel Arc (#65) binds the pipeline every time (tile work runs between).
+    if (r.instance.IsIntel() || s.pipeline != pipeline->Handle()) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
         s.pipeline = pipeline->Handle();
     }
@@ -4282,7 +4292,8 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     PrepareImages();
     GlobalBarrier();
     const CmdBuf cmdbuf{s.cmd};
-    if (s.pipeline != pipeline->Handle()) {
+    // FIX-188: Intel Arc (#65) binds the pipeline every time (tile work runs between).
+    if (r.instance.IsIntel() || s.pipeline != pipeline->Handle()) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
         s.pipeline = pipeline->Handle();
     }
@@ -4561,6 +4572,7 @@ void NativeRenderer::ProbeWatchedPictures() {
             ++it;
             continue;
         }
+        it->buffer->Invalidate(0, it->size);
         const u8* bytes = it->buffer->Mapped();
         const u64 count = it->size / 4;
         double sum = 0;
@@ -4700,6 +4712,7 @@ void NativeRenderer::ProbeWatchedPictures() {
                     vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
                     vk::ImageLayout::eGeneral,
                     vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, region);
+                stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), rect[2], rect[3], !entry.from_cpu,
                                   watched, true, 1, 1});
@@ -4724,11 +4737,15 @@ void NativeRenderer::ProbeWatchedPictures() {
                     vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
                     vk::ImageLayout::eGeneral,
                     vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, regions);
+                stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), desc.width, desc.height,
                                   !entry.from_cpu, watched, true, desc.mips,
                                   std::max(desc.layers, 1u)});
-            } else if (registry->RecordDownload(*stream.list, entry, *buffer, 0)) {
+            } else {
+                auto copies = Native::MipCopies(entry.info);
+                stream.list->CopyImageToBuffer(entry.image.get(), buffer.get(), copies);
+                stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
                 stream.pipeline = vk::Pipeline{};
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), entry.info.size.width,
@@ -4955,12 +4972,19 @@ void NativeRenderer::Splice() {
     if (!writebacks.empty()) {
         GlobalBarrier(); // NAT-112: written back in this submission
     }
-    s.list->End();
+    const bool wrapped = s.wrapped_list != nullptr; // FIX-188: Intel Arc (#65)
+    if (!wrapped) {
+        s.list->End();
+    }
     r.scheduler.EndRendering();
-    const vk::CommandBuffer secondary = s.cmd;
-    r.scheduler.CommandBuffer().executeCommands(secondary);
+    if (!wrapped) {
+        const vk::CommandBuffer secondary = s.cmd;
+        r.scheduler.CommandBuffer().executeCommands(secondary);
+    }
     const u64 tick = r.scheduler.CurrentTick();
-    device->MarkExecuted(s.list, {timeline.get(), tick});
+    if (!wrapped) {
+        device->MarkExecuted(s.list, {timeline.get(), tick});
+    }
     {
         std::scoped_lock chunk_lock{chunk_mutex};
         for (auto& chunk : s.chunks) {
@@ -4976,6 +5000,7 @@ void NativeRenderer::Splice() {
     s.pools.clear();
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
+    s.wrapped_list.reset();
     s.list = nullptr;
     s.cmd = vk::CommandBuffer{};
     s.rendering = false;

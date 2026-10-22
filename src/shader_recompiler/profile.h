@@ -50,6 +50,9 @@ struct Profile {
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};
     bool needs_lds_barriers{};
+    /// FIX-188: #65's Intel Arc translation (memory-only compute barriers, 64-bit shared memory
+    /// as two 32-bit halves); other GPUs keep the translation they had before it.
+    bool intel_arc_workarounds{};
     bool needs_buffer_offsets{};
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};

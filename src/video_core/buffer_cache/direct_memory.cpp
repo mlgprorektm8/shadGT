@@ -260,8 +260,18 @@ bool DirectMemory::ImportView(VAddr address) {
                                             &flags_info,
                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                             alias};
+    u32 memory_type_index = static_cast<u32>(std::countr_zero(ptr_props.memoryTypeBits));
+    // FIX-188: Intel Arc (#65) imports into cached host memory (uncached stalls the CPU).
+    const auto& mem_props = instance.GetMemoryProperties();
+    for (u32 i = 0; instance.IsIntel() && i < mem_props.memoryTypeCount; ++i) {
+        if ((ptr_props.memoryTypeBits & (1u << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostCached)) {
+            memory_type_index = i;
+            break;
+        }
+    }
     VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import, end - base,
-                              static_cast<u32>(std::countr_zero(ptr_props.memoryTypeBits))};
+                              memory_type_index};
     VkDeviceMemory memory{};
     if (const VkResult r = d.vkAllocateMemory(device, &info, nullptr, &memory); r != VK_SUCCESS) {
         UnmapAlias()(alias);

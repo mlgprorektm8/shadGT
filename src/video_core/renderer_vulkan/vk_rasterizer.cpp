@@ -76,13 +76,23 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     memory->SetRasterizer(this);
     scheduler.StartPerfMonitor();
 
-    scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+    // FIX-188: on Intel Arc (#65) the native work is spliced and barriers flushed when the
+    // session ends, before the submit callback (the scheduler ends it first there).
+    const auto end_session = [this] {
 #ifdef RYTY_GPU
         if (native) {
             native->Splice(); // NAT-100: native work recorded so far runs in this submission
         }
 #endif
         runtime.FlushBarriers();
+    };
+    if (instance.IsIntel()) {
+        scheduler.SetSessionCallback(end_session);
+    }
+    scheduler.SetSubmitCallback([this, end_session](Vulkan::SubmitInfo& info) {
+        if (!instance.IsIntel()) {
+            end_session();
+        }
         buffer_cache.SubmitPendingArenaBinds(info);
     });
 
@@ -1845,7 +1855,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                 .tessellate_quads = quad_list && !quad_triangles,
             },
             !quad_list);
-        if (!pipeline) {
+        if (!pipeline || !pipeline->Handle()) {
             if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 1);
             return;
         }
@@ -2234,7 +2244,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .tessellate_quads = true,
     };
     const GraphicsPipeline* pipeline = AcquireGraphicsPipeline(params, false);
-    if (!pipeline) {
+    if (!pipeline || !pipeline->Handle()) {
         if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 1);
         return;
     }
@@ -5317,8 +5327,8 @@ void Rasterizer::FinalizeTextureLayouts(RenderState* render_state) {
         ASSERT(backing != image.backing_images.end());
 
         ImageBindingRequirements requirements{
-            .is_depth = image.info.props.is_depth,
-            .has_stencil = image.info.props.has_stencil,
+            .is_depth = bool(image.info.props.is_depth),
+            .has_stencil = bool(image.info.props.has_stencil),
             .feedback_layout_supported = instance.IsAttachmentFeedbackLoopLayoutSupported(),
             .is_compute = render_state == nullptr,
         };

@@ -18,6 +18,13 @@ void MemoryBarrier(EmitContext& ctx, spv::Scope scope) {
 } // Anonymous namespace
 
 void EmitBarrier(EmitContext& ctx) {
+    // FIX-188: Intel Arc only (#65). NVIDIA also runs 32-wide subgroups and needs the execution
+    // barrier: without it compute shaders sharing LDS turned races red.
+    if (ctx.sw_stage == Shader::SwStage::Compute && ctx.profile.subgroup_size < 64 &&
+        ctx.profile.intel_arc_workarounds) {
+        MemoryBarrier(ctx, spv::Scope::Workgroup);
+        return;
+    }
     const auto execution{spv::Scope::Workgroup};
     spv::Scope memory;
     spv::MemorySemanticsMask memory_semantics;
