@@ -63,7 +63,7 @@ IR::Type CalculateSpecialSharedAtomicTypes(IR::Program& program) {
 // atomics of the same type are not used.
 void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile) {
     if (program.info.hw_stage != HwStage::Compute ||
-        (profile.supports_workgroup_explicit_memory_layout && !profile.needs_lds_barriers)) {
+        profile.supports_workgroup_explicit_memory_layout) {
         return;
     }
 

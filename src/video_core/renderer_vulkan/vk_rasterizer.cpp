@@ -76,16 +76,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     memory->SetRasterizer(this);
     scheduler.StartPerfMonitor();
 
-    scheduler.SetSessionCallback([this]() {
+    scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
 #ifdef RYTY_GPU
         if (native) {
             native->Splice(); // NAT-100: native work recorded so far runs in this submission
         }
 #endif
         runtime.FlushBarriers();
-    });
-
-    scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         buffer_cache.SubmitPendingArenaBinds(info);
     });
 
@@ -1848,7 +1845,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                 .tessellate_quads = quad_list && !quad_triangles,
             },
             !quad_list);
-        if (!pipeline || !pipeline->Handle()) {
+        if (!pipeline) {
             if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 1);
             return;
         }
@@ -2237,7 +2234,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .tessellate_quads = true,
     };
     const GraphicsPipeline* pipeline = AcquireGraphicsPipeline(params, false);
-    if (!pipeline || !pipeline->Handle()) {
+    if (!pipeline) {
         if (DrawSetEnabled()) NoteDrawSet(pipeline_cache.SelectedInfos(), 1);
         return;
     }
@@ -5320,8 +5317,8 @@ void Rasterizer::FinalizeTextureLayouts(RenderState* render_state) {
         ASSERT(backing != image.backing_images.end());
 
         ImageBindingRequirements requirements{
-            .is_depth = bool(image.info.props.is_depth),
-            .has_stencil = bool(image.info.props.has_stencil),
+            .is_depth = image.info.props.is_depth,
+            .has_stencil = image.info.props.has_stencil,
             .feedback_layout_supported = instance.IsAttachmentFeedbackLoopLayoutSupported(),
             .is_compute = render_state == nullptr,
         };

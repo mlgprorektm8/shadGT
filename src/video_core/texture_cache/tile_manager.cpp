@@ -227,20 +227,16 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
 
-    const u64 tiled_avail =
-        in_buffer->SizeBytes() > in_offset ? in_buffer->SizeBytes() - in_offset : 0;
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = in_buffer->Handle(),
         .offset = in_offset,
-        .range = std::min<u64>(info.guest_size, tiled_avail),
+        .range = info.guest_size,
     };
 
-    const u64 linear_avail =
-        staging.buffer->SizeBytes() > staging.offset ? staging.buffer->SizeBytes() - staging.offset : 0;
     const vk::DescriptorBufferInfo linear_buffer_info{
         .buffer = staging.buffer->Handle(),
         .offset = staging.offset,
-        .range = std::min<u64>(info.guest_size, linear_avail),
+        .range = info.guest_size,
     };
 
     const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
@@ -271,8 +267,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     }};
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
-    const auto divisor = (info.num_bits / 8) * 64;
-    const auto dim_x = divisor > 0 ? std::max(1u, static_cast<u32>(info.guest_size / divisor)) : 1u;
+    const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);
 
     runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size,
@@ -333,20 +328,16 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
 
-    const u64 tiled_avail =
-        out_buffer->SizeBytes() > out_offset ? out_buffer->SizeBytes() - out_offset : 0;
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = out_buffer->Handle(),
         .offset = out_offset,
-        .range = std::min<u64>(info.guest_size, tiled_avail),
+        .range = info.guest_size,
     };
 
-    const u64 linear_avail =
-        linear_buffer->SizeBytes() > linear_offset ? linear_buffer->SizeBytes() - linear_offset : 0;
     const vk::DescriptorBufferInfo linear_buffer_info{
         .buffer = linear_buffer->Handle(),
         .offset = linear_offset,
-        .range = std::min<u64>(info.guest_size, linear_avail),
+        .range = info.guest_size,
     };
 
     const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
@@ -377,8 +368,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     }};
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
-    const auto divisor = (info.num_bits / 8) * 64;
-    const auto dim_x = divisor > 0 ? std::max(1u, static_cast<u32>(info.guest_size / divisor)) : 1u;
+    const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);
 
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,

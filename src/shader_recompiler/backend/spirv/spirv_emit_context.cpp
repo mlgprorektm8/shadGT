@@ -1075,11 +1075,10 @@ void EmitContext::DefineImagesAndSamplers() {
 }
 
 void EmitContext::DefineSharedMemory() {
-    if (std::popcount(static_cast<u32>(info.shared_types)) == 0) {
+    const auto num_types = std::popcount(static_cast<u32>(info.shared_types));
+    if (num_types == 0) {
         return;
     }
-    info.shared_types |= IR::Type::U32;
-    const auto num_types = std::popcount(static_cast<u32>(info.shared_types));
     ASSERT(info.hw_stage == HwStage::Compute);
     const u32 shared_memory_size =
         runtime_info.hw.cs.shared_memory_size + info.shared_memory_scratch_size;

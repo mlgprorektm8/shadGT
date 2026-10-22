@@ -33,9 +33,6 @@
 #ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
 #endif
-#if defined(SDL_PLATFORM_WIN32)
-#include <windows.h>
-#endif
 #include <core/emulator_settings.h>
 #include "core/libraries/keyboard/keyboard.h"
 #include "core/libraries/mouse/sdl_mouse.h"
@@ -175,8 +172,6 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
             window, EmulatorSettings.GetFullScreenMode() == "Fullscreen" ? exclusive : NULL);
     }
     SDL_SetWindowFullscreen(window, EmulatorSettings.IsFullScreen());
-    SDL_ShowWindow(window);
-    SDL_RaiseWindow(window);
     SDL_SyncWindow(window);
     // The window geometry is only final once the fullscreen transition has settled; refresh
     // the cached size so the first swapchain and the splashscreen use the real drawable size.
@@ -188,11 +183,6 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     window_info.type = WindowSystemType::Windows;
     window_info.render_surface = SDL_GetPointerProperty(SDL_GetWindowProperties(window),
                                                         SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
-    if (auto* hwnd = static_cast<HWND>(window_info.render_surface)) {
-        ShowWindow(hwnd, SW_RESTORE);
-        ShowWindow(hwnd, SW_SHOWNORMAL);
-        SetForegroundWindow(hwnd);
-    }
 #elif defined(SDL_PLATFORM_LINUX) || defined(__FreeBSD__)
     // SDL doesn't have a platform define for FreeBSD AAAAAAAAAA
     if (SDL_strcmp(SDL_GetCurrentVideoDriver(), "x11") == 0) {

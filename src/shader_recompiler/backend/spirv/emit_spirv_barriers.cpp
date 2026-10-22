@@ -18,10 +18,6 @@ void MemoryBarrier(EmitContext& ctx, spv::Scope scope) {
 } // Anonymous namespace
 
 void EmitBarrier(EmitContext& ctx) {
-    if (ctx.sw_stage == Shader::SwStage::Compute && ctx.profile.subgroup_size < 64) {
-        MemoryBarrier(ctx, spv::Scope::Workgroup);
-        return;
-    }
     const auto execution{spv::Scope::Workgroup};
     spv::Scope memory;
     spv::MemorySemanticsMask memory_semantics;

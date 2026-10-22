@@ -512,11 +512,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 #endif
 
-    EndSession();
-
     if (on_submit) {
         on_submit(info);
     }
+
+    EndSession();
 
     info.AddSignal(work_semaphore.Handle(), signal_value);
     if (ring) {

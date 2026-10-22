@@ -33,8 +33,6 @@ struct StagingBufferRef {
 
 class StagingBufferPool {
 public:
-    static constexpr size_t DEV_LOCAL_STAGING_MIBS = 256;
-
     explicit StagingBufferPool(const Instance& instance, Scheduler& scheduler);
     ~StagingBufferPool();
 
