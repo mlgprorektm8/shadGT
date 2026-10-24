@@ -23,6 +23,7 @@ int mouse_joystick_binding = 0;
 float mouse_deadzone_offset = 0.5, mouse_speed = 1, mouse_speed_offset = 0.1250;
 bool mouse_gyro_roll_mode = false;
 Uint32 mouse_polling_id = 0;
+Uint32 mouse_wheel_hold_ms = 33;
 MouseMode mouse_mode = MouseMode::Off;
 
 // Switches mouse to a set mode or turns mouse emulation off if it was already in that mode.

@@ -62,35 +62,54 @@ circle = kp6
 cross = kp2
 square = kp4
 # Alternatives for users without a keypad
-triangle = c
-circle = b
-cross = n
-square = v
+triangle = i
+circle = l
+cross = k
+square = j
 
 l1 = q
 r1 = u
 l2 = e
 r2 = o
-l3 = x
-r3 = m
+l3 = z
+r3 = comma
 
 options = enter
 touchpad_center = space
 
-pad_up = up
-pad_down = down
-pad_left = left
-pad_right = right
+pad_up = f
+pad_down = c
+pad_left = x
+pad_right = v
 
 axis_left_x_minus = a
 axis_left_x_plus = d
 axis_left_y_minus = w
 axis_left_y_plus = s
+axis_left_x_minus = left
+axis_left_x_plus = right
+axis_left_y_minus = up
+axis_left_y_plus = down
 
-axis_right_x_minus = j
-axis_right_x_plus = l
-axis_right_y_minus = i
-axis_right_y_plus = k
+axis_right_x_minus = b
+axis_right_x_plus = m
+axis_right_y_minus = h
+axis_right_y_plus = n
+
+# Mouse bindings
+
+cross = leftbutton
+circle = rightbutton
+axis_right_y_minus = mousewheelup
+axis_right_y_plus = mousewheeldown
+mouse_to_joystick = left
+# mouse_movement_params = <min output floor>, <speed multiplier>, <constant nudge>
+# min_deflection (0..1) e.g. 0.5 means even the smallest move pushes the stick to at least 50% of full deflection
+# sensitivity (0..) e.g. 2 means a 2x multiplier on mouse motion (1 = default) (this is probably what you want to change)
+# base_deflection (0..1) e.g. 0.125 means a small constant added so any motion registers at all
+mouse_movement_params = 0, 5, 0
+# mouse_wheel_hold_ms = how long (ms) each mouse wheel tick stays held as input (default 33)
+mouse_wheel_hold_ms = 250
 
 # Controller bindings
 
@@ -122,10 +141,35 @@ axis_right_y = axis_right_y
 # Range of deadzones: 1 (almost none) to 127 (max)
 analog_deadzone = leftjoystick, 5, 127
 analog_deadzone = rightjoystick, 5, 127
+analog_deadzone:2 = leftjoystick, 5, 127
+analog_deadzone:2 = rightjoystick, 5, 127
+analog_deadzone:3 = leftjoystick, 5, 127
+analog_deadzone:3 = rightjoystick, 5, 127
+analog_deadzone:4 = leftjoystick, 5, 127
+analog_deadzone:4 = rightjoystick, 5, 127
 
 override_controller_color = false, 0, 0, 255
 )";
 }
+
+#if defined(WIN32)
+#define RYTY_EXPORT __declspec(dllexport)
+#else
+#define RYTY_EXPORT __attribute__((visibility("default")))
+#endif
+
+/// Returns the same default config text the input handler generates. Copies at most
+/// bufsize bytes into buf (NUL-terminated); returns the required size, or a negative
+/// size when buf is too small. Exposed so the RyGT loader can offer the same defaults.
+extern "C" RYTY_EXPORT int ryty_get_default_input_config(char* buf, int bufsize) {
+    const auto config = GetDefaultInputConfig();
+    const int required = static_cast<int>(config.size()) + 1;
+    if (bufsize < required) return -required;
+    config.copy(buf, config.size());
+    buf[config.size()] = '\0';
+    return required;
+}
+
 std::filesystem::path GetInputConfigFile(const std::string& game_id) {
     // Read configuration file of the game, and if it doesn't exist, generate it from default
     // If that doesn't exist either, generate that from getDefaultConfig() and try again
@@ -184,6 +228,9 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             {"hotkey_emulator_settings", "f3"},
             {"hotkey_toggle_friends", "f2"},
         };
+        std::map<std::string, std::string> mouse_default_bindings_to_add = {
+            {"hotkey_toggle_mouse_to_joystick", "middlebutton"},
+        };
         std::string legacy_capture_binding;
         bool legacy_capture_binding_found = false;
         std::ifstream global_in(config_file);
@@ -202,6 +249,7 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
                 legacy_capture_binding_found = true;
             }
             default_bindings_to_add.erase(output_string);
+            mouse_default_bindings_to_add.erase(output_string);
         }
         global_in.close();
         if (legacy_capture_binding_found) {
@@ -212,6 +260,9 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
         }
         std::ofstream global_out(config_file, std::ios::app);
         for (auto const& b : default_bindings_to_add) {
+            global_out << b.first << " = " << b.second << "\n";
+        }
+        for (auto const& b : mouse_default_bindings_to_add) {
             global_out << b.first << " = " << b.second << "\n";
         }
     }
@@ -368,6 +419,7 @@ void ParseInputConfig(const std::string game_id = "") {
     float mouse_deadzone_offset = 0.5;
     float mouse_speed = 1;
     float mouse_speed_offset = 0.125;
+    mouse_wheel_hold_ms = 33;
 
     // me when I'm in a type deduction tournament and my opponent is clang
     constexpr std::array<std::pair<int, int>, 4> default_deadzone = {
@@ -486,6 +538,14 @@ void ParseInputConfig(const std::string game_id = "") {
                 return;
             }
             SetMouseParams(mouse_deadzone_offset, mouse_speed, mouse_speed_offset);
+            return;
+        } else if (output_string == "mouse_wheel_hold_ms") {
+            auto hold_ms = parseInt(input_string);
+            if (!hold_ms || *hold_ms <= 0) {
+                LOG_WARNING(Input, "Invalid mouse wheel hold ms at line {}: \"{}\"", lineCount, input_string);
+                return;
+            }
+            mouse_wheel_hold_ms = *hold_ms;
             return;
         } else if (output_string == "analog_deadzone") {
             std::stringstream ss(input_string);

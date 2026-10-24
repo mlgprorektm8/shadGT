@@ -1,0 +1,231 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1150 560" width="100%" height="100%" style="background-color: #1a1a1a; font-family: system-ui, sans-serif;">
+  <!-- Title -->
+  <text x="30" y="45" fill="#ffffff" font-size="24" font-weight="bold">RyGT default keyboard bindings</text>
+
+  <!-- COLOR SCHEME DEFINITIONS (Palette optimized for readability against gray/white labels) -->
+  <defs>
+    <style>
+      .bg-none   { fill: #333333; stroke: #444444; }
+      .lbl-none  { fill: #aaaaaa; font-size: 12px; font-weight: normal; }
+      .lbl-bold  { fill: #ffffff; font-size: 13px; font-weight: bold; }
+
+      /* Color Groups */
+      .clr-face  { fill: #ff4757; stroke: #ff6b81; } /* Crimson */
+      .clr-l12   { fill: #ffa502; stroke: #ff7f50; } /* Orange */
+      .clr-r12   { fill: #eccc68; stroke: #ffa502; } /* Yellow-Gold */
+      .clr-l3r3  { fill: #2ed573; stroke: #7bed9f; } /* Lime Green */
+      .clr-dpad  { fill: #1e90ff; stroke: #70a1ff; } /* Dodger Blue */
+      .clr-lstick{ fill: #00d2d3; stroke: #48dbfb; } /* Cyan */
+      .clr-rstick{ fill: #9b59b6; stroke: #8e44ad; } /* Amethyst Purple */
+      .clr-opts  { fill: #fd79a8; stroke: #e84393; } /* Pink */
+      .clr-touch { fill: #20bf6b; stroke: #26de81; } /* Emerald Green */
+    </style>
+  </defs>
+
+  <!-- ==================== MAIN KEYBOARD BLOCK ==================== -->
+  <g transform="translate(30, 80)">
+    <!-- Function Row -->
+    <g transform="translate(0, 0)">
+      <rect x="0" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="20" y="22" text-anchor="middle" class="lbl-none">Esc</text>
+      <rect x="60" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="80" y="22" text-anchor="middle" class="lbl-none">F1</text>
+      <rect x="105" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="125" y="22" text-anchor="middle" class="lbl-none">F2</text>
+      <rect x="150" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="170" y="22" text-anchor="middle" class="lbl-none">F3</text>
+      <rect x="195" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="215" y="22" text-anchor="middle" class="lbl-none">F4</text>
+      <rect x="250" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="270" y="22" text-anchor="middle" class="lbl-none">F5</text>
+      <rect x="295" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="315" y="22" text-anchor="middle" class="lbl-none">F6</text>
+      <rect x="340" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="360" y="22" text-anchor="middle" class="lbl-none">F7</text>
+      <rect x="385" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="405" y="22" text-anchor="middle" class="lbl-none">F8</text>
+      <rect x="430" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="450" y="22" text-anchor="middle" class="lbl-none">F9</text>
+      <rect x="475" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="495" y="22" text-anchor="middle" class="lbl-none">F10</text>
+      <rect x="520" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="540" y="22" text-anchor="middle" class="lbl-none">F11</text>
+      <rect x="565" y="0" width="40" height="35" rx="4" class="bg-none"/><text x="585" y="22" text-anchor="middle" class="lbl-none">F12</text>
+    </g>
+
+    <!-- Number Row -->
+    <g transform="translate(0, 45)">
+      <rect x="0" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="20" y="25" text-anchor="middle" class="lbl-none">~</text>
+      <rect x="45" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="65" y="25" text-anchor="middle" class="lbl-none">1</text>
+      <rect x="90" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="110" y="25" text-anchor="middle" class="lbl-none">2</text>
+      <rect x="135" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="155" y="25" text-anchor="middle" class="lbl-none">3</text>
+      <rect x="180" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="200" y="25" text-anchor="middle" class="lbl-none">4</text>
+      <rect x="225" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="245" y="25" text-anchor="middle" class="lbl-none">5</text>
+      <rect x="270" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="290" y="25" text-anchor="middle" class="lbl-none">6</text>
+      <rect x="315" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="335" y="25" text-anchor="middle" class="lbl-none">7</text>
+      <rect x="360" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="380" y="25" text-anchor="middle" class="lbl-none">8</text>
+      <rect x="405" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="425" y="25" text-anchor="middle" class="lbl-none">9</text>
+      <rect x="450" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="470" y="25" text-anchor="middle" class="lbl-none">0</text>
+      <rect x="495" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="515" y="25" text-anchor="middle" class="lbl-none">-</text>
+      <rect x="540" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="560" y="25" text-anchor="middle" class="lbl-none">=</text>
+      <rect x="585" y="0" width="45" height="40" rx="4" class="bg-none"/><text x="607" y="25" text-anchor="middle" class="lbl-none">Bksp</text>
+    </g>
+
+    <!-- QWERTY Row -->
+    <g transform="translate(0, 90)">
+      <rect x="0" y="0" width="60" height="40" rx="4" class="bg-none"/><text x="30" y="25" text-anchor="middle" class="lbl-none">Tab</text>
+      <rect x="65" y="0" width="40" height="40" rx="4" class="clr-l12"/><text x="85" y="25" text-anchor="middle" class="lbl-bold">Q</text>
+      <rect x="110" y="0" width="40" height="40" rx="4" class="clr-lstick"/><text x="130" y="25" text-anchor="middle" class="lbl-bold">W</text>
+      <rect x="155" y="0" width="40" height="40" rx="4" class="clr-l12"/><text x="175" y="25" text-anchor="middle" class="lbl-bold">E</text>
+      <rect x="200" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="220" y="25" text-anchor="middle" class="lbl-none">R</text>
+      <rect x="245" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="265" y="25" text-anchor="middle" class="lbl-none">T</text>
+      <rect x="290" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="310" y="25" text-anchor="middle" class="lbl-none">Y</text>
+      <rect x="335" y="0" width="40" height="40" rx="4" class="clr-r12"/><text x="355" y="25" text-anchor="middle" class="lbl-bold">U</text>
+      <rect x="380" y="0" width="40" height="40" rx="4" class="clr-face"/><text x="400" y="25" text-anchor="middle" class="lbl-bold">I</text>
+      <rect x="425" y="0" width="40" height="40" rx="4" class="clr-r12"/><text x="445" y="25" text-anchor="middle" class="lbl-bold">O</text>
+      <rect x="470" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="490" y="25" text-anchor="middle" class="lbl-none">P</text>
+      <rect x="515" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="535" y="25" text-anchor="middle" class="lbl-none">[</text>
+      <rect x="560" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="580" y="25" text-anchor="middle" class="lbl-none">]</text>
+      <rect x="605" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="625" y="25" text-anchor="middle" class="lbl-none">\</text>
+    </g>
+
+    <!-- ASDF Row -->
+    <g transform="translate(0, 135)">
+      <rect x="0" y="0" width="75" height="40" rx="4" class="bg-none"/><text x="37" y="25" text-anchor="middle" class="lbl-none">Caps</text>
+      <rect x="80" y="0" width="40" height="40" rx="4" class="clr-lstick"/><text x="100" y="25" text-anchor="middle" class="lbl-bold">A</text>
+      <rect x="125" y="0" width="40" height="40" rx="4" class="clr-lstick"/><text x="145" y="25" text-anchor="middle" class="lbl-bold">S</text>
+      <rect x="170" y="0" width="40" height="40" rx="4" class="clr-lstick"/><text x="190" y="25" text-anchor="middle" class="lbl-bold">D</text>
+      <rect x="215" y="0" width="40" height="40" rx="4" class="clr-dpad"/><text x="235" y="25" text-anchor="middle" class="lbl-bold">F</text>
+      <rect x="260" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="280" y="25" text-anchor="middle" class="lbl-none">G</text>
+      <rect x="305" y="0" width="40" height="40" rx="4" class="clr-rstick"/><text x="325" y="25" text-anchor="middle" class="lbl-bold">H</text>
+      <rect x="350" y="0" width="40" height="40" rx="4" class="clr-face"/><text x="370" y="25" text-anchor="middle" class="lbl-bold">J</text>
+      <rect x="395" y="0" width="40" height="40" rx="4" class="clr-face"/><text x="415" y="25" text-anchor="middle" class="lbl-bold">K</text>
+      <rect x="440" y="0" width="40" height="40" rx="4" class="clr-face"/><text x="460" y="25" text-anchor="middle" class="lbl-bold">L</text>
+      <rect x="485" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="505" y="25" text-anchor="middle" class="lbl-none">;</text>
+      <rect x="530" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="550" y="25" text-anchor="middle" class="lbl-none">'</text>
+      <rect x="575" y="0" width="55" height="40" rx="4" class="clr-opts"/><text x="602" y="25" text-anchor="middle" class="lbl-bold">Enter</text>
+    </g>
+
+    <!-- ZXCV Row -->
+    <g transform="translate(0, 180)">
+      <rect x="0" y="0" width="95" height="40" rx="4" class="bg-none"/><text x="47" y="25" text-anchor="middle" class="lbl-none">Shift</text>
+      <rect x="100" y="0" width="40" height="40" rx="4" class="clr-l3r3"/><text x="120" y="25" text-anchor="middle" class="lbl-bold">Z</text>
+      <rect x="145" y="0" width="40" height="40" rx="4" class="clr-dpad"/><text x="165" y="25" text-anchor="middle" class="lbl-bold">X</text>
+      <rect x="190" y="0" width="40" height="40" rx="4" class="clr-dpad"/><text x="210" y="25" text-anchor="middle" class="lbl-bold">C</text>
+      <rect x="235" y="0" width="40" height="40" rx="4" class="clr-dpad"/><text x="255" y="25" text-anchor="middle" class="lbl-bold">V</text>
+      <rect x="280" y="0" width="40" height="40" rx="4" class="clr-rstick"/><text x="300" y="25" text-anchor="middle" class="lbl-bold">B</text>
+      <rect x="325" y="0" width="40" height="40" rx="4" class="clr-rstick"/><text x="345" y="25" text-anchor="middle" class="lbl-bold">N</text>
+      <rect x="370" y="0" width="40" height="40" rx="4" class="clr-rstick"/><text x="390" y="25" text-anchor="middle" class="lbl-bold">M</text>
+      <rect x="415" y="0" width="40" height="40" rx="4" class="clr-l3r3"/><text x="435" y="25" text-anchor="middle" class="lbl-bold">,</text>
+      <rect x="460" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="480" y="25" text-anchor="middle" class="lbl-none">.</text>
+      <rect x="505" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="525" y="25" text-anchor="middle" class="lbl-none">/</text>
+      <rect x="550" y="0" width="80" height="40" rx="4" class="bg-none"/><text x="590" y="25" text-anchor="middle" class="lbl-none">Shift</text>
+    </g>
+
+    <!-- Bottom Modifier / Space Row -->
+    <g transform="translate(0, 225)">
+      <rect x="0" y="0" width="60" height="40" rx="4" class="bg-none"/><text x="30" y="25" text-anchor="middle" class="lbl-none">Ctrl</text>
+      <rect x="65" y="0" width="50" height="40" rx="4" class="bg-none"/><text x="90" y="25" text-anchor="middle" class="lbl-none">Win</text>
+      <rect x="120" y="0" width="50" height="40" rx="4" class="bg-none"/><text x="145" y="25" text-anchor="middle" class="lbl-none">Alt</text>
+      <rect x="175" y="0" width="245" height="40" rx="4" class="clr-touch"/><text x="297" y="25" text-anchor="middle" class="lbl-bold">Space (Touchpad)</text>
+      <rect x="425" y="0" width="50" height="40" rx="4" class="bg-none"/><text x="450" y="25" text-anchor="middle" class="lbl-none">Alt</text>
+      <rect x="480" y="0" width="50" height="40" rx="4" class="bg-none"/><text x="505" y="25" text-anchor="middle" class="lbl-none">Win</text>
+      <rect x="535" y="0" width="45" height="40" rx="4" class="bg-none"/><text x="557" y="25" text-anchor="middle" class="lbl-none">Menu</text>
+      <rect x="585" y="0" width="45" height="40" rx="4" class="bg-none"/><text x="607" y="25" text-anchor="middle" class="lbl-none">Ctrl</text>
+    </g>
+  </g>
+
+  <!-- ==================== ARROW KEY CLUSTER ==================== -->
+  <g transform="translate(700, 80)">
+    <!-- Navigation Keys -->
+    <g transform="translate(0, 0)">
+      <rect x="0" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="20" y="25" text-anchor="middle" class="lbl-none">Ins</text>
+      <rect x="45" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="65" y="25" text-anchor="middle" class="lbl-none">Hm</text>
+      <rect x="90" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="110" y="25" text-anchor="middle" class="lbl-none">PgU</text>
+    </g>
+    <g transform="translate(0, 45)">
+      <rect x="0" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="20" y="25" text-anchor="middle" class="lbl-none">Del</text>
+      <rect x="45" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="65" y="25" text-anchor="middle" class="lbl-none">End</text>
+      <rect x="90" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="110" y="25" text-anchor="middle" class="lbl-none">PgD</text>
+    </g>
+
+    <!-- Dedicated Arrow Pad (Properly aligned at the bottom) -->
+    <g transform="translate(0, 135)">
+      <rect x="45" y="0" width="40" height="40" rx="4" class="clr-lstick"/><text x="65" y="25" text-anchor="middle" class="lbl-bold">&#9650;</text>
+      <rect x="0" y="45" width="40" height="40" rx="4" class="clr-lstick"/><text x="20" y="70" text-anchor="middle" class="lbl-bold">&#9664;</text>
+      <rect x="45" y="45" width="40" height="40" rx="4" class="clr-lstick"/><text x="65" y="70" text-anchor="middle" class="lbl-bold">&#9660;</text>
+      <rect x="90" y="45" width="40" height="40" rx="4" class="clr-lstick"/><text x="110" y="70" text-anchor="middle" class="lbl-bold">&#9654;</text>
+    </g>
+  </g>
+
+  <!-- ==================== NUMPAD BLOCK ==================== -->
+  <g transform="translate(890, 80)">
+    <!-- Top Num Row -->
+    <g transform="translate(0, 0)">
+      <rect x="0" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="20" y="25" text-anchor="middle" class="lbl-none">Num</text>
+      <rect x="45" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="65" y="25" text-anchor="middle" class="lbl-none">/</text>
+      <rect x="90" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="110" y="25" text-anchor="middle" class="lbl-none">*</text>
+      <rect x="135" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="155" y="25" text-anchor="middle" class="lbl-none">-</text>
+    </g>
+
+    <!-- 7 8 9 Row -->
+    <g transform="translate(0, 45)">
+      <rect x="0" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="20" y="25" text-anchor="middle" class="lbl-none">7</text>
+      <rect x="45" y="0" width="40" height="40" rx="4" class="clr-face"/><text x="65" y="25" text-anchor="middle" class="lbl-bold">8</text>
+      <rect x="90" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="110" y="25" text-anchor="middle" class="lbl-none">9</text>
+      <!-- Vertical double-height '+' key -->
+      <rect x="135" y="0" width="40" height="85" rx="4" class="bg-none"/><text x="155" y="48" text-anchor="middle" class="lbl-none">+</text>
+    </g>
+
+    <!-- 4 5 6 Row -->
+    <g transform="translate(0, 90)">
+      <rect x="0" y="0" width="40" height="40" rx="4" class="clr-face"/><text x="20" y="25" text-anchor="middle" class="lbl-bold">4</text>
+      <rect x="45" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="65" y="25" text-anchor="middle" class="lbl-none">5</text>
+      <rect x="90" y="0" width="40" height="40" rx="4" class="clr-face"/><text x="110" y="25" text-anchor="middle" class="lbl-bold">6</text>
+    </g>
+
+    <!-- 1 2 3 Row -->
+    <g transform="translate(0, 135)">
+      <rect x="0" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="20" y="25" text-anchor="middle" class="lbl-none">1</text>
+      <rect x="45" y="0" width="40" height="40" rx="4" class="clr-face"/><text x="65" y="25" text-anchor="middle" class="lbl-bold">2</text>
+      <rect x="90" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="110" y="25" text-anchor="middle" class="lbl-none">3</text>
+      <!-- Vertical double-height Numpad Enter key (Intentional light gray background) -->
+      <rect x="135" y="0" width="40" height="85" rx="4" class="bg-none"/><text x="155" y="48" text-anchor="middle" class="lbl-none">Ent</text>
+    </g>
+
+    <!-- 0 Row -->
+    <g transform="translate(0, 180)">
+      <rect x="0" y="0" width="85" height="40" rx="4" class="bg-none"/><text x="42" y="25" text-anchor="middle" class="lbl-none">0</text>
+      <rect x="90" y="0" width="40" height="40" rx="4" class="bg-none"/><text x="110" y="25" text-anchor="middle" class="lbl-none">.</text>
+    </g>
+  </g>
+
+  <!-- ==================== LEGEND SECTION ==================== -->
+  <g transform="translate(30, 420)">
+    <text x="0" y="0" fill="#ffffff" font-size="16" font-weight="bold">Legend</text>
+
+    <!-- Row 1 -->
+    <g transform="translate(0, 15)">
+      <rect x="0" y="0" width="20" height="20" rx="3" class="clr-face"/>
+      <text x="30" y="15" fill="#dddddd" font-size="14">Face buttons (I, J, K, L / Numpad 2, 4, 6, 8)</text>
+
+      <rect x="410" y="0" width="20" height="20" rx="3" class="clr-l12"/>
+      <text x="440" y="15" fill="#dddddd" font-size="14">L1, L2 triggers (Q, E)</text>
+
+      <rect x="790" y="0" width="20" height="20" rx="3" class="clr-r12"/>
+      <text x="820" y="15" fill="#dddddd" font-size="14">R1, R2 triggers (U, O)</text>
+    </g>
+
+    <!-- Row 2 -->
+    <g transform="translate(0, 50)">
+      <rect x="0" y="0" width="20" height="20" rx="3" class="clr-l3r3"/>
+      <text x="30" y="15" fill="#dddddd" font-size="14">L3, R3 stick clicks (Z, comma)</text>
+
+      <rect x="410" y="0" width="20" height="20" rx="3" class="clr-dpad"/>
+      <text x="440" y="15" fill="#dddddd" font-size="14">D-pad directional cross (F, C, X, V)</text>
+
+      <rect x="790" y="0" width="20" height="20" rx="3" class="clr-lstick"/>
+      <text x="820" y="15" fill="#dddddd" font-size="14">Left analog stick (W, A, S, D / Arrows)</text>
+    </g>
+
+    <!-- Row 3 -->
+    <g transform="translate(0, 85)">
+      <rect x="0" y="0" width="20" height="20" rx="3" class="clr-rstick"/>
+      <text x="30" y="15" fill="#dddddd" font-size="14">Right analog stick (B, M, H, N)</text>
+
+      <rect x="410" y="0" width="20" height="20" rx="3" class="clr-opts"/>
+      <text x="440" y="15" fill="#dddddd" font-size="14">Options / Start button (Main Enter only)</text>
+
+      <rect x="790" y="0" width="20" height="20" rx="3" class="clr-touch"/>
+      <text x="820" y="15" fill="#dddddd" font-size="14">Touchpad panel click (Spacebar only)</text>
+    </g>
+  </g>
+</svg>
