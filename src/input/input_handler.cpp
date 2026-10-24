@@ -151,6 +151,25 @@ analog_deadzone:4 = rightjoystick, 5, 127
 override_controller_color = false, 0, 0, 255
 )";
 }
+
+#if defined(WIN32)
+#define RYTY_EXPORT __declspec(dllexport)
+#else
+#define RYTY_EXPORT __attribute__((visibility("default")))
+#endif
+
+/// Returns the same default config text the input handler generates. Copies at most
+/// bufsize bytes into buf (NUL-terminated); returns the required size, or a negative
+/// size when buf is too small. Exposed so the RyGT loader can offer the same defaults.
+extern "C" RYTY_EXPORT int ryty_get_default_input_config(char* buf, int bufsize) {
+    const auto config = GetDefaultInputConfig();
+    const int required = static_cast<int>(config.size()) + 1;
+    if (bufsize < required) return -required;
+    config.copy(buf, config.size());
+    buf[config.size()] = '\0';
+    return required;
+}
+
 std::filesystem::path GetInputConfigFile(const std::string& game_id) {
     // Read configuration file of the game, and if it doesn't exist, generate it from default
     // If that doesn't exist either, generate that from getDefaultConfig() and try again
