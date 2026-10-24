@@ -92,6 +92,21 @@ axis_right_x_plus = l
 axis_right_y_minus = i
 axis_right_y_plus = k
 
+# Mouse bindings
+
+cross = leftbutton
+circle = rightbutton
+axis_right_y_minus = mousewheelup
+axis_right_y_plus = mousewheeldown
+mouse_to_joystick = left
+# mouse_movement_params = <min output floor>, <speed multiplier>, <constant nudge>
+# min_deflection (0..1) e.g. 0.5 means even the smallest move pushes the stick to at least 50% of full deflection
+# sensitivity (0..) e.g. 2 means a 2x multiplier on mouse motion (1 = default) (this is probably what you want to change)
+# base_deflection (0..1) e.g. 0.125 means a small constant added so any motion registers at all
+mouse_movement_params = 0, 5, 0
+# mouse_wheel_hold_ms = how long (ms) each mouse wheel tick stays held as input (default 33)
+mouse_wheel_hold_ms = 250
+
 # Controller bindings
 
 triangle = triangle
@@ -184,6 +199,9 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             {"hotkey_emulator_settings", "f3"},
             {"hotkey_toggle_friends", "f2"},
         };
+        std::map<std::string, std::string> mouse_default_bindings_to_add = {
+            {"hotkey_toggle_mouse_to_joystick", "middlebutton"},
+        };
         std::string legacy_capture_binding;
         bool legacy_capture_binding_found = false;
         std::ifstream global_in(config_file);
@@ -202,6 +220,7 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
                 legacy_capture_binding_found = true;
             }
             default_bindings_to_add.erase(output_string);
+            mouse_default_bindings_to_add.erase(output_string);
         }
         global_in.close();
         if (legacy_capture_binding_found) {
@@ -212,6 +231,9 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
         }
         std::ofstream global_out(config_file, std::ios::app);
         for (auto const& b : default_bindings_to_add) {
+            global_out << b.first << " = " << b.second << "\n";
+        }
+        for (auto const& b : mouse_default_bindings_to_add) {
             global_out << b.first << " = " << b.second << "\n";
         }
     }
