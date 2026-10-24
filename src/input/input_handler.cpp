@@ -62,35 +62,39 @@ circle = kp6
 cross = kp2
 square = kp4
 # Alternatives for users without a keypad
-triangle = c
-circle = b
-cross = n
-square = v
+triangle = i
+circle = l
+cross = k
+square = j
 
 l1 = q
 r1 = u
 l2 = e
 r2 = o
-l3 = x
-r3 = m
+l3 = z
+r3 = comma
 
 options = enter
 touchpad_center = space
 
-pad_up = up
-pad_down = down
-pad_left = left
-pad_right = right
+pad_up = f
+pad_down = c
+pad_left = x
+pad_right = v
 
 axis_left_x_minus = a
 axis_left_x_plus = d
 axis_left_y_minus = w
 axis_left_y_plus = s
+axis_left_x_minus = left
+axis_left_x_plus = right
+axis_left_y_minus = up
+axis_left_y_plus = down
 
-axis_right_x_minus = j
-axis_right_x_plus = l
-axis_right_y_minus = i
-axis_right_y_plus = k
+axis_right_x_minus = b
+axis_right_x_plus = m
+axis_right_y_minus = h
+axis_right_y_plus = n
 
 # Mouse bindings
 
@@ -137,6 +141,12 @@ axis_right_y = axis_right_y
 # Range of deadzones: 1 (almost none) to 127 (max)
 analog_deadzone = leftjoystick, 5, 127
 analog_deadzone = rightjoystick, 5, 127
+analog_deadzone:2 = leftjoystick, 5, 127
+analog_deadzone:2 = rightjoystick, 5, 127
+analog_deadzone:3 = leftjoystick, 5, 127
+analog_deadzone:3 = rightjoystick, 5, 127
+analog_deadzone:4 = leftjoystick, 5, 127
+analog_deadzone:4 = rightjoystick, 5, 127
 
 override_controller_color = false, 0, 0, 255
 )";
