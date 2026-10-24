@@ -50,9 +50,19 @@ ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group,
     size.width = attrib.width;
     size.height = attrib.height;
     size.depth = 1;
-    pitch = attrib.tiling_mode == TilingMode::Linear ? size.width : (size.width + 127) & (~127);
+    // The registered pitch, when given: GT Sport on PS4 Pro flips a 3200x1800 window of a
+    // 3840-pixel-wide 4K target, and only the matching pitch lets the cache see it as a subrect.
+    if (attrib.pitch_in_pixel >= size.width) {
+        pitch = attrib.pitch_in_pixel;
+    } else {
+        pitch = attrib.tiling_mode == TilingMode::Linear ? size.width
+                                                          : (size.width + 127) & (~127);
+    }
     num_bits = attrib.pixel_format != VideoOutFormat::A16R16G16B16Float ? 32 : 64;
     ASSERT(num_bits == 32);
+    // On a PS4 Pro the display buffers use the alternate tiling, as the color targets drawn into
+    // them do; without this the flip never matches the target it is a crop of.
+    alt_tile = props.is_tiled && Libraries::Kernel::sceKernelIsNeoMode();
 
     guest_address = cpu_address;
     UpdateSize();

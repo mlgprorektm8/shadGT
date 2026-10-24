@@ -25,6 +25,7 @@
 #include "common/perf_monitor.h"
 #include "common/read_capture.h"
 #include "core/address_space.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/kernel/equeue.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/kernel/threads.h"
@@ -1015,8 +1016,10 @@ void MemoryManager::NoteEmulatorWrite(VAddr address, u64 size, const void*,
 
 namespace Libraries::Kernel {
 
+// PS4 Pro (Neo) mode follows the General.neo_mode setting, as in shadGT itself, so the memory
+// layout, tiling and Gnm init packets match what the game sees from its own sceKernelIsNeoMode.
 s32 PS4_SYSV_ABI sceKernelIsNeoMode() {
-    return 0;
+    return EmulatorSettings.IsNeo() ? 1 : 0;
 }
 
 // libkernel.prx exports these by NID with the System V ABI.

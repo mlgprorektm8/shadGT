@@ -298,6 +298,8 @@ s32 PS4_SYSV_ABI sceVideoOutGetResolutionStatus(s32 handle, SceVideoOutResolutio
     }
 
     *status = port->resolution;
+    LOG_DEBUG(Lib_VideoOut, "full {}x{} pane {}x{}", status->full_width, status->full_height,
+              status->pane_width, status->pane_height);
     return ORBIS_OK;
 }
 

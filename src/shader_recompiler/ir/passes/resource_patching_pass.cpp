@@ -878,30 +878,32 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
         case AmdGpu::ImageType::Color1DArray: // x, slice, [lod]
         case AmdGpu::ImageType::Color2D:      // x, y, [lod]
             return {ir.CompositeConstruct(body->Arg(0), body->Arg(1)), body->Arg(2)};
-        case AmdGpu::ImageType::Color2DMsaa: // x, y. (sample is passed on different argument)
+        case AmdGpu::ImageType::Color2DMsaa: // x, y, fragment id, [mip]
         {
-            auto skip_lod = false;
             if (inst_info.has_lod) {
-                const auto mipid = body->Arg(2);
-                if (mipid.IsImmediate() && mipid.U32() == 0) {
-                    // if image_x_mip refers to a MSAA image, and mipid is 0, it is safe to be
-                    // skipped and fragid is taken from the next arg
-                    LOG_WARNING(Render_Recompiler, "Encountered a _mip instruction with MSAA "
-                                                   "image, and mipid is 0, skipping LoD");
-                    inst_info.has_lod.Assign(false);
-                    skip_lod = true;
-                } else {
-                    UNREACHABLE_MSG(
-                        "Encountered a _mip instruction with MSAA image, and mipid is non-zero");
+                // image_*_mip on an MSAA image: the fragment id stays with the coordinates and
+                // the mip level follows it (x, y, fragment id, mip). MSAA images have a single
+                // level, so the mip argument is dropped and the fragment id kept. GT Sport's
+                // PS4 Pro checkerboard resolve reads fragment 1 of its 2-sample buffers this
+                // way; the previous reading (x, y, mip, fragment id) rejected it.
+                const auto mip = body->Arg(3);
+                if (!mip.IsImmediate() || mip.U32() != 0) {
+                    LOG_WARNING(Render_Recompiler,
+                                "_mip instruction on MSAA image with non-zero mip, ignoring it");
                 }
+                inst_info.has_lod.Assign(false);
             }
-            return {ir.CompositeConstruct(body->Arg(0), body->Arg(1)), body->Arg(skip_lod ? 3 : 2)};
+            return {ir.CompositeConstruct(body->Arg(0), body->Arg(1)), body->Arg(2)};
         }
-        case AmdGpu::ImageType::Color2DArray:     // x, y, slice, [lod]
-        case AmdGpu::ImageType::Color2DMsaaArray: // x, y, slice. (sample is passed on different
-                                                  // argument)
-        case AmdGpu::ImageType::Cube:             // x, y, face, [lod]
-        case AmdGpu::ImageType::Color3D:          // x, y, z, [lod]
+        case AmdGpu::ImageType::Color2DMsaaArray: // x, y, slice, fragment id, [mip]
+            if (inst_info.has_lod) {
+                // As above; the mip level would be a fifth address register, never read here.
+                inst_info.has_lod.Assign(false);
+            }
+            return {ir.CompositeConstruct(body->Arg(0), body->Arg(1), body->Arg(2)), body->Arg(3)};
+        case AmdGpu::ImageType::Color2DArray: // x, y, slice, [lod]
+        case AmdGpu::ImageType::Cube:         // x, y, face, [lod]
+        case AmdGpu::ImageType::Color3D:      // x, y, z, [lod]
             return {ir.CompositeConstruct(body->Arg(0), body->Arg(1), body->Arg(2)), body->Arg(3)};
         default:
             UNREACHABLE_MSG("Unknown image type {}", view_type);
