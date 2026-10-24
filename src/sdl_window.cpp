@@ -412,7 +412,7 @@ void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
     // if it's a wheel event, make a timer that turns it off after a set time
     if (event->type == SDL_EVENT_MOUSE_WHEEL) {
         const SDL_Event* copy = new SDL_Event(*event);
-        SDL_AddTimer(33, wheelOffCallback, (void*)copy);
+        SDL_AddTimer(Input::mouse_wheel_hold_ms, wheelOffCallback, (void*)copy);
     }
 
     // add/remove it from the list

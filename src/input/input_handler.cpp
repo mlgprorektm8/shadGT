@@ -368,6 +368,7 @@ void ParseInputConfig(const std::string game_id = "") {
     float mouse_deadzone_offset = 0.5;
     float mouse_speed = 1;
     float mouse_speed_offset = 0.125;
+    mouse_wheel_hold_ms = 33;
 
     // me when I'm in a type deduction tournament and my opponent is clang
     constexpr std::array<std::pair<int, int>, 4> default_deadzone = {
@@ -486,6 +487,14 @@ void ParseInputConfig(const std::string game_id = "") {
                 return;
             }
             SetMouseParams(mouse_deadzone_offset, mouse_speed, mouse_speed_offset);
+            return;
+        } else if (output_string == "mouse_wheel_hold_ms") {
+            auto hold_ms = parseInt(input_string);
+            if (!hold_ms || *hold_ms <= 0) {
+                LOG_WARNING(Input, "Invalid mouse wheel hold ms at line {}: \"{}\"", lineCount, input_string);
+                return;
+            }
+            mouse_wheel_hold_ms = *hold_ms;
             return;
         } else if (output_string == "analog_deadzone") {
             std::stringstream ss(input_string);
